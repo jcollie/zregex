@@ -69,7 +69,6 @@ const Bt = struct {
         const undo_base = self.undo.items.len;
         const insts = self.prog.insts;
         const input = self.input;
-        const ci = self.prog.flags.case_insensitive;
         var pc = pc0;
         var pos = pos0;
 
@@ -82,7 +81,7 @@ const Bt = struct {
             switch (insts[pc]) {
                 .char => |c| if (pos < input.len) {
                     const d = common.decode(input, pos);
-                    if (common.charEq(c, d.cp, ci)) {
+                    if (common.charEq(c.cp, d.cp, c.ci)) {
                         pos += d.len;
                         pc += 1;
                         continue :step;
@@ -104,7 +103,7 @@ const Bt = struct {
                 .class => |cl| if (pos < input.len) {
                     const d = common.decode(input, pos);
                     const ranges = self.prog.ranges[cl.start..][0..cl.len];
-                    if (common.classMatches(ranges, cl.negated, ci, d.cp)) {
+                    if (common.classMatches(ranges, cl.negated, cl.ci, d.cp)) {
                         pos += d.len;
                         pc += 1;
                         continue :step;
@@ -141,9 +140,9 @@ const Bt = struct {
                     pc += 1;
                     continue :step;
                 },
-                .backref => |n| {
-                    const a = self.slots[2 * @as(u16, n)];
-                    const b = self.slots[2 * @as(u16, n) + 1];
+                .backref => |br| {
+                    const a = self.slots[2 * @as(u16, br.group)];
+                    const b = self.slots[2 * @as(u16, br.group) + 1];
                     if (a == null or b == null) {
                         // Unset group: matches empty (JS semantics).
                         pc += 1;
@@ -151,7 +150,7 @@ const Bt = struct {
                     }
                     const text = input[a.?..b.?];
                     if (pos + text.len <= input.len and
-                        bytesEqFold(text, input[pos..][0..text.len], ci))
+                        bytesEqFold(text, input[pos..][0..text.len], br.ci))
                     {
                         pos += text.len;
                         pc += 1;

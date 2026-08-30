@@ -130,7 +130,6 @@ pub fn run(
     const base_slots = try arena.alloc(?usize, prog.slot_count);
     @memset(base_slots, null);
 
-    const ci = prog.flags.case_insensitive;
     var gen: u32 = 1;
     var pos = start;
     var matched = false;
@@ -147,7 +146,7 @@ pub fn run(
             const th = clist.items[i];
             switch (prog.insts[th.pc]) {
                 .char => |c| if (d) |dd| {
-                    if (common.charEq(c, dd.cp, ci))
+                    if (common.charEq(c.cp, dd.cp, c.ci))
                         try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
                 },
                 .any => if (d) |dd| {
@@ -159,7 +158,7 @@ pub fn run(
                 },
                 .class => |cl| if (d) |dd| {
                     const ranges = prog.ranges[cl.start..][0..cl.len];
-                    if (common.classMatches(ranges, cl.negated, ci, dd.cp))
+                    if (common.classMatches(ranges, cl.negated, cl.ci, dd.cp))
                         try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
                 },
                 .match => {

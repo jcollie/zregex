@@ -147,6 +147,45 @@ test "flags" {
     try std.testing.expect(try re6.isMatch(gpa, "ABC"));
 }
 
+test "inline flags" {
+    try expectFind("(?i)hello", "say HeLLo", "HeLLo");
+    try expectFind("(?i)[a-z]+", "ABC", "ABC");
+    // Takes effect mid-pattern...
+    try expectFind("a(?i)b", "aB", "aB");
+    try expectFind("a(?i)b", "Ab", null);
+    // ...and is scoped to the enclosing group.
+    try expectFind("(a(?i)b)c", "aBc", "aBc");
+    try expectFind("(a(?i)b)c", "aBC", null);
+    try expectFind("(?i:ab)c", "ABc", "ABc");
+    try expectFind("(?i:a(?-i:b))", "Ab", "Ab");
+    try expectFind("(?i:a(?-i:b))", "AB", null);
+    // Persists across | until the group ends (PCRE semantics).
+    try expectFind("(?:x(?i)a|b)", "B", "B");
+    // m and s.
+    try expectFind("(?m)^b$", "a\nb\nc", "b");
+    try expectFind("(?s)a.b", "a\nb", "a\nb");
+    try expectFind("(?s:a.)b", "a\nb", "a\nb");
+    try expectFind("a.(?s)b", "a\nb", null); // too late for the earlier dot
+
+    // Clearing a flag set via compileWithFlags.
+    var re = try Regex.compileWithFlags(gpa, "a(?-i)b", .{ .case_insensitive = true });
+    defer re.deinit();
+    try std.testing.expect(try re.isMatch(gpa, "Ab"));
+    try std.testing.expect(!try re.isMatch(gpa, "aB"));
+
+    // Case-insensitive backreference comparison.
+    try expectFind("(?i)(abc)-\\1", "xABc-abCx", "ABc-abC");
+    var re2 = try Regex.compile(gpa, "(abc)-(?i)\\1");
+    defer re2.deinit();
+    try std.testing.expect(try re2.isMatch(gpa, "abc-ABC"));
+}
+
+test "inline flags at comptime" {
+    const re = comptime Regex.compileComptime("(?i)h(?-i:ell)o");
+    try std.testing.expect(try re.isMatch(gpa, "HellO"));
+    try std.testing.expect(!try re.isMatch(gpa, "hELLo"));
+}
+
 test "engine selection" {
     var re = try Regex.compile(gpa, "a+b");
     defer re.deinit();

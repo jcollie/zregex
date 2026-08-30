@@ -22,17 +22,23 @@ pub const NodeIndex = u32;
 
 pub const Node = union(enum) {
     empty,
-    literal: u21,
-    /// `.` — whether it matches `\n` is decided by `Flags.dot_all` at compile.
-    any,
+    literal: Literal,
+    /// `.`; the payload is whether it matches `\n` (`dot_all` at this point).
+    any: bool,
     class: Class,
     concat: [2]NodeIndex,
     alt: [2]NodeIndex,
     repeat: Repeat,
     group: Group,
     assertion: common.Assertion,
-    backref: u8,
+    backref: Backref,
     look: Look,
+};
+
+pub const Literal = struct {
+    cp: u21,
+    /// ASCII case-insensitive (`case_insensitive` at this point).
+    ci: bool,
 };
 
 pub const Class = struct {
@@ -40,6 +46,12 @@ pub const Class = struct {
     start: u32,
     len: u32,
     negated: bool,
+    ci: bool,
+};
+
+pub const Backref = struct {
+    index: u8,
+    ci: bool,
 };
 
 pub const Repeat = struct {
@@ -296,7 +308,7 @@ pub const Parser = struct {
             '[' => return self.parseClass(),
             '.' => {
                 self.pos += 1;
-                return self.addNode(.any);
+                return self.addNode(.{ .any = self.flags.dot_all });
             },
             '^' => {
                 self.pos += 1;
@@ -311,19 +323,28 @@ pub const Parser = struct {
             '\\' => {
                 const esc = try self.parseEscape(false);
                 return switch (esc) {
-                    .literal => |cp| self.addNode(.{ .literal = cp }),
+                    .literal => |cp| self.addNode(.{ .literal = .{
+                        .cp = cp,
+                        .ci = self.flags.case_insensitive,
+                    } }),
                     .class => |cl| self.addNode(.{ .class = cl }),
                     .assertion => |a| self.addNode(.{ .assertion = a }),
                     .backref => |n| blk: {
                         self.has_backref = true;
-                        break :blk self.addNode(.{ .backref = n });
+                        break :blk self.addNode(.{ .backref = .{
+                            .index = n,
+                            .ci = self.flags.case_insensitive,
+                        } });
                     },
                 };
             },
             else => {
                 const d = common.decode(self.pattern, self.pos);
                 self.pos += d.len;
-                return self.addNode(.{ .literal = d.cp });
+                return self.addNode(.{ .literal = .{
+                    .cp = d.cp,
+                    .ci = self.flags.case_insensitive,
+                } });
             },
         }
     }
@@ -367,6 +388,7 @@ pub const Parser = struct {
                     self.pos += 1;
                     capture_index = try self.parseGroupName('\'');
                 },
+                'i', 'm', 's', '-' => return self.parseFlagGroup(depth),
                 else => return error.UnsupportedFeature,
             }
         } else {
@@ -374,13 +396,66 @@ pub const Parser = struct {
             capture_index = self.group_count;
             self.group_count += 1;
         }
+        // Inline flag changes inside a group are scoped to that group.
+        const saved_flags = self.flags;
         const body = try self.parseAlternation(depth + 1);
+        self.flags = saved_flags;
         if (!self.eat(')')) return error.UnbalancedParen;
         if (look_kind) |lk| {
             self.has_look = true;
             return self.addNode(.{ .look = .{ .child = body, .kind = lk } });
         }
         return self.addNode(.{ .group = .{ .child = body, .index = capture_index } });
+    }
+
+    /// Inline flags; `self.pos` is at the first flag letter after `(?`.
+    ///
+    /// `(?ims-ims)` mutates the current flags until the end of the enclosing
+    /// group (PCRE semantics: the change crosses `|`). `(?ims-ims:...)` scopes
+    /// the change to the parenthesized body.
+    fn parseFlagGroup(self: *Self, depth: u32) ParseError!NodeIndex {
+        var new_flags = self.flags;
+        var clearing = false;
+        var seen_letter = false;
+        while (self.peek()) |c| {
+            switch (c) {
+                'i' => new_flags.case_insensitive = !clearing,
+                'm' => new_flags.multiline = !clearing,
+                's' => new_flags.dot_all = !clearing,
+                '-' => {
+                    if (clearing) return error.UnsupportedFeature;
+                    clearing = true;
+                    self.pos += 1;
+                    continue;
+                },
+                ':' => {
+                    self.pos += 1;
+                    const saved = self.flags;
+                    self.flags = new_flags;
+                    const body = try self.parseAlternation(depth + 1);
+                    self.flags = saved;
+                    if (!self.eat(')')) return error.UnbalancedParen;
+                    return self.addNode(.{ .group = .{ .child = body, .index = null } });
+                },
+                ')' => {
+                    self.pos += 1;
+                    if (!seen_letter) return error.UnsupportedFeature;
+                    self.flags = new_flags;
+                    // `(?i)*` etc.: nothing tangible to repeat.
+                    if (self.peek()) |c2| switch (c2) {
+                        '*', '+', '?' => return error.NothingToRepeat,
+                        '{' => if (try self.scanBounds() != null) return error.NothingToRepeat,
+                        else => {},
+                    };
+                    return self.addNode(.empty);
+                },
+                // 'x' (extended) and anything else are unsupported.
+                else => return error.UnsupportedFeature,
+            }
+            seen_letter = true;
+            self.pos += 1;
+        }
+        return error.UnexpectedEnd;
     }
 
     /// Parses a group name terminated by `term`, registers it, and returns the
@@ -513,7 +588,12 @@ pub const Parser = struct {
     fn shorthand(self: *Self, rs: []const common.ClassRange, complement: bool) ParseError!Class {
         const start = self.ranges_len;
         if (complement) try self.addComplement(rs) else try self.addRanges(rs);
-        return .{ .start = start, .len = self.ranges_len - start, .negated = false };
+        return .{
+            .start = start,
+            .len = self.ranges_len - start,
+            .negated = false,
+            .ci = self.flags.case_insensitive,
+        };
     }
 
     fn parseHex(self: *Self, comptime n: usize) ParseError!u21 {
@@ -602,6 +682,7 @@ pub const Parser = struct {
             .start = start,
             .len = self.ranges_len - start,
             .negated = negated,
+            .ci = self.flags.case_insensitive,
         } });
     }
 };
@@ -659,6 +740,31 @@ test "parses valid patterns" {
     try expectParses("a{b}");
     try expectParses("héllo•");
     try expectParses("||");
+    try expectParses("(?i)abc");
+    try expectParses("(?ims-i)abc");
+    try expectParses("(?i:a(?-i:b))c");
+    try expectParses("(?-i)a");
+}
+
+test "inline flags scope to the enclosing group" {
+    var bufs = TestBufs{};
+    var p = bufs.parser("a(x(?i)b)c", .{});
+    _ = try p.parse();
+    // Nodes are appended in parse order: 'a' and 'c' outside the group stay
+    // case-sensitive, 'b' after (?i) is not; the flag reset at ')'.
+    var lits: [8]Literal = undefined;
+    var n: usize = 0;
+    for (p.nodes[0..p.nodes_len]) |node| {
+        if (node == .literal) {
+            lits[n] = node.literal;
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expect(!lits[0].ci); // a
+    try std.testing.expect(!lits[1].ci); // x
+    try std.testing.expect(lits[2].ci); // b
+    try std.testing.expect(!lits[3].ci); // c
 }
 
 test "rejects invalid patterns" {
@@ -676,7 +782,11 @@ test "rejects invalid patterns" {
     try expectParseError(error.InvalidBackref, "\\1");
     try expectParseError(error.InvalidBackref, "(a)\\2");
     try expectParseError(error.DuplicateGroupName, "(?<x>a)(?<x>b)");
-    try expectParseError(error.UnsupportedFeature, "(?i)a");
+    try expectParseError(error.UnsupportedFeature, "(?x)a");
+    try expectParseError(error.UnsupportedFeature, "(?)a");
+    try expectParseError(error.UnsupportedFeature, "(?i-m-s)a");
+    try expectParseError(error.NothingToRepeat, "a(?i)*");
+    try expectParseError(error.UnexpectedEnd, "(?im");
     try expectParseError(error.UnexpectedEnd, "a\\");
     try expectParseError(error.InvalidCodepoint, "\\x{110000}");
 }

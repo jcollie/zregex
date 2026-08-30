@@ -47,7 +47,8 @@ const re = comptime zregex.Regex.compileComptime("\\d{3}-\\d{4}");
 if (try re.isMatch(gpa, input)) { ... }
 ```
 
-Flags: `compileWithFlags(gpa, pattern, .{ .case_insensitive = true, .multiline = true, .dot_all = true })`.
+Flags: `compileWithFlags(gpa, pattern, .{ .case_insensitive = true, .multiline = true, .dot_all = true })`,
+or inline: `(?i)`, `(?m)`, `(?s)` — see below.
 
 ## Supported syntax
 
@@ -61,6 +62,8 @@ Flags: `compileWithFlags(gpa, pattern, .{ .case_insensitive = true, .multiline =
 - Backreferences `\1`…`\99`, `\k<name>` *(backtracking engine)*
 - Lookaround `(?=)` `(?!)` `(?<=)` `(?<!)` — lookbehind may be
   variable-length *(backtracking engine)*
+- Inline flags `(?ims)` / `(?-ims)` (effective until the end of the enclosing
+  group) and scoped groups `(?ims-ims:...)`
 
 ## Semantics
 

@@ -15,10 +15,22 @@ const parser = @import("parser.zig");
 /// Hard cap on program length; counted repeats can expand a lot.
 pub const max_insts: u32 = 1 << 16;
 
+pub const CharOp = struct {
+    cp: u21,
+    /// ASCII case-insensitive.
+    ci: bool,
+};
+
 pub const ClassOp = struct {
     start: u32,
     len: u32,
     negated: bool,
+    ci: bool,
+};
+
+pub const BackrefOp = struct {
+    group: u8,
+    ci: bool,
 };
 
 pub const LookOp = struct {
@@ -29,7 +41,7 @@ pub const LookOp = struct {
 
 pub const Inst = union(enum) {
     /// Consume one codepoint equal to this (mod case folding).
-    char: u21,
+    char: CharOp,
     /// Consume any codepoint.
     any,
     /// Consume any codepoint except '\n'.
@@ -43,8 +55,8 @@ pub const Inst = union(enum) {
     save: u16,
     assert: common.Assertion,
     match,
-    /// Consume text equal to what capture group n matched.
-    backref: u8,
+    /// Consume text equal to what the capture group matched.
+    backref: BackrefOp,
     /// Zero-width lookaround running a sub-program.
     look: LookOp,
     /// Scratch slot write, guards empty-body loops.
@@ -61,7 +73,6 @@ pub const Program = struct {
     slot_count: u16,
     /// Includes group 0.
     group_count: u8,
-    flags: common.Flags,
 };
 
 pub const CompileError = error{ProgramTooLarge};
@@ -73,7 +84,6 @@ pub const Counts = struct {
 
 pub const Compiler = struct {
     nodes: []const parser.Node,
-    flags: common.Flags,
     counting: bool,
     insts: []Inst,
     len: u32 = 0,
@@ -106,12 +116,13 @@ pub const Compiler = struct {
     fn emitNode(self: *Self, idx: parser.NodeIndex) CompileError!void {
         switch (self.nodes[idx]) {
             .empty => {},
-            .literal => |cp| _ = try self.emit(.{ .char = cp }),
-            .any => _ = try self.emit(if (self.flags.dot_all) .any else .any_not_nl),
+            .literal => |l| _ = try self.emit(.{ .char = .{ .cp = l.cp, .ci = l.ci } }),
+            .any => |nl| _ = try self.emit(if (nl) .any else .any_not_nl),
             .class => |cl| _ = try self.emit(.{ .class = .{
                 .start = cl.start,
                 .len = cl.len,
                 .negated = cl.negated,
+                .ci = cl.ci,
             } }),
             .concat => |ab| {
                 try self.emitNode(ab[0]);
@@ -146,7 +157,7 @@ pub const Compiler = struct {
                 }
             },
             .assertion => |a| _ = try self.emit(.{ .assert = a }),
-            .backref => |n| _ = try self.emit(.{ .backref = n }),
+            .backref => |b| _ = try self.emit(.{ .backref = .{ .group = b.index, .ci = b.ci } }),
             .look => |l| {
                 const j = try self.emit(.{ .jmp = 0 });
                 const sub = self.len;
@@ -208,11 +219,9 @@ pub fn count(
     nodes: []const parser.Node,
     root: parser.NodeIndex,
     group_count: u8,
-    flags: common.Flags,
 ) CompileError!Counts {
     var c = Compiler{
         .nodes = nodes,
-        .flags = flags,
         .counting = true,
         .insts = &.{},
         .next_slot = 2 * @as(u16, group_count),
@@ -226,12 +235,10 @@ pub fn emitInto(
     nodes: []const parser.Node,
     root: parser.NodeIndex,
     group_count: u8,
-    flags: common.Flags,
     insts: []Inst,
 ) CompileError!void {
     var c = Compiler{
         .nodes = nodes,
-        .flags = flags,
         .counting = false,
         .insts = insts,
         .next_slot = 2 * @as(u16, group_count),
@@ -262,10 +269,10 @@ fn compileForTest(
         .names = &names,
     };
     const root = try p.parse();
-    const counts = try count(p.nodes[0..p.nodes_len], root, p.group_count, flags);
+    const counts = try count(p.nodes[0..p.nodes_len], root, p.group_count);
     const insts = try gpa.alloc(Inst, counts.insts);
     errdefer gpa.free(insts);
-    try emitInto(p.nodes[0..p.nodes_len], root, p.group_count, flags, insts);
+    try emitInto(p.nodes[0..p.nodes_len], root, p.group_count, insts);
     return .{ .insts = insts, .slots = counts.slots, .p = p.group_count };
 }
 

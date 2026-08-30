@@ -60,7 +60,9 @@ pub const Regex = struct {
     slot_count: u16,
     flags: Flags,
     engine: Engine,
-    /// Step budget for the backtracking engine; tune per regex if needed.
+    /// Step budget for the backtracking engine, applied per match attempt
+    /// (per start position, like PCRE's match limit); tune per regex if
+    /// needed.
     max_steps: usize = default_max_steps,
     /// Backing allocator for owned memory; null for comptime-compiled regexes.
     gpa: ?std.mem.Allocator,

@@ -48,4 +48,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Benchmark harness (always ReleaseFast); see bench/run.sh.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-zregex",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench_zregex.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zregex", .module = mod },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Build the benchmark harness");
+    bench_step.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 }

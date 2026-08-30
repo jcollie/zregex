@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+// SPDX-License-Identifier: MIT
+
+//! Benchmark harness. Usage: bench-zregex <corpus-file>
+//! Output protocol (one line per benchmark): impl \t name \t best_ms \t count
+const std = @import("std");
+const zregex = @import("zregex");
+
+const Case = struct {
+    name: []const u8,
+    pattern: []const u8,
+    reps: usize = 5,
+    /// If set, run against this haystack instead of the corpus.
+    haystack: ?[]const u8 = null,
+};
+
+const patho_haystack = "a" ** 22 ++ "!";
+
+const cases = [_]Case{
+    .{ .name = "literal", .pattern = "synchronization" },
+    .{ .name = "ci_literal", .pattern = "(?i)SYNCHRONIZATION" },
+    .{ .name = "date", .pattern = "\\d{4}-\\d{2}-\\d{2}" },
+    .{ .name = "email", .pattern = "[\\w.]+@[\\w.]+" },
+    .{ .name = "alt", .pattern = "error|warning|fatal|panic" },
+    .{ .name = "ing_suffix", .pattern = "[a-z]+ing" },
+    .{ .name = "spanning", .pattern = "ERROR.{0,40}failed" },
+    .{ .name = "groups", .pattern = "(\\w+)@([\\w.]+)" },
+    .{ .name = "lookahead", .pattern = "\\w+(?=@)" },
+    .{ .name = "backref", .pattern = "(\\w{3,})-\\1" },
+    .{ .name = "pathological", .pattern = "(a+)+$", .reps = 1, .haystack = patho_haystack },
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const gpa = std.heap.smp_allocator;
+    const io = init.io;
+
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len != 2) {
+        std.debug.print("usage: {s} <corpus>\n", .{args[0]});
+        std.process.exit(1);
+    }
+    const corpus = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(64 << 20));
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const out = &stdout_file_writer.interface;
+
+    for (cases) |case| {
+        var re = try zregex.Regex.compile(gpa, case.pattern);
+        defer re.deinit();
+        const haystack = case.haystack orelse corpus;
+
+        var best_ns: i96 = std.math.maxInt(i96);
+        var count: usize = 0;
+        for (0..case.reps) |_| {
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            var c: usize = 0;
+            var it = re.iterator(gpa, haystack);
+            while (try it.next()) |m| {
+                var mm = m;
+                mm.deinit(gpa);
+                c += 1;
+            }
+            const t1 = std.Io.Timestamp.now(io, .awake);
+            const ns = t0.durationTo(t1).nanoseconds;
+            if (ns < best_ns) best_ns = ns;
+            count = c;
+        }
+        const ms = @as(f64, @floatFromInt(@as(i64, @intCast(best_ns)))) / 1e6;
+        try out.print("zregex/{t}\t{s}\t{d:.2}\t{d}\n", .{ re.engine, case.name, ms, count });
+        try out.flush();
+    }
+}

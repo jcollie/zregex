@@ -238,6 +238,10 @@ pub fn run(
 
     var s = start;
     while (true) {
+        // The budget is per match attempt (like PCRE's match limit): each
+        // start position gets a fresh allowance, so scanning a large haystack
+        // is not itself budget-limited while any single attempt stays bounded.
+        bt.steps = 0;
         if (try bt.matchFrom(0, s, null)) return true;
         if (s >= input.len) return false;
         s += common.decode(input, s).len;

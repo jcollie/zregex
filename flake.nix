@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+{
+  description = "";
+
+  inputs = {
+    nixpkgs = {
+      url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
+    };
+  };
+
+  outputs =
+    {
+      nixpkgs,
+      ...
+    }:
+    let
+      inherit (nixpkgs) lib;
+      linuxSystems = builtins.filter (
+        system: (lib.systems.elaborate system).isLinux
+      ) lib.systems.flakeExposed;
+      makePackages =
+        system:
+        import nixpkgs {
+          inherit system;
+        };
+      forAllSystems = lib.genAttrs linuxSystems;
+    in
+    {
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = makePackages system;
+        in
+        {
+          default = pkgs.mkShell {
+            name = "zregex";
+            nativeBuildInputs = [
+              pkgs.git-pages-cli
+              pkgs.kcov
+              pkgs.radicle-node
+              pkgs.reuse
+              pkgs.zig_0_16
+            ];
+          };
+        }
+      );
+    };
+}

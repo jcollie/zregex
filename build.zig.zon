@@ -1,0 +1,17 @@
+// SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+// SPDX-License-Identifier: MIT
+.{
+    .name = .zregex,
+    .version = "0.0.0",
+    // Globally unique package identifier together with `name`; never changes.
+    .fingerprint = 0x9f5d80d30fd26c90, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSES",
+        "README.md",
+    },
+}

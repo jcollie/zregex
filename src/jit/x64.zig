@@ -62,6 +62,34 @@ pub const Cond = enum(u4) {
     g = 0xF,
 };
 
+/// SSE registers. Only the 128-bit integer subset of SSE2 is used, which is
+/// baseline on x86-64 — no runtime feature detection is needed.
+pub const Xmm = enum(u4) {
+    xmm0 = 0,
+    xmm1 = 1,
+    xmm2 = 2,
+    xmm3 = 3,
+    xmm4 = 4,
+    xmm5 = 5,
+    xmm6 = 6,
+    xmm7 = 7,
+    xmm8 = 8,
+    xmm9 = 9,
+    xmm10 = 10,
+    xmm11 = 11,
+    xmm12 = 12,
+    xmm13 = 13,
+    xmm14 = 14,
+    xmm15 = 15,
+
+    fn low(self: Xmm) u3 {
+        return @truncate(@intFromEnum(self));
+    }
+    fn ext(self: Xmm) u1 {
+        return @truncate(@intFromEnum(self) >> 3);
+    }
+};
+
 pub const Label = u32;
 
 const Fixup = struct {
@@ -434,6 +462,75 @@ pub const Asm = struct {
         self.b(0x8D);
         self.modrm(0, dst.low(), 5); // rip-relative
         self.fixup(l);
+    }
+
+    // -- SSE2 ---------------------------------------------------------------
+    //
+    // The mandatory prefix (66/F3) comes first, then REX, then the escape
+    // byte, which is the order the manual requires and objdump confirms.
+
+    /// `movdqu dst, [mem]`.
+    pub fn movdquXmmMem(self: *Asm, dst: Xmm, m: Mem) void {
+        const rb = memRexBits(m);
+        self.b(0xF3);
+        self.rex(0, dst.ext(), rb.x, rb.b);
+        self.b(0x0F);
+        self.b(0x6F);
+        self.emitMem(dst.low(), m);
+    }
+
+    /// `movdqu dst, [rip+label]`.
+    pub fn movdquXmmLabel(self: *Asm, dst: Xmm, l: Label) void {
+        self.b(0xF3);
+        self.rex(0, dst.ext(), 0, 0);
+        self.b(0x0F);
+        self.b(0x6F);
+        self.modrm(0, dst.low(), 5); // rip-relative
+        self.fixup(l);
+    }
+
+    fn sse2RegReg(self: *Asm, opcode: u8, dst: Xmm, src: Xmm) void {
+        self.b(0x66);
+        self.rex(0, dst.ext(), 0, src.ext());
+        self.b(0x0F);
+        self.b(opcode);
+        self.modrm(3, dst.low(), src.low());
+    }
+
+    /// `movdqa dst, src` (register to register).
+    pub fn movdqaXmmXmm(self: *Asm, dst: Xmm, src: Xmm) void {
+        self.sse2RegReg(0x6F, dst, src);
+    }
+
+    /// `pcmpgtb dst, src` — signed byte compare, so any byte >= 0x80 reads as
+    /// negative and falls outside every ASCII range.
+    pub fn pcmpgtbXmmXmm(self: *Asm, dst: Xmm, src: Xmm) void {
+        self.sse2RegReg(0x64, dst, src);
+    }
+
+    pub fn porXmmXmm(self: *Asm, dst: Xmm, src: Xmm) void {
+        self.sse2RegReg(0xEB, dst, src);
+    }
+
+    pub fn pandXmmXmm(self: *Asm, dst: Xmm, src: Xmm) void {
+        self.sse2RegReg(0xDB, dst, src);
+    }
+
+    /// `pmovmskb dst, src` — one bit per byte lane into a general register.
+    pub fn pmovmskbRegXmm(self: *Asm, dst: Reg, src: Xmm) void {
+        self.b(0x66);
+        self.rex(0, dst.ext(), 0, src.ext());
+        self.b(0x0F);
+        self.b(0xD7);
+        self.modrm(3, dst.low(), src.low());
+    }
+
+    /// `bsf dst, src` (32-bit): index of the lowest set bit.
+    pub fn bsfRegReg(self: *Asm, dst: Reg, src: Reg) void {
+        self.rex(0, dst.ext(), 0, src.ext());
+        self.b(0x0F);
+        self.b(0xBC);
+        self.modrm(3, dst.low(), src.low());
     }
 
     /// Emit raw data (alignment is the caller's business).

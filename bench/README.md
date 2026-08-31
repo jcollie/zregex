@@ -12,32 +12,33 @@ prints a merged table. Each harness emits `impl \t bench \t best_ms \t count`;
 match counts are cross-checked in the "matches" column (a single value means
 all implementations agree).
 
-Snapshot (2026-08-30, Linux, corpus 4.2 MB, times in ms, best of 5, with the
-first-byte prefilter, lazy capture handling, the lazy DFA, and the fused
-backtracker):
+Snapshot (2026-08-31, Linux, corpus 4.2 MB, times in ms, best of 5, with the
+first-byte prefilter, lazy capture handling, the lazy DFA, the fused
+backtracker, and the x86-64 JIT with SSE2 run scanning):
 
-| benchmark    | zregex    | pcre2   | pcre2-jit | python | perl   | posix   |
-|--------------|----------:|--------:|----------:|-------:|-------:|--------:|
-| literal      | 5.5       | 4.5     | 0.18      | 1.9    | 1.7    | 6.4     |
-| ci_literal   | 6.7       | 1944.5  | 0.18      | 16.6   | 2.7    | 8.3     |
-| date         | 7.8       | 2.8     | 0.62      | 41.3   | 5.0    | 251.3   |
-| email        | 25.3      | 83.6    | 6.01      | 87.6   | 38.9   | 242.1   |
-| alt          | 21.0      | 29.8    | 4.84      | 23.5   | 17.3   | 285.6   |
-| ing_suffix   | 39.2      | 203.4   | 6.97      | 64.8   | 54.7   | 1007.5  |
-| spanning     | 0.4       | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
-| groups       | 28.1      | 129.6   | 5.70      | 157.3  | 42.1   | 289.7   |
-| lookahead    | 43.5 (bt) | 305.2   | 8.99      | 175.5  | 41.3   | —       |
-| backref      | 49.0 (bt) | 132.4   | 17.24     | 122.9  | 181.0  | —       |
-| pathological | **0.01**  | ERROR   | 26.3      | 282.8  | 0.01   | 0.01    |
+| benchmark    | zregex          | pcre2   | pcre2-jit | python | perl   | posix   |
+|--------------|----------------:|--------:|----------:|-------:|-------:|--------:|
+| literal      | 1.8 (jit)       | 4.5     | 0.17      | 1.9    | 1.7    | 6.5     |
+| ci_literal   | 2.9 (jit)       | 1921.8  | 0.19      | 16.8   | 2.7    | 8.3     |
+| date         | 2.2 (jit)       | 2.7     | 0.61      | 41.7   | 5.1    | 245.5   |
+| email        | 26.4 (dfa)      | 83.0    | 5.96      | 88.7   | 39.5   | 240.5   |
+| alt          | 12.1 (jit)      | 29.6    | 4.81      | 22.9   | 17.4   | 285.7   |
+| ing_suffix   | 39.9 (dfa)      | 201.8   | 6.93      | 64.3   | 55.1   | 1006.0  |
+| spanning     | **0.09** (jit)  | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
+| groups       | 29.2 (dfa)      | 130.3   | 5.66      | 149.0  | 41.8   | 290.2   |
+| lookahead    | **5.5** (jit)   | 295.8   | 8.70      | 167.7  | 40.7   | —       |
+| backref      | **7.5** (jit)   | 133.3   | 17.06     | 124.7  | 180.2  | —       |
+| pathological | 0.26 (jit→pike) | ERROR   | 26.5      | 279.8  | 0.01   | 0.01    |
 
 The parenthesised engine is the one `Regex.engine` selected. zregex is
 fastest of the interpreted engines on eight of eleven rows, and beats PCRE2's
-JIT outright on `spanning` and `backref`.
+JIT outright on `spanning`, `lookahead`, and `backref`.
 "pathological" is `(a+)+$` against `"a"*22 + "!"`: PCRE2's interpreter aborts
-with a match-limit error and Python backtracks for ~300ms, while the Pike VM
-answers in microseconds regardless of input — the design's core guarantee.
+with a match-limit error and Python backtracks for ~280ms. The JIT spends a
+bounded number of native steps on it, bails, and the Pike VM answers — the
+design's core guarantee, kept even with a backtracking JIT in front.
 
-Five layers shape these numbers. The first-byte prefilter (computed at
+Six layers shape these numbers. The first-byte prefilter (computed at
 compile time from the program) skips start positions that cannot begin a
 match: it took the sparse-match rows from a flat ~165 ms down to single-digit
 ms (`spanning`: 165 -> 0.5). Lazy capture handling removed group 0's save
@@ -64,7 +65,18 @@ greedy-repeat retries jump straight to occurrences of the literal the
 continuation must match next (a char or single-char lookahead), and lead-run
 skipping applies dynamically to backref patterns whenever a failed attempt
 never executed a backref — together taking `backref` from 232 to 49 ms and
-`lookahead` from 63 to 43. Finally the JIT compiles patterns to
+`lookahead` from 63 to 43.
+
+Finally the JIT compiles patterns to native code, taking over wherever few
+start positions get tried — literals, digits, alternations, and everything
+behind a backreference or lookaround. Dense scans stay on the lazy DFA, which
+reads each byte once where a backtracker re-reads it. Two things carry the
+JIT's repeat-heavy rows: consume loops scan sixteen bytes per iteration with
+SSE2, and greedy repeats no longer leave a retry frame when the continuation
+must match a literal the repeat itself never matches (retries only ever
+resume *inside* the consumed run, so `\w+@` can never find an `@` there).
+Together those took `lookahead` to 5.5 ms and `backref` to 7.5, both now
+faster than PCRE2's JIT. Finally the JIT compiles patterns to
 native code, taking over wherever few start positions get tried — literals,
 digits, alternations, and everything behind a backreference or lookaround
 (`backref`: 49 -> 16 ms, `lookahead`: 63 -> 15). Dense scans stay on the lazy

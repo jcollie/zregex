@@ -656,3 +656,19 @@ test "jit bails instead of blowing up, and the answer still comes back" {
     try std.testing.expectEqual(zregex.Engine.jit, re.engine);
     try std.testing.expect(!try re.isMatch(gpa, "a" ** 30 ++ "b"));
 }
+
+test "greedy give-back happens exactly where a shorter run could help" {
+    // '-' is not a word character, so no shorter \w+ run can be followed by
+    // one: both engines skip the retry entirely. Matches must be unaffected.
+    try expectGroups("(\\w+)-(\\w+)", "ab-cd", &.{ "ab-cd", "ab", "cd" });
+    try expectFind("\\w+-\\w+", "xx yy-zz", "yy-zz");
+    try expectGroups("(\\w{3,})-\\1", "aaaa bbbb ccc-ccc dd", &.{ "ccc-ccc", "ccc" });
+    // Here the continuation *is* a member of the repeated class, so the
+    // give-back is real and the shorter run is what matches.
+    try expectGroups("(\\S+)-(\\S+)", "a-b-c", &.{ "a-b-c", "a-b", "c" });
+    try expectFind("[a-z]+ing", "singing", "singing");
+    try expectFind("[a-z]+ab", "xabab", "xabab");
+    try expectFind("\\w+_\\w+", "a_b", "a_b"); // '_' is a word char
+    // Case-insensitive: the fold partner counts as a member too.
+    try expectFind("(?i)[a-z]+X", "fooxbar", "foox");
+}

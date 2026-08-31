@@ -237,6 +237,16 @@ const Blob = struct {
     bytes: [16]u8,
 };
 
+/// Widest run scanner: two SSE registers hold each range's bounds, leaving
+/// four for the data, the accumulator, and two temporaries.
+const max_simd_ranges = 6;
+
+/// The ASCII bytes a single-codepoint test accepts, as merged ranges.
+const AsciiSet = struct {
+    ranges: [max_simd_ranges]common.ClassRange,
+    len: usize,
+};
+
 /// Identical classes appear once per emit site (a repeat emits its child
 /// several times); one table each is enough.
 const BitsCache = struct {
@@ -273,6 +283,92 @@ pub const Gen = struct {
         try self.blobs.append(self.gpa, .{ .label = l, .bytes = bits });
         try self.bits_cache.append(self.gpa, .{ .bits = bits, .label = l });
         return l;
+    }
+
+    /// The ASCII acceptance set of a repeat's child, as ranges, when it is
+    /// narrow enough to drive the vector scanner. Null when the instruction
+    /// can match a non-ASCII codepoint (the scanner would have to stop and
+    /// re-enter around every helper call) or needs too many ranges.
+    fn asciiRunSet(self: *Gen, inst: compiler.Inst) ?AsciiSet {
+        if (!asciiOnly(self.prog, inst)) return null;
+        var accept: [128]bool = @splat(false);
+        switch (inst) {
+            .char => |c| {
+                accept[c.cp] = true;
+                if (c.ci) {
+                    if (c.cp >= 'a' and c.cp <= 'z') accept[c.cp - 32] = true;
+                    if (c.cp >= 'A' and c.cp <= 'Z') accept[c.cp + 32] = true;
+                }
+            },
+            .class => |cl| {
+                const ranges = self.prog.ranges[cl.start..][0..cl.len];
+                for (0..128) |cp| {
+                    accept[cp] = common.classMatches(ranges, cl.negated, cl.ci, @intCast(cp));
+                }
+            },
+            else => return null,
+        }
+        var set = AsciiSet{ .ranges = undefined, .len = 0 };
+        var cp: u21 = 0;
+        while (cp < 128) {
+            if (!accept[cp]) {
+                cp += 1;
+                continue;
+            }
+            const lo = cp;
+            while (cp < 128 and accept[cp]) cp += 1;
+            if (set.len == max_simd_ranges) return null;
+            set.ranges[set.len] = .{ .lo = lo, .hi = cp - 1 };
+            set.len += 1;
+        }
+        return if (set.len == 0) null else set;
+    }
+
+    /// Consume a run of accepted ASCII bytes sixteen at a time.
+    ///
+    /// For each range the vector `(lo > v) | (v > hi)` marks the bytes
+    /// outside it; ANDing those across ranges marks bytes outside the whole
+    /// set, and the first such byte ends the run. The comparison is signed,
+    /// so any byte >= 0x80 reads as negative, falls outside every ASCII
+    /// range, and correctly stops the scan — the scalar loop that follows
+    /// then handles it. Exact for ASCII-only children, so the scalar loop
+    /// only ever finishes the sub-16-byte tail.
+    fn emitSimdRun(self: *Gen, set: AsciiSet) Error!void {
+        const a = &self.a;
+        var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
+        var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
+        for (set.ranges[0..set.len], 0..) |r, i| {
+            lo_regs[i] = @enumFromInt(2 + 2 * i);
+            hi_regs[i] = @enumFromInt(3 + 2 * i);
+            a.movdquXmmLabel(lo_regs[i], try self.emitBlob(@splat(@intCast(r.lo))));
+            a.movdquXmmLabel(hi_regs[i], try self.emitBlob(@splat(@intCast(r.hi))));
+        }
+        const l_loop = try a.here();
+        const l_done = try a.label();
+        const l_partial = try a.label();
+        // Sixteen bytes left to read?
+        a.movRegReg(.rax, r_len);
+        a.subRegReg(.rax, r_pos);
+        a.cmpRegImm(.rax, 16);
+        a.jcc(.b, l_done);
+        a.movdquXmmMem(.xmm0, inputAt(r_pos, 0));
+        for (0..set.len) |i| {
+            a.movdqaXmmXmm(.xmm14, lo_regs[i]);
+            a.pcmpgtbXmmXmm(.xmm14, .xmm0); // lo > v
+            a.movdqaXmmXmm(.xmm15, .xmm0);
+            a.pcmpgtbXmmXmm(.xmm15, hi_regs[i]); // v > hi
+            a.porXmmXmm(.xmm14, .xmm15); // outside this range
+            if (i == 0) a.movdqaXmmXmm(.xmm1, .xmm14) else a.pandXmmXmm(.xmm1, .xmm14);
+        }
+        a.pmovmskbRegXmm(.rax, .xmm1);
+        a.testRegReg(.rax, .rax);
+        a.jcc(.ne, l_partial);
+        a.addRegImm(r_pos, 16);
+        a.jmp(l_loop);
+        a.place(l_partial);
+        a.bsfRegReg(.rax, .rax); // first byte outside the set
+        a.addRegReg(r_pos, .rax);
+        a.place(l_done);
     }
 
     /// 128-bit acceptance table for codepoints 0..127.
@@ -571,6 +667,11 @@ pub const Gen = struct {
         a.movMemReg(ctxMem(ctx_scratch0), r_pos);
         const l_loop_done = try a.label();
         if (r.max == compiler.RepOp.unbounded) {
+            // No iteration count to maintain here, so the run can be scanned
+            // in bulk; the scalar loop then finishes the tail.
+            if (self.asciiRunSet(self.prog.insts[child_pc])) |set| {
+                try self.emitSimdRun(set);
+            }
             const l_loop = try a.here();
             try self.emitTest(child_pc, l_loop_done, true);
             a.jmp(l_loop);
@@ -593,6 +694,12 @@ pub const Gen = struct {
             }
         }
         a.place(l_loop_done);
+
+        if (retryIsFutile(self.prog, pc)) {
+            // No shorter run can match, so this repeat leaves no frame at all.
+            a.jmp(cont);
+            return;
+        }
 
         const l_noframe = try a.label();
         const retry = try a.label();
@@ -706,6 +813,38 @@ fn retryScanChar(prog: compiler.Program, cont_pc: u32) ?ScanChar {
     if (c.cp >= 0x80) return null;
     const folds = c.ci and ((c.cp >= 'a' and c.cp <= 'z') or (c.cp >= 'A' and c.cp <= 'Z'));
     return .{ .byte = @intCast(c.cp), .ci = folds };
+}
+
+/// Whether a byte is accepted by a repeat's child instruction.
+fn childAcceptsByte(prog: compiler.Program, child: compiler.Inst, byte: u8) bool {
+    const cp: u21 = byte;
+    return switch (child) {
+        .char => |c| common.charEq(c.cp, cp, c.ci),
+        .class => |cl| common.classMatches(
+            prog.ranges[cl.start..][0..cl.len],
+            cl.negated,
+            cl.ci,
+            cp,
+        ),
+        .any => true,
+        .any_not_nl => cp != '\n',
+        else => false,
+    };
+}
+
+/// Can a shorter run ever help? Greedy retries resume strictly inside the run
+/// the repeat consumed, so the byte at any retry position is one the child
+/// matched. If the continuation must match a literal the child never matches
+/// -- `\w+@`, `[a-z]+-` -- no retry can succeed and no frame is needed.
+fn retryIsFutile(prog: compiler.Program, pc: u32) bool {
+    const sc = retryScanChar(prog, pc + 2) orelse return false;
+    const child = prog.insts[pc + 1];
+    if (childAcceptsByte(prog, child, sc.byte)) return false;
+    if (sc.ci) {
+        const other: u8 = if (sc.byte >= 'a') sc.byte - 32 else sc.byte + 32;
+        if (childAcceptsByte(prog, child, other)) return false;
+    }
+    return true;
 }
 
 /// Detects the leading greedy unbounded repeat that lets a failed attempt skip
@@ -936,6 +1075,9 @@ pub fn compile(
             const l_skip_done = try a.label();
             a.cmpMemImm32(ctxMem(ctx_touched), 0);
             a.jcc(.ne, l_no_skip);
+            if (g.asciiRunSet(prog.insts[child_pc])) |set| {
+                try g.emitSimdRun(set);
+            }
             const l_loop = try a.here();
             try g.emitTest(child_pc, l_skip_done, true);
             a.jmp(l_loop);

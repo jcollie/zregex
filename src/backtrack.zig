@@ -155,7 +155,7 @@ const Bt = struct {
         }
         if (count < r.min) return null;
         if (r.greedy) {
-            if (p > min_pos) {
+            if (p > min_pos and !self.retryFutile(pc)) {
                 // One frame covers every shorter retry.
                 try self.stack.append(self.gpa, .{
                     .pc = pc + 2,
@@ -210,6 +210,24 @@ const Bt = struct {
         if (c.cp >= 0x80) return null; // ASCII only: always a boundary
         const folds = c.ci and ((c.cp >= 'a' and c.cp <= 'z') or (c.cp >= 'A' and c.cp <= 'Z'));
         return .{ .byte = @intCast(c.cp), .ci = folds };
+    }
+
+    /// Can a shorter run ever help?
+    ///
+    /// Greedy retries only ever resume strictly inside the run the repeat
+    /// consumed, so the byte at any retry position is one the child matched.
+    /// If the continuation must match a literal the child never matches --
+    /// `\w+@`, `[a-z]+-`, `\d+x` -- no retry can succeed, and the frame (and
+    /// the backward scan it would drive) is pure overhead.
+    fn retryFutile(self: *Bt, pc: u32) bool {
+        const sc = self.retryScanChar(pc + 2) orelse return false;
+        const child = self.prog.insts[pc + 1];
+        if (repAccepts(self.prog, child, sc.byte)) return false;
+        if (sc.ci) {
+            const other: u8 = if (sc.byte >= 'a') sc.byte - 32 else sc.byte + 32;
+            if (repAccepts(self.prog, child, other)) return false;
+        }
+        return true;
     }
 
     /// Last position in [lo, hi) holding `sc` (case-folded if ci).

@@ -11,7 +11,8 @@ Three engines behind one API:
 
 - **JIT** — on x86-64, patterns are compiled to native machine code: literals
   become byte compares, classes become bit-test tables, and repeats become
-  tight consume loops. It backtracks, so it carries a step budget
+  consume loops that scan sixteen bytes at a time with SSE2 (baseline on
+  x86-64, so no CPU feature detection is involved). It backtracks, so it carries a step budget
   proportional to the input; exhausting it hands the search to one of the
   interpreters below, which is what keeps every guarantee below intact.
 - **Pike VM + lazy DFA** — patterns without backreferences or lookaround run

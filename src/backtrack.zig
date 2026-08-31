@@ -469,7 +469,15 @@ const Bt = struct {
                             _ = self.stack.pop();
                             continue;
                         }
-                        top.pos -= common.decodeBefore(input, top.pos).len;
+                        // A codepoint can straddle the floor when the search
+                        // started inside one, and stepping over it would put
+                        // the match end before its own start.
+                        const back = common.decodeBefore(input, top.pos).len;
+                        if (top.pos - back < top.aux) {
+                            _ = self.stack.pop();
+                            continue;
+                        }
+                        top.pos -= back;
                         pc = top.pc;
                         pos = top.pos;
                         continue :step;

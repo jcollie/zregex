@@ -366,21 +366,14 @@ const Gen = struct {
                 a.place(l_ok);
             },
             .behind_pos, .behind_neg => {
+                // Asking the helper, rather than stepping back and decoding
+                // forward: those differ wherever the text is not valid UTF-8.
                 const positive = l.kind == .behind_pos;
-                const l_nomatch = try a.label();
-                const l_restore_fail = try a.label();
-                const l_done = try a.label();
-                a.cbz(r_pos, l_nomatch);
-                self.storeCtx(r_pos, runtime.ctx_scratch2);
-                try self.emitStepBack();
-                try self.emitTest(child_pc, l_restore_fail, false);
-                self.loadCtx(r_pos, runtime.ctx_scratch2);
-                if (positive) a.b(l_done) else a.b(self.l_fail);
-                a.place(l_restore_fail);
-                self.loadCtx(r_pos, runtime.ctx_scratch2);
-                a.place(l_nomatch);
-                if (positive) a.b(self.l_fail);
-                a.place(l_done);
+                a.movReg(.x0, r_ctx);
+                a.movImm(.x1, child_pc);
+                a.movReg(.x2, r_pos);
+                self.call(&runtime.helperLookBehind);
+                if (positive) a.cbz(.x0, self.l_fail) else a.cbnz(.x0, self.l_fail);
             },
         }
     }
@@ -554,6 +547,11 @@ const Gen = struct {
             a.cmpReg(r_pos, .x9);
             a.bcond(.ls, l_pop_fail);
             try self.emitStepBack();
+            // A codepoint can straddle the floor when the search started
+            // inside one; the helper may have clobbered x9, so reload it.
+            a.ldur(.x9, r_stack, @as(i32, runtime.frame_aux) - runtime.frame_size);
+            a.cmpReg(r_pos, .x9);
+            a.bcond(.lo, l_pop_fail);
         }
         a.stur(r_pos, r_stack, @as(i32, runtime.frame_pos) - runtime.frame_size);
         a.b(cont);

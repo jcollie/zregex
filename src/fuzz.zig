@@ -196,8 +196,22 @@ fn oneCase(src: Source) anyerror!void {
 
     var hay: std.ArrayList(u8) = .empty;
     defer hay.deinit(gpa);
-    const hay_len = src.intRange(u8, 0, 24);
-    for (0..hay_len) |_| try hay.appendSlice(gpa, chunks[src.index(chunks.len)]);
+    // Most haystacks stay short, where a bug is easiest to read back. Some
+    // are long, with long runs of one character: nothing shorter than a
+    // vector block ever reaches the SIMD scanners, the lead-run skip, or a
+    // prefilter search that has to cross real distance.
+    if (src.intRange(u8, 0, 3) == 0) {
+        const runs = src.intRange(u8, 1, 8);
+        for (0..runs) |_| {
+            const piece = chunks[src.index(chunks.len)];
+            const n = src.intRange(u16, 1, 200);
+            for (0..n) |_| try hay.appendSlice(gpa, piece);
+            try hay.appendSlice(gpa, chunks[src.index(chunks.len)]);
+        }
+    } else {
+        const hay_len = src.intRange(u8, 0, 24);
+        for (0..hay_len) |_| try hay.appendSlice(gpa, chunks[src.index(chunks.len)]);
+    }
 
     const needs_backtrack = re.fallback_engine == .backtrack;
 
@@ -223,7 +237,16 @@ fn oneCase(src: Source) anyerror!void {
     var actual: std.ArrayList(?Span) = .empty;
     defer actual.deinit(gpa);
 
-    for (configs) |cfg| {
+    // A few offsets to search from, the same ones for every configuration.
+    var starts: [4]usize = undefined;
+    var start_count: usize = 0;
+    if (hay.items.len != 0) {
+        while (start_count < starts.len) : (start_count += 1) {
+            starts[start_count] = src.index(hay.items.len + 1);
+        }
+    }
+
+    configs: for (configs) |cfg| {
         if (needs_backtrack and !cfg.handles_backtrack_only) continue;
         if (std.mem.eql(u8, cfg.name, "jit") and re.jit_code == null) continue;
 
@@ -231,9 +254,29 @@ fn oneCase(src: Source) anyerror!void {
         cfg.apply(&probe);
         actual.clearRetainingCapacity();
         collect(gpa, &probe, hay.items, compare_groups, &actual) catch |err| switch (err) {
-            error.StepLimitExceeded => continue,
+            error.StepLimitExceeded => continue :configs,
             else => return err,
         };
+
+        // Searching from an offset is its own path: assertions and lookbehind
+        // have to see the text before the start, which `find` never exercises.
+        for (starts[0..start_count]) |st| {
+            if (st > hay.items.len) continue;
+            // Giving up part way would leave this configuration with fewer
+            // results than the reference and read as a disagreement, so a
+            // configuration that runs out of budget is dropped whole.
+            const m = probe.findAt(gpa, hay.items, st) catch |err| switch (err) {
+                error.StepLimitExceeded => continue :configs,
+                else => return err,
+            };
+            if (m) |mm| {
+                var owned = mm;
+                defer owned.deinit(gpa);
+                try actual.append(gpa, owned.span());
+            } else {
+                try actual.append(gpa, null);
+            }
+        }
 
         if (reference_name.len == 0 or (per_family and cfg.family != reference_family)) {
             reference_name = cfg.name;

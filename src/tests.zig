@@ -759,3 +759,52 @@ test "cases where PCRE2 is the one that is wrong" {
     try expectFind("(?:a){0,0}A", "A", "A");
     try expectFind("(?:(?=x)+){0}A", "A", "A");
 }
+
+test "lookbehind at a position inside a multi-byte sequence" {
+    // Found by differential fuzzing. The JIT used to step back by the length
+    // `decodeBefore` reports and then decode *forward* from there, which is a
+    // different operation: starting inside a multi-byte sequence,
+    // `decodeBefore` falls back to the single byte before the position, while
+    // decoding forward finds the whole sequence, which ends elsewhere.
+    var re = try Regex.compile(gpa, "(?<=\u{20ac})");
+    defer re.deinit();
+    const hay = "ab\u{20ac}"; // '€' occupies bytes 2, 3 and 4
+    // Only the position just past the euro qualifies.
+    for ([_]usize{ 0, 1, 2, 3, 4 }) |start| {
+        var m = (try re.findAt(gpa, hay, start)).?;
+        defer m.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 5), m.span().start);
+    }
+    // And the position itself still qualifies when searched from directly.
+    var last = (try re.findAt(gpa, hay, 5)).?;
+    defer last.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 5), last.span().start);
+    // A negative lookbehind must agree with it position for position.
+    var neg = try Regex.compile(gpa, "(?<!\u{20ac})b");
+    defer neg.deinit();
+    try std.testing.expect(try neg.isMatch(gpa, "ab"));
+    try std.testing.expect(!try neg.isMatch(gpa, "\u{20ac}b"));
+}
+
+test "searching from inside a multi-byte codepoint" {
+    // `findAt` takes any byte offset, including one inside a codepoint. A
+    // greedy repeat retrying from there used to step back over the whole
+    // codepoint and land before the position the search started at, which
+    // reported a match ending before its own start.
+    const hay = "ab@aab A\u{20ac}"; // 'A' at 7, euro at 8, 9 and 10
+    for ([_][]const u8{ "[\u{a0}-\u{2fff}]*(?<=A)", ".*(?<=A)", "[\u{a0}-\u{2fff}]*(?<=\u{20ac})" }) |pat| {
+        var re = try Regex.compile(gpa, pat);
+        defer re.deinit();
+        for (0..hay.len + 1) |start| {
+            const m = try re.findAt(gpa, hay, start);
+            if (m) |found| {
+                var mm = found;
+                defer mm.deinit(gpa);
+                const sp = mm.span();
+                try std.testing.expect(sp.start >= start);
+                try std.testing.expect(sp.start <= sp.end);
+                try std.testing.expect(sp.end <= hay.len);
+            }
+        }
+    }
+}

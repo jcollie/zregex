@@ -134,6 +134,33 @@ pub fn helperTest(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
     return if (ok) d.len + 1 else 0;
 }
 
+/// Whether the single-codepoint sub-program at `pc` accepts the codepoint
+/// that *ends* at `pos`.
+///
+/// Generated code cannot get this by stepping back and decoding forward.
+/// Where the text is not valid UTF-8 the two disagree: at a position inside a
+/// multi-byte sequence, `decodeBefore` falls back to the single byte before
+/// it, while decoding forward from there finds the whole sequence — which
+/// ends somewhere else entirely.
+pub fn helperLookBehind(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
+    if (pos == 0) return 0;
+    const input = ctx.input[0..ctx.input_len];
+    const cp = common.decodeBefore(input, pos).cp;
+    const ok = switch (ctx.prog.insts[pc]) {
+        .char => |ch| common.charEq(ch.cp, cp, ch.ci),
+        .class => |cl| common.classMatches(
+            ctx.prog.ranges[cl.start..][0..cl.len],
+            cl.negated,
+            cl.ci,
+            cp,
+        ),
+        .any => true,
+        .any_not_nl => cp != '\n',
+        else => false,
+    };
+    return @intFromBool(ok);
+}
+
 /// Consumed length + 1 if the backreference at `pc` matches at `pos`.
 pub fn helperBackref(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
     const br = ctx.prog.insts[pc].backref;

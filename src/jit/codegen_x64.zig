@@ -476,22 +476,15 @@ pub const Gen = struct {
                 a.place(l_ok);
             },
             .behind_pos, .behind_neg => {
+                // Asking the helper, rather than stepping back and decoding
+                // forward: those differ wherever the text is not valid UTF-8.
                 const positive = l.kind == .behind_pos;
-                const l_nomatch = try a.label();
-                const l_restore_fail = try a.label();
-                const l_done = try a.label();
-                a.testRegReg(r_pos, r_pos);
-                a.jcc(.e, l_nomatch); // nothing precedes the start of input
-                a.movMemReg(ctxMem(ctx_scratch2), r_pos);
-                try self.emitStepBack();
-                try self.emitTest(child_pc, l_restore_fail, false);
-                a.movRegMem(r_pos, ctxMem(ctx_scratch2));
-                if (positive) a.jmp(l_done) else a.jmp(self.l_fail);
-                a.place(l_restore_fail);
-                a.movRegMem(r_pos, ctxMem(ctx_scratch2));
-                a.place(l_nomatch);
-                if (positive) a.jmp(self.l_fail);
-                a.place(l_done);
+                a.movRegReg(arg0, r_ctx);
+                a.movRegImm64(arg1, child_pc);
+                a.movRegReg(arg2, r_pos);
+                self.call(&runtime.helperLookBehind);
+                a.testRegReg(.rax, .rax);
+                a.jcc(if (positive) .e else .ne, self.l_fail);
             },
         }
     }
@@ -637,6 +630,11 @@ pub const Gen = struct {
             a.cmpRegReg(r_pos, .rcx);
             a.jcc(.be, l_pop_fail);
             try self.emitStepBack();
+            // A codepoint can straddle the floor when the search started
+            // inside one; the helper may have clobbered rcx, so reload it.
+            a.movRegMem(.rcx, floor);
+            a.cmpRegReg(r_pos, .rcx);
+            a.jcc(.b, l_pop_fail);
         }
         a.movMemReg(stored_pos, r_pos);
         a.jmp(cont);

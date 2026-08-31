@@ -219,9 +219,17 @@ only part that cares where it is:
 | Platform | JIT |
 |---|---|
 | Linux / BSD, x86-64 and aarch64 | yes |
+| Windows, x86-64 and aarch64 | yes |
 | macOS, Apple Silicon | yes, with the entitlement below |
 | macOS, Intel | yes |
 | anything else | no — the interpreters run instead |
+
+Each platform gets executable memory its own way: `mmap` plus `mprotect` on
+Linux and the BSDs, `VirtualAlloc` plus `VirtualProtect` on Windows, and
+`MAP_JIT` with a per-thread write toggle on Apple platforms. The generated
+code differs too — Windows x64 passes arguments in different registers than
+System V, reserves shadow space at every call, and expects `rsi`, `rdi` and
+`xmm6`-`xmm15` to come back unchanged.
 
 ### If you ship a macOS app that uses this library
 

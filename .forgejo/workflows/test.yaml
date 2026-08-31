@@ -31,7 +31,7 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check formatting
-        run: nix develop .#default -c zig fmt --check .
+        run: nix develop .#default -c zig fmt --check build.zig src bench tools
 
       - name: Check REUSE compliance
         run: nix develop .#default -c reuse lint

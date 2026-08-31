@@ -8,7 +8,8 @@
 //! executable from the CPU's point of view (W^X). Mappings are per compiled
 //! pattern and released by `deinit`.
 //!
-//! Two ways of getting there. Everywhere but Apple platforms, map
+//! Three ways of getting there. Windows allocates with `VirtualAlloc` and
+//! flips with `VirtualProtect`. Everywhere but Apple platforms, map
 //! read+write and `mprotect` to read+execute. Apple enforces W^X in hardware
 //! on Apple Silicon and rejects that transition, so there the region is
 //! mapped with `MAP_JIT` and write access is toggled per thread with
@@ -45,9 +46,14 @@ const darwin = struct {
 /// Whether this build can map executable memory at all. Platforms without it
 /// simply never JIT; every caller has an interpreter fallback.
 pub const supported = switch (builtin.os.tag) {
-    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .windows => true,
     else => false,
 };
+
+const is_windows = builtin.os.tag == .windows;
+
+/// Win32 bindings, imported only on the target that has them.
+const win32 = if (is_windows) @import("win32").everything else struct {};
 
 /// Make newly written instructions visible to the instruction fetcher.
 ///
@@ -58,8 +64,9 @@ pub const supported = switch (builtin.os.tag) {
 /// cache, with barriers between. The line sizes come from CTR_EL0, which
 /// reports them as a log2 count of 4-byte words.
 fn syncInstructionCache(code: []const u8) void {
-    // Apple platforms use sys_icache_invalidate instead; see `finalize`.
-    if (builtin.cpu.arch != .aarch64 or darwin_jit) return;
+    // Apple platforms use sys_icache_invalidate and Windows uses
+    // FlushInstructionCache; see `finalize`.
+    if (builtin.cpu.arch != .aarch64 or darwin_jit or is_windows) return;
     if (code.len == 0) return;
     const ctr = asm volatile ("mrs %[out], ctr_el0"
         : [out] "=r" (-> u64),
@@ -99,7 +106,7 @@ pub const Buffer = struct {
     /// Darwin only: this thread currently holds write access to MAP_JIT memory.
     writable: bool = false,
 
-    const Mode = enum { mprotect, map_jit };
+    const Mode = enum { mprotect, map_jit, virtual_protect };
 
     /// Reserve `size` bytes of writable memory to assemble into.
     ///
@@ -108,6 +115,17 @@ pub const Buffer = struct {
     /// analyze them.
     pub fn init(size: usize) Error!Buffer {
         if (!supported) return error.MemoryProtectionFailed;
+        if (is_windows) {
+            const len = std.mem.alignForward(usize, @max(size, 1), std.heap.pageSize());
+            const ptr = win32.VirtualAlloc(
+                null,
+                len,
+                .{ .COMMIT = 1, .RESERVE = 1 },
+                .{ .PAGE_READWRITE = 1 },
+            ) orelse return error.OutOfMemory;
+            const raw: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ptr));
+            return .{ .mapping = raw[0..len], .mode = .virtual_protect };
+        }
         if (supported) {
             const page = std.heap.pageSize();
             const len = std.mem.alignForward(usize, @max(size, 1), page);
@@ -146,9 +164,26 @@ pub const Buffer = struct {
     /// Make the first `code_len` bytes executable and no longer writable.
     pub fn finalize(self: *Buffer, code_len: usize) Error!void {
         if (!supported) return error.MemoryProtectionFailed;
+        if (is_windows) {
+            std.debug.assert(code_len <= self.mapping.len);
+            var old: win32.PAGE_PROTECTION_FLAGS = undefined;
+            if (win32.VirtualProtect(
+                self.mapping.ptr,
+                self.mapping.len,
+                .{ .PAGE_EXECUTE_READ = 1 },
+                &old,
+            ) == 0) return error.MemoryProtectionFailed;
+            self.code = self.mapping[0..code_len];
+            // Redundant on x86-64, where the caches are coherent, but it is
+            // what the API asks for and it matters on Windows-on-ARM.
+            _ = win32.FlushInstructionCache(win32.GetCurrentProcess(), self.mapping.ptr, code_len);
+            return;
+        }
         if (supported) {
             std.debug.assert(code_len <= self.mapping.len);
             switch (self.mode) {
+                // Windows returns above, before this switch.
+                .virtual_protect => unreachable,
                 .map_jit => {
                     if (darwin_jit) {
                         darwin.pthread_jit_write_protect_np(1);
@@ -178,6 +213,11 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
+        if (is_windows) {
+            _ = win32.VirtualFree(self.mapping.ptr, 0, .RELEASE);
+            self.* = undefined;
+            return;
+        }
         if (supported) {
             // Never leave the thread holding write access to JIT memory,
             // however this buffer is being abandoned.
@@ -204,8 +244,12 @@ test "code can take arguments" {
     if (!supported or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     var buf = try Buffer.init(64);
     defer buf.deinit();
-    // lea eax, [rdi + rsi] ; ret   (System V: args in rdi, rsi)
-    const code = [_]u8{ 0x8D, 0x04, 0x37, 0xC3 };
+    // The first two integer arguments live in different registers per ABI:
+    // rdi and rsi under System V, rcx and rdx under Windows x64.
+    const code = if (is_windows)
+        [_]u8{ 0x8D, 0x04, 0x11, 0xC3 } // lea eax, [rcx + rdx] ; ret
+    else
+        [_]u8{ 0x8D, 0x04, 0x37, 0xC3 }; // lea eax, [rdi + rsi] ; ret
     @memcpy(buf.mapping[0..code.len], &code);
     try buf.finalize(code.len);
     const f: *const fn (u32, u32) callconv(.c) u32 = @ptrCast(buf.code.ptr);

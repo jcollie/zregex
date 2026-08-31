@@ -147,12 +147,12 @@ numbers above:
 Match counts are identical in all four columns, across two architectures,
 three operating systems, and both the native-code and interpreter paths.
 
-Windows has no JIT — there is no equivalent there of the mapping dance the
-others do — so its column is the same code with the interpreters doing all
-the work, which makes it an unintentionally clean measure of what the JIT is
-worth: 4-6x on the repeat-heavy rows (`ing_suffix` 82 against 18, `email` 49
-against 8, `backref` 78 against 12), and nothing at all on `pathological`,
-where the lazy DFA was always the one answering.
+The Windows column above predates the Windows JIT backend, which makes it a
+clean measure of what native code is worth: the identical library with the
+interpreters doing all the work ran `ing_suffix` at 82 ms against 18,
+`email` at 49 against 8, and `backref` at 78 against 12 — 4-6x — while
+`pathological` was unchanged, the lazy DFA having always been the one
+answering there. Windows now JITs too, and lands with the others.
 
 The aarch64 macOS column is the first execution of the `MAP_JIT` path
 anywhere: `jit_available=true`, and every row selected the JIT, so Apple's

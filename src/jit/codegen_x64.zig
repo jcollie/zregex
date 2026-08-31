@@ -19,6 +19,7 @@
 //! Anything the generator does not support (multi-codepoint lookaround) makes
 //! `compile` return null and the caller keeps using the interpreter.
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("../common.zig");
 const compiler = @import("../compiler.zig");
 const x64 = @import("x64.zig");
@@ -68,6 +69,36 @@ const AsciiSet = runtime.AsciiSet;
 const retryScanChar = runtime.retryScanChar;
 const retryIsFutile = runtime.retryIsFutile;
 const leadSkipChild = runtime.leadSkipChild;
+
+// Windows x64 and System V differ in which registers carry arguments, which
+// are callee-saved, and whether the caller must leave scratch space above the
+// stack pointer for the callee. The generated code is otherwise identical.
+const win_abi = builtin.os.tag == .windows;
+const arg0: Reg = if (win_abi) .rcx else .rdi;
+const arg1: Reg = if (win_abi) .rdx else .rsi;
+const arg2: Reg = if (win_abi) .r8 else .rdx;
+/// Windows requires 32 bytes of shadow space above the stack pointer at every
+/// call; reserving it once in the prologue covers all of them. The extra 8
+/// keeps the stack 16-byte aligned given the pushes below.
+/// Chosen so that rsp is 16-byte aligned at every call given the pushes
+/// above: with eight of them rsp sits 8 past a boundary, and 40 (or 40 plus
+/// any multiple of 16) brings it back. The saved vector registers go above
+/// the 32-byte shadow space and are written with unaligned stores, so they
+/// impose no alignment of their own.
+const stack_reserve: i32 = if (win_abi) 40 else 8;
+/// xmm0..xmm5 are call-clobbered under both ABIs, so data, the accumulator
+/// and the two temporaries live there and a class needing one range touches
+/// nothing that must be preserved. Range constants start above them.
+const first_const_xmm = 4;
+/// Windows, unlike System V, requires xmm6..xmm15 to be preserved across a
+/// call, so a scanner wide enough to reach them saves what it uses.
+const first_saved_xmm = 6;
+/// rsi and rdi are callee-saved on Windows, and the generator uses both as
+/// scratch, so there they must be saved and restored.
+const saved_regs: []const Reg = if (win_abi)
+    &.{ .rbp, .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi }
+else
+    &.{ .rbp, .rbx, .r12, .r13, .r14, .r15 };
 
 // Registers holding machine state.
 const r_input: Reg = .rbx;
@@ -156,8 +187,8 @@ pub const Gen = struct {
         var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
         var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
-            lo_regs[i] = @enumFromInt(2 + 2 * i);
-            hi_regs[i] = @enumFromInt(3 + 2 * i);
+            lo_regs[i] = @enumFromInt(first_const_xmm + 2 * i);
+            hi_regs[i] = @enumFromInt(first_const_xmm + 1 + 2 * i);
             const lo: [32]u8 = @splat(@intCast(r.lo));
             const hi: [32]u8 = @splat(@intCast(r.hi));
             a.vmovdquYmmLabel(lo_regs[i], try self.emitBlob(&lo));
@@ -172,11 +203,11 @@ pub const Gen = struct {
         a.jcc(.b, l_done);
         a.vmovdquYmmMem(.xmm0, inputAt(r_pos, 0));
         for (0..set.len) |i| {
-            const acc: x64.Xmm = if (i == 0) .xmm1 else .xmm14;
+            const acc: x64.Xmm = if (i == 0) .xmm1 else .xmm2;
             a.vpcmpgtbYmm(acc, lo_regs[i], .xmm0); // lo > v
-            a.vpcmpgtbYmm(.xmm15, .xmm0, hi_regs[i]); // v > hi
-            a.vporYmm(acc, acc, .xmm15); // outside this range
-            if (i != 0) a.vpandYmm(.xmm1, .xmm1, .xmm14);
+            a.vpcmpgtbYmm(.xmm3, .xmm0, hi_regs[i]); // v > hi
+            a.vporYmm(acc, acc, .xmm3); // outside this range
+            if (i != 0) a.vpandYmm(.xmm1, .xmm1, .xmm2);
         }
         a.vpmovmskbRegYmm(.rax, .xmm1);
         a.testRegReg(.rax, .rax);
@@ -197,8 +228,8 @@ pub const Gen = struct {
         var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
         var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
-            lo_regs[i] = @enumFromInt(2 + 2 * i);
-            hi_regs[i] = @enumFromInt(3 + 2 * i);
+            lo_regs[i] = @enumFromInt(first_const_xmm + 2 * i);
+            hi_regs[i] = @enumFromInt(first_const_xmm + 1 + 2 * i);
             const lo: [16]u8 = @splat(@intCast(r.lo));
             const hi: [16]u8 = @splat(@intCast(r.hi));
             a.movdquXmmLabel(lo_regs[i], try self.emitBlob(&lo));
@@ -214,12 +245,12 @@ pub const Gen = struct {
         a.jcc(.b, l_done);
         a.movdquXmmMem(.xmm0, inputAt(r_pos, 0));
         for (0..set.len) |i| {
-            a.movdqaXmmXmm(.xmm14, lo_regs[i]);
-            a.pcmpgtbXmmXmm(.xmm14, .xmm0); // lo > v
-            a.movdqaXmmXmm(.xmm15, .xmm0);
-            a.pcmpgtbXmmXmm(.xmm15, hi_regs[i]); // v > hi
-            a.porXmmXmm(.xmm14, .xmm15); // outside this range
-            if (i == 0) a.movdqaXmmXmm(.xmm1, .xmm14) else a.pandXmmXmm(.xmm1, .xmm14);
+            a.movdqaXmmXmm(.xmm2, lo_regs[i]);
+            a.pcmpgtbXmmXmm(.xmm2, .xmm0); // lo > v
+            a.movdqaXmmXmm(.xmm3, .xmm0);
+            a.pcmpgtbXmmXmm(.xmm3, hi_regs[i]); // v > hi
+            a.porXmmXmm(.xmm2, .xmm3); // outside this range
+            if (i == 0) a.movdqaXmmXmm(.xmm1, .xmm2) else a.pandXmmXmm(.xmm1, .xmm2);
         }
         a.pmovmskbRegXmm(.rax, .xmm1);
         a.testRegReg(.rax, .rax);
@@ -319,8 +350,8 @@ pub const Gen = struct {
                 a.place(l_high);
                 // Non-ASCII is never '\n', so both forms just consume it.
                 if (advance) {
-                    a.movRegReg(.rdi, r_ctx);
-                    a.movRegReg(.rsi, r_pos);
+                    a.movRegReg(arg0, r_ctx);
+                    a.movRegReg(arg1, r_pos);
                     self.call(&helperCpLen);
                     a.addRegReg(r_pos, .rax);
                 }
@@ -334,9 +365,9 @@ pub const Gen = struct {
     /// The generic path: call `helperTest` and advance by what it consumed.
     fn emitHelperTest(self: *Gen, pc: u32, on_fail: x64.Label, advance: bool) Error!void {
         const a = &self.a;
-        a.movRegReg(.rdi, r_ctx);
-        a.movRegImm64(.rsi, pc);
-        a.movRegReg(.rdx, r_pos);
+        a.movRegReg(arg0, r_ctx);
+        a.movRegImm64(arg1, pc);
+        a.movRegReg(arg2, r_pos);
         self.call(&helperTest);
         a.testRegReg(.rax, .rax);
         a.jcc(.e, on_fail);
@@ -422,8 +453,8 @@ pub const Gen = struct {
         a.movzxRegMem8(.rax, inputAt(r_pos, -1));
         a.cmpReg8Imm(.rax, 0x80);
         a.jcc(.b, l_one);
-        a.movRegReg(.rdi, r_ctx);
-        a.movRegReg(.rsi, r_pos);
+        a.movRegReg(arg0, r_ctx);
+        a.movRegReg(arg1, r_pos);
         self.call(&helperCpLenBefore);
         a.subRegReg(r_pos, .rax);
         a.jmp(l_done);
@@ -653,6 +684,23 @@ pub const Gen = struct {
 /// A literal the continuation of a greedy repeat must match next, letting
 /// retries jump between its occurrences (the JIT's form of the interpreter's
 /// required-literal scanning).
+/// The widest run scanner this program will emit, in ranges: that decides how
+/// many vector registers the code touches, and so how many Windows expects it
+/// to hand back unchanged.
+fn maxSimdRanges(prog: compiler.Program) usize {
+    var most: usize = 0;
+    for (prog.insts, 0..) |inst, pc| {
+        if (inst != .rep) continue;
+        const r = inst.rep;
+        if (!r.greedy or r.max != compiler.RepOp.unbounded) continue;
+        if (runtime.asciiRunSet(prog, prog.insts[pc + 1])) |set| most = @max(most, set.len);
+    }
+    if (runtime.leadSkipChild(prog)) |child_pc| {
+        if (runtime.asciiRunSet(prog, prog.insts[child_pc])) |set| most = @max(most, set.len);
+    }
+    return most;
+}
+
 pub fn compile(
     gpa: std.mem.Allocator,
     prog: compiler.Program,
@@ -696,16 +744,29 @@ pub fn compile(
     g.l_word_table = try a.label();
 
     // -- prologue -----------------------------------------------------------
-    a.push(.rbp);
-    a.push(.rbx);
-    a.push(.r12);
-    a.push(.r13);
-    a.push(.r14);
-    a.push(.r15);
-    // Six pushes leave rsp 8 past a 16-byte boundary; this realigns it so the
-    // helper calls see the stack the System V ABI requires.
-    a.subRegImm(.rsp, 8);
-    a.movRegReg(r_ctx, .rdi);
+    // Range constants occupy xmm(first_const_xmm) upward; on Windows anything
+    // from xmm6 up must come back unchanged, so it is saved here.
+    const ranges_used = maxSimdRanges(prog);
+    const highest_xmm: usize = if (ranges_used == 0) 0 else first_const_xmm + 2 * ranges_used - 1;
+    const xmm_saves: i32 = if (win_abi and highest_xmm >= first_saved_xmm)
+        @intCast(highest_xmm - first_saved_xmm + 1)
+    else
+        0;
+    // Saved above the shadow space, and 16-byte aligned because rsp is.
+    const reserve: i32 = stack_reserve + 16 * xmm_saves;
+
+    inline for (saved_regs) |r| a.push(r);
+    // The pushes leave rsp 8 past a 16-byte boundary; this realigns it, and on
+    // Windows also claims the shadow space every call there requires.
+    a.subRegImm(.rsp, reserve);
+    {
+        var i: i32 = 0;
+        while (i < xmm_saves) : (i += 1) {
+            const reg: x64.Xmm = @enumFromInt(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i)))));
+            a.movdquMemXmm(.{ .base = .rsp, .disp = stack_reserve + 16 * i }, reg);
+        }
+    }
+    a.movRegReg(r_ctx, arg0);
     a.movRegMem(r_input, ctxMem(ctx_input));
     a.movRegMem(r_len, ctxMem(ctx_input_len));
     a.movRegMem(r_pos, ctxMem(ctx_start));
@@ -719,9 +780,9 @@ pub fn compile(
         const pf_table = try a.label();
         if (prefilter.single) |byte| {
             // One candidate byte: hand the scan to a vectorized search.
-            a.movRegReg(.rdi, r_ctx);
-            a.movRegReg(.rsi, r_pos);
-            a.movRegImm64(.rdx, byte);
+            a.movRegReg(arg0, r_ctx);
+            a.movRegReg(arg1, r_pos);
+            a.movRegImm64(arg2, byte);
             g.call(&helperMemchr);
             a.movRegReg(r_pos, .rax);
             a.cmpRegReg(r_pos, r_len);
@@ -744,8 +805,8 @@ pub fn compile(
                 const l_stepped = try a.label();
                 a.cmpReg8Imm(.rax, 0x80);
                 a.jcc(.b, l_one);
-                a.movRegReg(.rdi, r_ctx);
-                a.movRegReg(.rsi, r_pos);
+                a.movRegReg(arg0, r_ctx);
+                a.movRegReg(arg1, r_pos);
                 g.call(&helperCpLen);
                 a.addRegReg(r_pos, .rax);
                 a.jmp(l_stepped);
@@ -792,9 +853,9 @@ pub fn compile(
             },
             .backref => {
                 a.movMemImm32(ctxMem(ctx_touched), 1);
-                a.movRegReg(.rdi, r_ctx);
-                a.movRegImm64(.rsi, pc);
-                a.movRegReg(.rdx, r_pos);
+                a.movRegReg(arg0, r_ctx);
+                a.movRegImm64(arg1, pc);
+                a.movRegReg(arg2, r_pos);
                 g.call(&helperBackref);
                 a.testRegReg(.rax, .rax);
                 a.jcc(.e, g.l_fail);
@@ -883,8 +944,8 @@ pub fn compile(
         a.movzxRegMem8(.rax, inputAt(r_pos, 0));
         a.cmpReg8Imm(.rax, 0x80);
         a.jcc(.b, l_one);
-        a.movRegReg(.rdi, r_ctx);
-        a.movRegReg(.rsi, r_pos);
+        a.movRegReg(arg0, r_ctx);
+        a.movRegReg(arg1, r_pos);
         g.call(&helperCpLen);
         a.addRegReg(r_pos, .rax);
         a.jmp(g.l_attempt);
@@ -902,13 +963,19 @@ pub fn compile(
     a.movRegImm64(.rax, @bitCast(@as(i64, -1)));
 
     a.place(g.l_epilogue);
-    a.addRegImm(.rsp, 8);
-    a.pop(.r15);
-    a.pop(.r14);
-    a.pop(.r13);
-    a.pop(.r12);
-    a.pop(.rbx);
-    a.pop(.rbp);
+    {
+        var i: i32 = 0;
+        while (i < xmm_saves) : (i += 1) {
+            const reg: x64.Xmm = @enumFromInt(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i)))));
+            a.movdquXmmMem(reg, .{ .base = .rsp, .disp = stack_reserve + 16 * i });
+        }
+    }
+    a.addRegImm(.rsp, reserve);
+    comptime var back = saved_regs.len;
+    inline while (back > 0) {
+        back -= 1;
+        a.pop(saved_regs[back]);
+    }
     a.ret();
 
     // -- data ---------------------------------------------------------------

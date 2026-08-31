@@ -2,5 +2,7 @@
 # SPDX-License-Identifier: MIT
 .zig-cache/
 zig-out/
+# Zig's project-local store for fetched dependencies.
+zig-pkg/
 bench/out/
 qemu_*.core

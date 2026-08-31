@@ -6,7 +6,15 @@
     // Globally unique package identifier together with `name`; never changes.
     .fingerprint = 0x9f5d80d30fd26c90, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // Win32 bindings, used by the JIT to map executable memory. Lazy so
+        // that builds for other targets never fetch it.
+        .zigwin32 = .{
+            .url = "git+https://github.com/marlersoft/zigwin32#9f15c276b4e9d05afd34a10d8662a7dfc34647ea",
+            .hash = "win32-42.0.39-preview-mX5pFS564gPTezZn4v3TMxRnfJUrZNx1B_F2p2HKXOeG",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

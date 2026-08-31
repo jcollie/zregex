@@ -479,6 +479,16 @@ pub const Asm = struct {
         self.emitMem(dst.low(), m);
     }
 
+    /// `movdqu [mem], src`.
+    pub fn movdquMemXmm(self: *Asm, m: Mem, src: Xmm) void {
+        const rb = memRexBits(m);
+        self.b(0xF3);
+        self.rex(0, src.ext(), rb.x, rb.b);
+        self.b(0x0F);
+        self.b(0x7F);
+        self.emitMem(src.low(), m);
+    }
+
     /// `movdqu dst, [rip+label]`.
     pub fn movdquXmmLabel(self: *Asm, dst: Xmm, l: Label) void {
         self.b(0xF3);

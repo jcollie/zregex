@@ -13,6 +13,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // On Windows the JIT maps executable memory through the Win32 API.
+    // Lazy, so builds for other targets never fetch the bindings.
+    if (target.result.os.tag == .windows) {
+        if (b.lazyDependency("zigwin32", .{})) |win32| {
+            mod.addImport("win32", win32.module("win32"));
+        }
+    }
+
     // Demo CLI.
     const exe = b.addExecutable(.{
         .name = "zregex",

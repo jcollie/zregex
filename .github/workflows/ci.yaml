@@ -52,7 +52,7 @@ jobs:
           version: 0.16.0
 
       - name: Check formatting
-        run: zig fmt --check .
+        run: zig fmt --check build.zig src bench tools
 
       - name: Run tests
         run: zig build test

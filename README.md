@@ -9,8 +9,10 @@ A regular expression library for Zig 0.16.
 
 Two engines behind one API:
 
-- **Pike VM** — patterns without backreferences or lookaround run in
-  guaranteed linear time (no catastrophic backtracking, ever).
+- **Pike VM + lazy DFA** — patterns without backreferences or lookaround run
+  in guaranteed linear time (no catastrophic backtracking, ever). An RE2-style
+  lazy DFA finds match spans at one table transition per codepoint; the Pike
+  VM extracts captures from a small window.
 - **Backtracker** — patterns using backreferences or lookaround fall back to a
   backtracking engine with a configurable step budget
   (`error.StepLimitExceeded` instead of hanging).

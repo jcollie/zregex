@@ -8,6 +8,7 @@ const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const pike = @import("pike.zig");
 const backtrack = @import("backtrack.zig");
+const dfa = @import("dfa.zig");
 
 pub const Flags = common.Flags;
 pub const ParseError = parser.ParseError;
@@ -62,6 +63,13 @@ pub const Regex = struct {
     engine: Engine,
     /// Which bytes a match can start with; lets the engines skip ahead.
     prefilter: compiler.Prefilter,
+    /// Codepoint partition for the lazy DFA; `alphabet.ok == false` disables it.
+    alphabet: compiler.Alphabet,
+    /// Lazy DFA policy. `.auto` uses the DFA only when the byte prefilter is
+    /// weak (a broad or unusable candidate set) — when the prefilter is
+    /// highly selective, memchr-style skipping with the Pike VM alone is
+    /// faster than any per-codepoint automaton. `.on`/`.off` force it.
+    dfa_mode: enum { auto, on, off } = .auto,
     /// Step budget for the backtracking engine, applied per match attempt
     /// (per start position, like PCRE's match limit); tune per regex if
     /// needed.
@@ -114,6 +122,15 @@ pub const Regex = struct {
         defer gpa.free(pf_stack);
         const prefilter = compiler.computeFirstBytes(insts, ranges, visited, pf_stack);
 
+        const abuf = try gpa.alloc(u21, compiler.alphabetBufferSize(counts.insts));
+        defer gpa.free(abuf);
+        var alphabet = compiler.computeAlphabet(insts, ranges, abuf);
+        if (alphabet.ok) {
+            alphabet.starts = try gpa.dupe(u21, alphabet.starts);
+        } else {
+            alphabet.starts = &.{};
+        }
+
         // Group names point into `pattern`, which the caller may free; copy
         // them into one owned buffer.
         var name_bytes: usize = 0;
@@ -139,6 +156,7 @@ pub const Regex = struct {
             .flags = flags,
             .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
             .prefilter = prefilter,
+            .alphabet = alphabet,
             .gpa = gpa,
         };
     }
@@ -185,6 +203,11 @@ pub const Regex = struct {
                 &pf_stack,
             );
 
+            var abuf: [compiler.alphabetBufferSize(counts.insts)]u21 = undefined;
+            var alphabet = compiler.computeAlphabet(&final_insts, &final_ranges, &abuf);
+            const final_starts: [alphabet.starts.len]u21 = abuf[0..alphabet.starts.len].*;
+            alphabet.starts = &final_starts;
+
             return .{
                 .program = &final_insts,
                 .ranges = &final_ranges,
@@ -194,6 +217,7 @@ pub const Regex = struct {
                 .flags = flags,
                 .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
                 .prefilter = prefilter,
+                .alphabet = alphabet,
                 .gpa = null,
             };
         }
@@ -205,6 +229,7 @@ pub const Regex = struct {
             gpa.free(self.ranges);
             gpa.free(self.names);
             gpa.free(self.names_buf);
+            gpa.free(self.alphabet.starts);
         }
         self.* = undefined;
     }
@@ -232,9 +257,29 @@ pub const Regex = struct {
         };
     }
 
+    fn dfaEligible(self: *const Regex) bool {
+        if (self.engine != .pike or !self.alphabet.ok) return false;
+        return switch (self.dfa_mode) {
+            .off => false,
+            .on => true,
+            // A 1-2 byte prefilter is a memchr-class skip nothing beats;
+            // anything broader profits from the DFA.
+            .auto => !self.prefilter.usable or self.prefilter.count > 2,
+        };
+    }
+
     /// Does the pattern match anywhere in `haystack`? The allocator is only
     /// used for engine scratch space and is fully released before returning.
     pub fn isMatch(self: *const Regex, gpa: std.mem.Allocator, haystack: []const u8) RunError!bool {
+        if (self.dfaEligible()) {
+            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet);
+            defer machine.deinit();
+            switch (try dfa.search(&machine, haystack, 0, .is_match)) {
+                .match => return true,
+                .no_match => return false,
+                .give_up => {}, // cache blew up; fall through to the Pike VM
+            }
+        }
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
         return self.runEngine(gpa, haystack, 0, slots);
@@ -252,9 +297,41 @@ pub const Regex = struct {
         haystack: []const u8,
         start: usize,
     ) RunError!?Match {
+        if (self.dfaEligible()) {
+            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet);
+            defer machine.deinit();
+            return self.findAtWith(gpa, haystack, start, &machine);
+        }
+        return self.findAtWith(gpa, haystack, start, null);
+    }
+
+    /// Search core; `machine` is a warm DFA cache (the iterator keeps one
+    /// across calls) or null to use the fallback engine directly.
+    fn findAtWith(
+        self: *const Regex,
+        gpa: std.mem.Allocator,
+        haystack: []const u8,
+        start: usize,
+        machine: ?*dfa.Machine,
+    ) RunError!?Match {
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
-        if (!try self.runEngine(gpa, haystack, start, slots)) return null;
+        if (machine) |m| {
+            // The DFA finds the span; the Pike VM reruns only the window
+            // where the match can start, to extract captures.
+            switch (try dfa.search(m, haystack, start, .find)) {
+                .no_match => return null,
+                .match => |sp| {
+                    const ok = try pike.run(gpa, self.prog(), haystack, sp.window_start, slots);
+                    std.debug.assert(ok); // the DFA is a memoized Pike VM
+                },
+                .give_up => {
+                    if (!try self.runEngine(gpa, haystack, start, slots)) return null;
+                },
+            }
+        } else {
+            if (!try self.runEngine(gpa, haystack, start, slots)) return null;
+        }
 
         const groups = try gpa.alloc(?Span, self.group_count);
         for (groups, 0..) |*g, i| {
@@ -284,11 +361,24 @@ pub const Regex = struct {
         haystack: []const u8,
         pos: usize = 0,
         done: bool = false,
+        /// Warm DFA cache shared across `next()` calls; created lazily.
+        machine: ?dfa.Machine = null,
+
+        /// Frees the iterator's DFA cache. Safe to call whether or not any
+        /// `next()` call was made.
+        pub fn deinit(self: *Iterator) void {
+            if (self.machine) |*m| m.deinit();
+            self.* = undefined;
+        }
 
         /// Caller owns the returned Match (free with `Match.deinit`).
         pub fn next(self: *Iterator) RunError!?Match {
             if (self.done) return null;
-            const m = (try self.re.findAt(self.gpa, self.haystack, self.pos)) orelse {
+            if (self.machine == null and self.re.dfaEligible()) {
+                self.machine = try dfa.Machine.init(self.gpa, self.re.prog(), &self.re.alphabet);
+            }
+            const mach: ?*dfa.Machine = if (self.machine) |*m| m else null;
+            const m = (try self.re.findAtWith(self.gpa, self.haystack, self.pos, mach)) orelse {
                 self.done = true;
                 return null;
             };

@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
 
     try out.print("engine: {t}\n", .{re.engine});
     var it = re.iterator(arena, text);
+    defer it.deinit();
     var n: usize = 0;
     while (try it.next()) |m| {
         var match = m;

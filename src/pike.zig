@@ -68,7 +68,10 @@ const Ctx = struct {
     }
 
     /// Add `pc0` and its epsilon closure to `list` in priority (DFS) order.
-    fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, start: usize, slots0: ?*const SlotNode) !void {
+    /// Force-inlined: when the Pike VM lost single-call-site inlining (the
+    /// lazy DFA added callers), the outlined closure cost ~2x on scan-heavy
+    /// patterns.
+    inline fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, start: usize, slots0: ?*const SlotNode) !void {
         if (!self.tryEnter(gen, pc0)) return;
         var sp: usize = 0;
         self.stack[sp] = .{ .pc = pc0, .start = start, .slots = slots0 };

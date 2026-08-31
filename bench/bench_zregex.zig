@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
             const t0 = std.Io.Timestamp.now(io, .awake);
             var c: usize = 0;
             var it = re.iterator(gpa, haystack);
+            defer it.deinit();
             while (try it.next()) |m| {
                 var mm = m;
                 mm.deinit(gpa);

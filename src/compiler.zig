@@ -353,12 +353,16 @@ pub const Prefilter = struct {
     ascii_only: bool,
     /// Exactly one candidate byte (ASCII): use a vectorized memchr scan.
     single: ?u8,
+    /// How many bytes are candidates; a small count means byte-skipping
+    /// alone is highly selective.
+    count: u16,
 
     pub const unusable: Prefilter = .{
         .bytes = @splat(true),
         .usable = false,
         .ascii_only = false,
         .single = null,
+        .count = 256,
     };
 
     /// First position >= `start` where a match could begin (input.len if
@@ -501,5 +505,166 @@ pub fn computeFirstBytes(
         .usable = true,
         .ascii_only = ascii_only,
         .single = if (ascii_only) single else null,
+        .count = @intCast(n),
     };
+}
+
+// ---------------------------------------------------------------------------
+// Alphabet compression for the lazy DFA
+
+/// Partition of all codepoints into equivalence classes: two codepoints in
+/// the same class are indistinguishable to every consuming instruction in the
+/// program (including under ASCII case folding) and agree on the properties
+/// assertions care about (word char, newline). DFA states then need one
+/// transition per class instead of per codepoint.
+pub const Alphabet = struct {
+    ok: bool,
+    /// Class of every cp < 256 (covers ASCII and the invalid-byte fallback).
+    low: [256]u8,
+    /// Sorted interval start points; interval i covers [starts[i], starts[i+1]).
+    /// starts[0] is always 0. Class i == interval i.
+    starts: []const u21,
+
+    pub const disabled: Alphabet = .{ .ok = false, .low = @splat(0), .starts = &.{} };
+
+    /// Number of real classes; the DFA uses `numClasses()` itself as the
+    /// end-of-input pseudo-class.
+    pub fn numClasses(a: *const Alphabet) u16 {
+        return @intCast(a.starts.len);
+    }
+
+    pub fn classOf(a: *const Alphabet, cp: u21) u16 {
+        if (cp < 256) return a.low[cp];
+        // Greatest starts[i] <= cp.
+        var lo: usize = 0;
+        var hi: usize = a.starts.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (a.starts[mid] <= cp) lo = mid else hi = mid;
+        }
+        return @intCast(lo);
+    }
+
+    /// A representative codepoint of class k.
+    pub fn sample(a: *const Alphabet, k: u16) u21 {
+        return a.starts[k];
+    }
+};
+
+/// Required size of the boundary scratch buffer for `computeAlphabet`.
+pub fn alphabetBufferSize(inst_count: usize) usize {
+    return 6 * inst_count + 24;
+}
+
+/// Compute the codepoint partition. The returned `starts` slice aliases
+/// `bounds_buf`; the caller copies it into owned storage. Returns a disabled
+/// alphabet when the partition would exceed 254 classes.
+pub fn computeAlphabet(
+    insts: []const Inst,
+    ranges: []const common.ClassRange,
+    bounds_buf: []u21,
+) Alphabet {
+    var n: usize = 0;
+    const add = struct {
+        fn f(buf: []u21, len: *usize, cp: u21) void {
+            if (len.* < buf.len) {
+                buf[len.*] = cp;
+                len.* += 1;
+            }
+        }
+    }.f;
+    const addCp = struct {
+        fn f(buf: []u21, len: *usize, cp: u21) void {
+            f2(buf, len, cp);
+            if (cp < parser.max_codepoint) f2(buf, len, cp + 1);
+        }
+        fn f2(buf: []u21, len: *usize, cp: u21) void {
+            if (len.* < buf.len) {
+                buf[len.*] = cp;
+                len.* += 1;
+            }
+        }
+    };
+    _ = add;
+
+    // Always present: 0, word-char set edges, newline (assertion context).
+    addCp.f2(bounds_buf, &n, 0);
+    for ([_][2]u21{ .{ '0', '9' }, .{ 'A', 'Z' }, .{ '_', '_' }, .{ 'a', 'z' } }) |w| {
+        addCp.f2(bounds_buf, &n, w[0]);
+        addCp.f2(bounds_buf, &n, w[1] + 1);
+    }
+    addCp.f(bounds_buf, &n, '\n');
+
+    for (insts) |inst| switch (inst) {
+        .char => |c| {
+            addCp.f(bounds_buf, &n, c.cp);
+            // Case-fold image so ci equality stays uniform per class.
+            if (c.cp >= 'a' and c.cp <= 'z') addCp.f(bounds_buf, &n, c.cp - 32);
+            if (c.cp >= 'A' and c.cp <= 'Z') addCp.f(bounds_buf, &n, c.cp + 32);
+        },
+        .class => |cl| for (ranges[cl.start..][0..cl.len]) |r| {
+            addCp.f2(bounds_buf, &n, r.lo);
+            addCp.f2(bounds_buf, &n, r.hi + 1);
+            // Fold images of the letter intersections.
+            if (r.hi >= 'a' and r.lo <= 'z') {
+                addCp.f2(bounds_buf, &n, @max(r.lo, 'a') - 32);
+                addCp.f2(bounds_buf, &n, @min(r.hi, 'z') - 32 + 1);
+            }
+            if (r.hi >= 'A' and r.lo <= 'Z') {
+                addCp.f2(bounds_buf, &n, @max(r.lo, 'A') + 32);
+                addCp.f2(bounds_buf, &n, @min(r.hi, 'Z') + 32 + 1);
+            }
+        },
+        else => {},
+    };
+    if (n >= bounds_buf.len) return .disabled; // overflowed scratch space
+
+    std.mem.sort(u21, bounds_buf[0..n], {}, std.sort.asc(u21));
+    // Unique in place; drop anything above the codepoint space.
+    var m: usize = 0;
+    for (bounds_buf[0..n]) |b| {
+        if (b > parser.max_codepoint) break;
+        if (m == 0 or bounds_buf[m - 1] != b) {
+            bounds_buf[m] = b;
+            m += 1;
+        }
+    }
+    if (m == 0 or m > 254) return .disabled;
+
+    var a = Alphabet{ .ok = true, .low = undefined, .starts = bounds_buf[0..m] };
+    for (0..256) |cp| {
+        var lo: usize = 0;
+        var hi: usize = m;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (a.starts[mid] <= cp) lo = mid else hi = mid;
+        }
+        a.low[cp] = @intCast(lo);
+    }
+    return a;
+}
+
+test computeAlphabet {
+    // "[a-c]x" style program.
+    const insts = [_]Inst{
+        .{ .class = .{ .start = 0, .len = 1, .negated = false, .ci = false } },
+        .{ .char = .{ .cp = 'x', .ci = false } },
+        .match,
+    };
+    const rs = [_]common.ClassRange{.{ .lo = 'a', .hi = 'c' }};
+    var buf: [alphabetBufferSize(insts.len)]u21 = undefined;
+    const a = computeAlphabet(&insts, &rs, &buf);
+    try std.testing.expect(a.ok);
+    // Same class within [a-c], different from 'd' and from 'x'.
+    try std.testing.expectEqual(a.classOf('a'), a.classOf('c'));
+    try std.testing.expect(a.classOf('a') != a.classOf('d'));
+    try std.testing.expect(a.classOf('x') != a.classOf('a'));
+    // Fold images of [a-c] are isolated too.
+    try std.testing.expectEqual(a.classOf('A'), a.classOf('C'));
+    try std.testing.expect(a.classOf('A') != a.classOf('D'));
+    // Word/newline properties are uniform per class.
+    try std.testing.expect(a.classOf('\n') != a.classOf(' '));
+    try std.testing.expect(a.classOf('_') != a.classOf('-'));
+    // High codepoints hit the search path.
+    try std.testing.expectEqual(a.classOf(0x1F600), a.classOf(0x1F601));
 }

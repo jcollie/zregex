@@ -251,6 +251,7 @@ test "iterator" {
     defer re.deinit();
     const haystack = "a1b22c333";
     var it = re.iterator(gpa, haystack);
+    defer it.deinit();
     const expected = [_][]const u8{ "1", "22", "333" };
     for (expected) |e| {
         var m = (try it.next()).?;
@@ -266,6 +267,7 @@ test "iterator with empty matches" {
     defer re.deinit();
     const haystack = "baa";
     var it = re.iterator(gpa, haystack);
+    defer it.deinit();
     var spans: std.ArrayList(zregex.Span) = .empty;
     defer spans.deinit(gpa);
     while (try it.next()) |m| {
@@ -376,4 +378,79 @@ test "prefilter honors utf-8 lead bytes and raw fallback" {
     try std.testing.expect(!re.prefilter.bytes['e']);
     try std.testing.expect(try re.isMatch(gpa, "abcé"));
     try std.testing.expect(try re.isMatch(gpa, "ab\xE9cd")); // invalid byte fallback
+}
+
+test "dfa and pike agree on every match and capture" {
+    const patterns = [_][]const u8{
+        "abc",           "a+",      "a+?",         "a*b",
+        "(a|ab)(c|bcd)", "<.+>",    "<.+?>",       "(\\w+)@([\\w.]+)",
+        "^\\w+",         "\\w+$",   "\\bcat\\b",   "\\Babc",
+        "x{2,4}",        "(a*)*b",  "(|a)*b",      "[^x]y",
+        ".at",           "a$",      "^",           "a?",
+        "é+",
+        "(.)(.)",        "\\d{2,}", "colou?r",     "(?:ab|cd)+",
+        "(a)(b)?c?",     "^$",      "\\x{1F600}+",
+    };
+    const haystacks = [_][]const u8{
+        "",
+        "a",
+        "abc abc",
+        "aaabbb",
+        "the cat sat on a mat",
+        "x@y.z mail alice@example.org!",
+        "line one\nline two\ncat\n",
+        "xxxxx",
+        "abcbcd",
+        "aébé\xFFcé",
+        "color colour",
+        "ababcdab",
+        "hi 😀😀 there",
+        "wordcat catword cat",
+        "12 345 6789",
+    };
+    for (patterns) |pat| {
+        var re = try Regex.compile(gpa, pat);
+        defer re.deinit();
+        if (re.engine != .pike) continue;
+        for (haystacks) |hay| {
+            re.dfa_mode = .on;
+            var it_dfa = re.iterator(gpa, hay);
+            defer it_dfa.deinit();
+            re.dfa_mode = .off;
+            var it_pike = re.iterator(gpa, hay);
+            defer it_pike.deinit();
+            while (true) {
+                re.dfa_mode = .on;
+                const a = try it_dfa.next();
+                re.dfa_mode = .off;
+                const b = try it_pike.next();
+                if (a == null or b == null) {
+                    try std.testing.expectEqual(a == null, b == null);
+                    break;
+                }
+                var ma = a.?;
+                defer ma.deinit(gpa);
+                var mb = b.?;
+                defer mb.deinit(gpa);
+                std.testing.expectEqualSlices(?zregex.Span, mb.groups, ma.groups) catch |err| {
+                    std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "dfa handles findAt context correctly" {
+    // \b at a findAt start must see the previous character.
+    var re = try Regex.compile(gpa, "\\bcat");
+    defer re.deinit();
+    var m = try re.findAt(gpa, "concat cat", 3);
+    try std.testing.expect(m != null); // finds " cat", not "cat" inside concat
+    try std.testing.expectEqual(@as(usize, 7), m.?.span().start);
+    m.?.deinit(gpa);
+    // ^ must not hold at a mid-string start position.
+    var re2 = try Regex.compile(gpa, "^x");
+    defer re2.deinit();
+    try std.testing.expectEqual(@as(?zregex.Match, null), try re2.findAt(gpa, "yx", 1));
 }

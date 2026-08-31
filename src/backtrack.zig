@@ -236,8 +236,16 @@ pub fn run(
     defer bt.undo.deinit(gpa);
     @memset(slots_out, null);
 
+    const pf = &prog.prefilter;
     var s = start;
     while (true) {
+        if (pf.usable) {
+            // A usable prefilter implies the pattern cannot match empty, so
+            // skipping non-candidate positions (including end of input) is
+            // sound.
+            s = pf.scan(input, s);
+            if (s >= input.len) return false;
+        }
         // The budget is per match attempt (like PCRE's match limit): each
         // start position gets a fresh allowance, so scanning a large haystack
         // is not itself budget-limited while any single attempt stays bounded.

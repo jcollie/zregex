@@ -60,6 +60,8 @@ pub const Regex = struct {
     slot_count: u16,
     flags: Flags,
     engine: Engine,
+    /// Which bytes a match can start with; lets the engines skip ahead.
+    prefilter: compiler.Prefilter,
     /// Step budget for the backtracking engine, applied per match attempt
     /// (per start position, like PCRE's match limit); tune per regex if
     /// needed.
@@ -106,6 +108,12 @@ pub const Regex = struct {
         const ranges = try gpa.dupe(common.ClassRange, ranges_tmp[0..p.ranges_len]);
         errdefer gpa.free(ranges);
 
+        const visited = try gpa.alloc(bool, counts.insts);
+        defer gpa.free(visited);
+        const pf_stack = try gpa.alloc(u32, counts.insts);
+        defer gpa.free(pf_stack);
+        const prefilter = compiler.computeFirstBytes(insts, ranges, visited, pf_stack);
+
         // Group names point into `pattern`, which the caller may free; copy
         // them into one owned buffer.
         var name_bytes: usize = 0;
@@ -130,6 +138,7 @@ pub const Regex = struct {
             .slot_count = counts.slots,
             .flags = flags,
             .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
+            .prefilter = prefilter,
             .gpa = gpa,
         };
     }
@@ -167,6 +176,15 @@ pub const Regex = struct {
             const final_ranges: [p.ranges_len]common.ClassRange = ranges[0..p.ranges_len].*;
             const final_names: [p.names_len]parser.NamedGroup = names[0..p.names_len].*;
 
+            var visited: [counts.insts]bool = undefined;
+            var pf_stack: [counts.insts]u32 = undefined;
+            const prefilter = compiler.computeFirstBytes(
+                &final_insts,
+                &final_ranges,
+                &visited,
+                &pf_stack,
+            );
+
             return .{
                 .program = &final_insts,
                 .ranges = &final_ranges,
@@ -175,6 +193,7 @@ pub const Regex = struct {
                 .slot_count = counts.slots,
                 .flags = flags,
                 .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
+                .prefilter = prefilter,
                 .gpa = null,
             };
         }
@@ -196,6 +215,7 @@ pub const Regex = struct {
             .ranges = self.ranges,
             .slot_count = self.slot_count,
             .group_count = self.group_count,
+            .prefilter = self.prefilter,
         };
     }
 

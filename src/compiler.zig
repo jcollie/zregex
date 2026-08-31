@@ -73,6 +73,7 @@ pub const Program = struct {
     slot_count: u16,
     /// Includes group 0.
     group_count: u8,
+    prefilter: Prefilter,
 };
 
 pub const CompileError = error{ProgramTooLarge};
@@ -329,4 +330,171 @@ test "program size cap" {
         error.ProgramTooLarge,
         compileForTest(gpa, "(?:(?:(?:a{1000}){1000}){1000})", .{}),
     );
+}
+
+// ---------------------------------------------------------------------------
+// First-byte prefilter
+
+/// The set of bytes a match can possibly start with, computed from the
+/// program. Lets the engines skip start positions instead of seeding a match
+/// attempt at every one.
+pub const Prefilter = struct {
+    bytes: [256]bool,
+    /// False when the analysis bailed (`.`, negated class, leading backref,
+    /// or a pattern that can match empty): every position is a candidate.
+    usable: bool,
+    /// All candidate bytes are < 0x80. ASCII bytes are always codepoint
+    /// boundaries, so a byte-at-a-time scan cannot stop mid-sequence.
+    ascii_only: bool,
+    /// Exactly one candidate byte (ASCII): use a vectorized memchr scan.
+    single: ?u8,
+
+    pub const unusable: Prefilter = .{
+        .bytes = @splat(true),
+        .usable = false,
+        .ascii_only = false,
+        .single = null,
+    };
+
+    /// First position >= `start` where a match could begin (input.len if
+    /// none). Only stops at positions our decoder treats as boundaries.
+    pub fn scan(pf: *const Prefilter, input: []const u8, start: usize) usize {
+        if (pf.single) |b| {
+            return std.mem.indexOfScalarPos(u8, input, start, b) orelse input.len;
+        }
+        var pos = start;
+        if (pf.ascii_only) {
+            while (pos < input.len and !pf.bytes[input[pos]]) pos += 1;
+            return pos;
+        }
+        while (pos < input.len and !pf.bytes[input[pos]]) {
+            pos += common.decode(input, pos).len;
+        }
+        return pos;
+    }
+};
+
+const FirstBytes = struct {
+    bytes: [256]bool = @splat(false),
+    ok: bool = true,
+
+    fn addByte(fb: *FirstBytes, b: u8) void {
+        fb.bytes[b] = true;
+    }
+
+    fn addChar(fb: *FirstBytes, cp: u21, ci: bool) void {
+        if (cp < 0x80) {
+            fb.addByte(@intCast(cp));
+            if (ci) fb.addByte(@intCast(common.foldLower(cp)));
+            if (ci and cp >= 'a' and cp <= 'z') fb.addByte(@intCast(cp - 32));
+            return;
+        }
+        // UTF-8 lead byte.
+        var buf: [4]u8 = undefined;
+        _ = std.unicode.utf8Encode(cp, &buf) catch return fb.bail();
+        fb.addByte(buf[0]);
+        // Our decoder degrades an invalid byte to a codepoint of its own
+        // value, so a raw byte can also start (be all of) this codepoint.
+        if (cp <= 0xFF) fb.addByte(@intCast(cp));
+    }
+
+    fn addRange(fb: *FirstBytes, lo: u21, hi: u21, ci: bool) void {
+        // ASCII portion: exact bytes (with case folding).
+        var cp: u21 = lo;
+        while (cp <= @min(hi, 0x7F)) : (cp += 1) fb.addChar(cp, ci);
+        // Lead bytes per UTF-8 length class.
+        if (hi >= 0x80 and lo <= 0x7FF) {
+            const a: u32 = @max(lo, 0x80) >> 6;
+            const b: u32 = @min(hi, 0x7FF) >> 6;
+            for (a..b + 1) |x| fb.addByte(@intCast(0xC0 | x));
+        }
+        if (hi >= 0x800 and lo <= 0xFFFF) {
+            const a: u32 = @max(lo, 0x800) >> 12;
+            const b: u32 = @min(hi, 0xFFFF) >> 12;
+            for (a..b + 1) |x| fb.addByte(@intCast(0xE0 | x));
+        }
+        if (hi >= 0x10000) {
+            const a: u32 = @max(lo, 0x10000) >> 18;
+            const b: u32 = @min(hi, parser.max_codepoint) >> 18;
+            for (a..b + 1) |x| fb.addByte(@intCast(0xF0 | x));
+        }
+        // Raw invalid-byte fallback values.
+        if (hi >= 0x80 and lo <= 0xFF) {
+            const a: u32 = @max(lo, 0x80);
+            const b: u32 = @min(hi, 0xFF);
+            for (a..b + 1) |x| fb.addByte(@intCast(x));
+        }
+    }
+
+    fn bail(fb: *FirstBytes) void {
+        fb.ok = false;
+    }
+};
+
+/// Walk the epsilon structure from pc 0 and collect possible first bytes.
+/// `visited` and `stack` must both be `insts.len` long.
+pub fn computeFirstBytes(
+    insts: []const Inst,
+    ranges: []const common.ClassRange,
+    visited: []bool,
+    stack: []u32,
+) Prefilter {
+    @memset(visited, false);
+    var fb = FirstBytes{};
+    var sp: usize = 0;
+    stack[sp] = 0;
+    sp += 1;
+    visited[0] = true;
+    while (sp > 0 and fb.ok) {
+        sp -= 1;
+        const pc = stack[sp];
+        const push = struct {
+            fn f(v: []bool, st: []u32, p: *usize, t: u32) void {
+                if (!v[t]) {
+                    v[t] = true;
+                    st[p.*] = t;
+                    p.* += 1;
+                }
+            }
+        }.f;
+        switch (insts[pc]) {
+            .jmp => |t| push(visited, stack, &sp, t),
+            .split => |t| {
+                push(visited, stack, &sp, t[0]);
+                push(visited, stack, &sp, t[1]);
+            },
+            // Zero-width: keep walking. Lookarounds only constrain a match,
+            // so skipping over them keeps the byte set an over-approximation.
+            .save, .set_pos, .fail_if_same, .assert, .look => push(visited, stack, &sp, pc + 1),
+            .char => |c| fb.addChar(c.cp, c.ci),
+            .class => |cl| {
+                if (cl.negated) {
+                    fb.bail();
+                } else {
+                    for (ranges[cl.start..][0..cl.len]) |r| fb.addRange(r.lo, r.hi, cl.ci);
+                }
+            },
+            .any, .any_not_nl, .backref => fb.bail(),
+            // Match reachable without consuming: the pattern can match empty
+            // anywhere, so every position is a candidate.
+            .match => fb.bail(),
+        }
+    }
+    if (!fb.ok) return .unusable;
+    var n: usize = 0;
+    var ascii_only = true;
+    var single: ?u8 = null;
+    for (fb.bytes, 0..) |set, b| {
+        if (!set) continue;
+        n += 1;
+        single = if (n == 1) @intCast(b) else null;
+        if (b >= 0x80) ascii_only = false;
+    }
+    if (n == 0 or n == 256) return .unusable;
+    return .{
+        .bytes = fb.bytes,
+        .usable = true,
+        .ascii_only = ascii_only,
+        .single = if (ascii_only) single else null,
+    };
 }

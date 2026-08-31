@@ -130,16 +130,25 @@ pub fn run(
     const base_slots = try arena.alloc(?usize, prog.slot_count);
     @memset(base_slots, null);
 
+    const pf = &prog.prefilter;
     var gen: u32 = 1;
     var pos = start;
     var matched = false;
 
     while (true) {
+        // With no live threads and no match yet, only candidate first bytes
+        // matter: skip straight to the next one.
+        if (!matched and clist.len == 0 and pf.usable) {
+            pos = pf.scan(input, pos);
+            if (pos >= input.len) break;
+        }
         const d: ?common.DecodeResult = if (pos < input.len) common.decode(input, pos) else null;
 
         // Seed a new lowest-priority thread at this position until we have a
         // match; this is what makes the search unanchored and leftmost.
-        if (!matched) try ctx.addThread(&clist, gen, 0, pos, base_slots);
+        if (!matched and (!pf.usable or (pos < input.len and pf.bytes[input[pos]]))) {
+            try ctx.addThread(&clist, gen, 0, pos, base_slots);
+        }
 
         var i: usize = 0;
         while (i < clist.len) : (i += 1) {

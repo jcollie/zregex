@@ -16,7 +16,9 @@ Two engines behind one API:
   (`error.StepLimitExceeded` instead of hanging).
 
 Engine selection is automatic at compile time; check `regex.engine` if you
-care which one you got.
+care which one you got. Both engines skip ahead using a first-byte prefilter
+computed from the pattern (see `bench/` for numbers against PCRE2, Python,
+Perl, and POSIX).
 
 ## Usage
 

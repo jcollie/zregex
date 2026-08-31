@@ -317,3 +317,63 @@ test "compile errors surface" {
     try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "+"));
     try std.testing.expectError(error.ProgramTooLarge, Regex.compile(gpa, "(?:(?:a{1000}){1000}){1000}"));
 }
+
+test "prefilter analysis" {
+    const cases = [_]struct {
+        pattern: []const u8,
+        flags: zregex.Flags = .{},
+        usable: bool,
+        single: ?u8 = null,
+    }{
+        .{ .pattern = "abc", .usable = true, .single = 'a' },
+        .{ .pattern = "^abc$", .usable = true, .single = 'a' },
+        .{ .pattern = "(?i)q", .usable = true }, // {q, Q}
+        .{ .pattern = "cat|dog", .usable = true },
+        .{ .pattern = "a*bc", .usable = true }, // {a, b}
+        .{ .pattern = "(?=x)yz", .usable = true, .single = 'y' },
+        .{ .pattern = "(a)\\1", .usable = true, .single = 'a' },
+        .{ .pattern = ".x", .usable = false },
+        .{ .pattern = "[^a]x", .usable = false },
+        .{ .pattern = "a?b?", .usable = false }, // can match empty
+    };
+    inline for (cases) |c| {
+        var re = try Regex.compileWithFlags(gpa, c.pattern, c.flags);
+        defer re.deinit();
+        try std.testing.expectEqual(c.usable, re.prefilter.usable);
+        if (c.single) |b| try std.testing.expectEqual(@as(?u8, b), re.prefilter.single);
+    }
+    // Set contents: a*bc can start with 'a' or 'b' but not 'c'.
+    var re = try Regex.compile(gpa, "a*bc");
+    defer re.deinit();
+    try std.testing.expect(re.prefilter.bytes['a']);
+    try std.testing.expect(re.prefilter.bytes['b']);
+    try std.testing.expect(!re.prefilter.bytes['c']);
+    // (?i) folds.
+    var re2 = try Regex.compile(gpa, "(?i)q");
+    defer re2.deinit();
+    try std.testing.expect(re2.prefilter.bytes['q']);
+    try std.testing.expect(re2.prefilter.bytes['Q']);
+}
+
+test "prefilter never stops mid-codepoint" {
+    // U+00A9 (©) is 0xC2 0xA9 in UTF-8; 'é' is 0xC3 0xA9. A lone invalid
+    // 0xA9 byte decodes to U+00A9 via the fallback, but the 0xA9 inside a
+    // valid 'é' must not: matches may only start at decode boundaries.
+    var re = try Regex.compile(gpa, "\u{A9}");
+    defer re.deinit();
+    try std.testing.expect(!re.prefilter.ascii_only);
+    try std.testing.expect(!try re.isMatch(gpa, "é")); // C3 A9: no boundary at the A9
+    try std.testing.expect(try re.isMatch(gpa, "x\xA9y")); // lone invalid byte: matches
+    try std.testing.expect(try re.isMatch(gpa, "x\u{A9}y")); // real ©
+}
+
+test "prefilter honors utf-8 lead bytes and raw fallback" {
+    var re = try Regex.compile(gpa, "é+");
+    defer re.deinit();
+    try std.testing.expect(re.prefilter.usable);
+    try std.testing.expect(re.prefilter.bytes[0xC3]); // é lead byte
+    try std.testing.expect(re.prefilter.bytes[0xE9]); // raw fallback for U+E9
+    try std.testing.expect(!re.prefilter.bytes['e']);
+    try std.testing.expect(try re.isMatch(gpa, "abcé"));
+    try std.testing.expect(try re.isMatch(gpa, "ab\xE9cd")); // invalid byte fallback
+}

@@ -7,8 +7,13 @@ SPDX-License-Identifier: MIT
 
 A regular expression library for Zig 0.16.
 
-Two engines behind one API:
+Three engines behind one API:
 
+- **JIT** — on x86-64, patterns are compiled to native machine code: literals
+  become byte compares, classes become bit-test tables, and repeats become
+  tight consume loops. It backtracks, so it carries a step budget
+  proportional to the input; exhausting it hands the search to one of the
+  interpreters below, which is what keeps every guarantee below intact.
 - **Pike VM + lazy DFA** — patterns without backreferences or lookaround run
   in guaranteed linear time (no catastrophic backtracking, ever). An RE2-style
   lazy DFA finds match spans at one table transition per codepoint; the Pike
@@ -21,10 +26,16 @@ Two engines behind one API:
   step budget (`error.StepLimitExceeded` instead of hanging) remains as the
   backstop for the rare shapes memoization cannot key.
 
-Engine selection is automatic at compile time; check `regex.engine` if you
-care which one you got. Both engines skip ahead using a first-byte prefilter
+Engine selection is automatic at compile time: `regex.engine` reports what
+will run and `regex.fallback_engine` what finishes anything the JIT bails on.
+Set `regex.jit_mode` to `.off` to keep searches on the interpreters, or `.on`
+to force native code. Every engine skips ahead using a first-byte prefilter
 computed from the pattern (see `bench/` for numbers against PCRE2, Python,
 Perl, and POSIX).
+
+All three produce identical matches and captures; which one runs is a
+performance decision only, and the test suite checks them against each other
+pattern by pattern.
 
 ## Usage
 

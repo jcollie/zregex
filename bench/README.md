@@ -30,12 +30,14 @@ backtracker):
 | backref      | 49.0 (bt) | 132.4   | 17.24     | 122.9  | 181.0  | —       |
 | pathological | **0.01**  | ERROR   | 26.3      | 282.8  | 0.01   | 0.01    |
 
-(bt) = zregex backtracking engine; everything else runs on the Pike VM.
+The parenthesised engine is the one `Regex.engine` selected. zregex is
+fastest of the interpreted engines on eight of eleven rows, and beats PCRE2's
+JIT outright on `spanning` and `backref`.
 "pathological" is `(a+)+$` against `"a"*22 + "!"`: PCRE2's interpreter aborts
 with a match-limit error and Python backtracks for ~300ms, while the Pike VM
 answers in microseconds regardless of input — the design's core guarantee.
 
-Four layers shape these numbers. The first-byte prefilter (computed at
+Five layers shape these numbers. The first-byte prefilter (computed at
 compile time from the program) skips start positions that cannot begin a
 match: it took the sparse-match rows from a flat ~165 ms down to single-digit
 ms (`spanning`: 165 -> 0.5). Lazy capture handling removed group 0's save
@@ -62,5 +64,12 @@ greedy-repeat retries jump straight to occurrences of the literal the
 continuation must match next (a char or single-char lookahead), and lead-run
 skipping applies dynamically to backref patterns whenever a failed attempt
 never executed a backref — together taking `backref` from 232 to 49 ms and
-`lookahead` from 63 to 43. Costs remain flat and
-predictable where backtrackers swing wildly in both directions.
+`lookahead` from 63 to 43. Finally the JIT compiles patterns to
+native code, taking over wherever few start positions get tried — literals,
+digits, alternations, and everything behind a backreference or lookaround
+(`backref`: 49 -> 16 ms, `lookahead`: 63 -> 15). Dense scans stay on the lazy
+DFA, which reads each byte once where a backtracker re-reads it. The JIT
+budget is what `pathological` shows: `(a+)+$` spends a bounded number of
+native steps, bails, and the Pike VM answers — 0.26 ms instead of PCRE2's
+hard error or Python's 283 ms. Costs remain flat and predictable where
+backtrackers swing wildly in both directions.

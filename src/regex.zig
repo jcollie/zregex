@@ -9,6 +9,7 @@ const compiler = @import("compiler.zig");
 const pike = @import("pike.zig");
 const backtrack = @import("backtrack.zig");
 const dfa = @import("dfa.zig");
+const jitmod = @import("jit.zig");
 
 pub const Flags = common.Flags;
 pub const ParseError = parser.ParseError;
@@ -47,10 +48,13 @@ pub const Match = struct {
 
 /// Which engine executes the compiled program.
 pub const Engine = enum {
-    /// Pike VM: guaranteed linear time.
+    /// Pike VM (with the lazy DFA in front of it): guaranteed linear time.
     pike,
-    /// Budgeted backtracker: needed for backrefs and lookaround.
+    /// Budgeted, memoizing backtracker: needed for backrefs and lookaround.
     backtrack,
+    /// Native code compiled for this pattern, with `fallback_engine` behind
+    /// it for the inputs that exhaust its budget.
+    jit,
 };
 
 pub const Regex = struct {
@@ -60,7 +64,14 @@ pub const Regex = struct {
     group_count: u8,
     slot_count: u16,
     flags: Flags,
+    /// The engine that runs searches. `.jit` means native code runs first and
+    /// `fallback_engine` finishes anything it bails on.
     engine: Engine,
+    /// The interpreter behind the JIT, and the engine used when the JIT is
+    /// unavailable or turned off.
+    fallback_engine: Engine,
+    /// Native code for this pattern, when one could be generated.
+    jit_code: ?jitmod.Jit = null,
     /// Which bytes a match can start with; lets the engines skip ahead.
     prefilter: compiler.Prefilter,
     /// Codepoint partition for the lazy DFA; `alphabet.ok == false` disables it.
@@ -70,6 +81,11 @@ pub const Regex = struct {
     /// highly selective, memchr-style skipping with the Pike VM alone is
     /// faster than any per-codepoint automaton. `.on`/`.off` force it.
     dfa_mode: enum { auto, on, off } = .auto,
+    /// JIT policy. `.auto` follows `engine`: native code runs when the
+    /// pattern is one it beats the interpreters on. `.on` forces it whenever
+    /// code was generated and `.off` never uses it; both are safe, since
+    /// every path produces identical matches.
+    jit_mode: enum { auto, on, off } = .auto,
     /// Backref-aware memoization in the backtracking engine: prunes states
     /// whose failure was already proven, bounding pathological backtracking
     /// polynomially. Keys include everything the remaining program can read
@@ -152,7 +168,7 @@ pub const Regex = struct {
             off += ng.name.len;
         }
 
-        return .{
+        var re: Regex = .{
             .program = insts,
             .ranges = ranges,
             .names = names,
@@ -160,11 +176,16 @@ pub const Regex = struct {
             .group_count = p.group_count,
             .slot_count = counts.slots,
             .flags = flags,
-            .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
+            .engine = .pike, // replaced below, once the JIT has had its turn
+            .fallback_engine = .pike,
             .prefilter = prefilter,
             .alphabet = alphabet,
             .gpa = gpa,
         };
+        re.fallback_engine = if (p.has_backref or p.has_look) .backtrack else .pike;
+        re.jit_code = try jitmod.Jit.compile(gpa, re.prog(), &re.prefilter);
+        re.engine = if (re.jitIsDefault()) .jit else re.fallback_engine;
+        return re;
     }
 
     /// Compile `pattern` at comptime; the program is baked into the binary and
@@ -222,7 +243,10 @@ pub const Regex = struct {
                 .group_count = p.group_count,
                 .slot_count = counts.slots,
                 .flags = flags,
+                // Comptime compilation cannot map executable memory, so a
+                // comptime pattern always runs on an interpreter.
                 .engine = if (p.has_backref or p.has_look) .backtrack else .pike,
+                .fallback_engine = if (p.has_backref or p.has_look) .backtrack else .pike,
                 .prefilter = prefilter,
                 .alphabet = alphabet,
                 .gpa = null,
@@ -231,6 +255,7 @@ pub const Regex = struct {
     }
 
     pub fn deinit(self: *Regex) void {
+        if (self.jit_code) |*j| j.deinit();
         if (self.gpa) |gpa| {
             gpa.free(self.program);
             gpa.free(self.ranges);
@@ -258,14 +283,37 @@ pub const Regex = struct {
         start: usize,
         slots: []?usize,
     ) RunError!bool {
-        return switch (self.engine) {
-            .pike => pike.run(gpa, self.prog(), haystack, start, slots),
+        return switch (self.fallback_engine) {
             .backtrack => backtrack.run(gpa, self.prog(), haystack, start, slots, self.max_steps, self.memo),
+            .pike, .jit => pike.run(gpa, self.prog(), haystack, start, slots),
         };
     }
 
+    /// Should native code run this pattern by default?
+    ///
+    /// Behind a backreference or lookaround the JIT competes with the
+    /// backtracking interpreter and wins outright. For everything else it
+    /// competes with the lazy DFA, which scans dense input in one pass where
+    /// a backtracker re-reads it — so the JIT only takes over when the
+    /// prefilter is selective enough that few start positions are ever tried.
+    fn jitIsDefault(self: *const Regex) bool {
+        if (self.jit_code == null) return false;
+        if (self.fallback_engine == .backtrack) return true;
+        return self.prefilter.usable and self.prefilter.count <= 16;
+    }
+
+    /// Native code, when it is compiled and the policy allows it.
+    fn jitFn(self: *const Regex) ?*const jitmod.Jit {
+        switch (self.jit_mode) {
+            .off => return null,
+            .auto => if (self.engine != .jit) return null,
+            .on => {},
+        }
+        return if (self.jit_code) |*j| j else null;
+    }
+
     fn dfaEligible(self: *const Regex) bool {
-        if (self.engine != .pike or !self.alphabet.ok) return false;
+        if (self.fallback_engine != .pike or !self.alphabet.ok) return false;
         return switch (self.dfa_mode) {
             .off => false,
             .on => true,
@@ -278,6 +326,15 @@ pub const Regex = struct {
     /// Does the pattern match anywhere in `haystack`? The allocator is only
     /// used for engine scratch space and is fully released before returning.
     pub fn isMatch(self: *const Regex, gpa: std.mem.Allocator, haystack: []const u8) RunError!bool {
+        if (self.jitFn()) |j| {
+            const slots = try gpa.alloc(?usize, self.slot_count);
+            defer gpa.free(slots);
+            switch (j.run(haystack, 0, slots)) {
+                .match => return true,
+                .no_match => return false,
+                .bail => {}, // budget spent; the interpreters finish the job
+            }
+        }
         if (self.dfaEligible()) {
             var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet);
             defer machine.deinit();
@@ -323,6 +380,13 @@ pub const Regex = struct {
     ) RunError!?Match {
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
+        if (self.jitFn()) |j| {
+            switch (j.run(haystack, start, slots)) {
+                .match => return try self.buildMatch(gpa, slots),
+                .no_match => return null,
+                .bail => {},
+            }
+        }
         if (machine) |m| {
             // The DFA finds the span; the Pike VM reruns only the window
             // where the match can start, to extract captures.
@@ -340,6 +404,10 @@ pub const Regex = struct {
             if (!try self.runEngine(gpa, haystack, start, slots)) return null;
         }
 
+        return try self.buildMatch(gpa, slots);
+    }
+
+    fn buildMatch(self: *const Regex, gpa: std.mem.Allocator, slots: []const ?usize) RunError!Match {
         const groups = try gpa.alloc(?Span, self.group_count);
         for (groups, 0..) |*g, i| {
             const a = slots[2 * i];

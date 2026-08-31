@@ -22,8 +22,15 @@ pub const ParseError = regex.ParseError;
 pub const CompileError = regex.CompileError;
 pub const RunError = regex.RunError;
 
+/// Whether this build can compile patterns to native code. When false every
+/// pattern runs on an interpreter and `Regex.engine` is never `.jit`.
+pub const jit_available = @import("jit.zig").available;
+
 test {
     _ = @import("common.zig");
+    _ = @import("jit.zig");
+    _ = @import("jit/mem.zig");
+    _ = @import("jit/x64.zig");
     _ = @import("parser.zig");
     _ = @import("compiler.zig");
     _ = @import("tests.zig");

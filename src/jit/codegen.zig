@@ -1,0 +1,1004 @@
+// SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+// SPDX-License-Identifier: MIT
+
+//! x86-64 code generator: turns a compiled program into a native backtracking
+//! matcher with the same leftmost-greedy semantics as `backtrack.zig`.
+//!
+//! State lives in callee-saved registers, so helper calls cannot disturb it:
+//!
+//!   rbx = input base   r12 = input length   r13 = current position
+//!   r14 = capture slots   r15 = backtrack stack top   rbp = context
+//!
+//! ASCII is handled entirely inline — a literal is a byte compare, a class is
+//! a `bt` against a 128-bit table embedded in the code — and the rare
+//! non-ASCII paths call back into Zig helpers that reuse the interpreter's
+//! own tested logic. Backtracking frames are 32 bytes on a caller-supplied
+//! stack; every frame names the code address that resumes it, so failing is a
+//! peek and an indirect jump rather than a dispatch loop.
+//!
+//! Anything the generator does not support (multi-codepoint lookaround) makes
+//! `compile` return null and the caller keeps using the interpreter.
+const std = @import("std");
+const common = @import("../common.zig");
+const compiler = @import("../compiler.zig");
+const x64 = @import("x64.zig");
+
+const Reg = x64.Reg;
+const Mem = x64.Mem;
+
+/// Runtime context; the generated code reads and writes it by fixed offsets,
+/// so field order is part of the ABI (see the `ctx_*` constants).
+pub const Ctx = extern struct {
+    input: [*]const u8,
+    input_len: usize,
+    start: usize,
+    slots: [*]usize,
+    stack_base: [*]u8,
+    stack_end: usize,
+    undo_slots: [*]usize,
+    undo_vals: [*]usize,
+    undo_len: usize,
+    undo_cap: usize,
+    /// Decremented on every backtrack; going negative bails to the caller.
+    budget: isize,
+    match_start: usize,
+    match_end: usize,
+    touched_backref: usize,
+    prog: *const compiler.Program,
+    scratch0: usize,
+    scratch1: usize,
+    scratch2: usize,
+};
+
+const ctx_input = 0;
+const ctx_input_len = 8;
+const ctx_start = 16;
+const ctx_slots = 24;
+const ctx_stack_base = 32;
+const ctx_stack_end = 40;
+const ctx_undo_slots = 48;
+const ctx_undo_vals = 56;
+const ctx_undo_len = 64;
+const ctx_undo_cap = 72;
+const ctx_budget = 80;
+const ctx_match_start = 88;
+const ctx_match_end = 96;
+const ctx_touched = 104;
+const ctx_prog = 112;
+const ctx_scratch0 = 120;
+const ctx_scratch1 = 128;
+const ctx_scratch2 = 136;
+
+comptime {
+    std.debug.assert(@offsetOf(Ctx, "input") == ctx_input);
+    std.debug.assert(@offsetOf(Ctx, "input_len") == ctx_input_len);
+    std.debug.assert(@offsetOf(Ctx, "start") == ctx_start);
+    std.debug.assert(@offsetOf(Ctx, "slots") == ctx_slots);
+    std.debug.assert(@offsetOf(Ctx, "stack_base") == ctx_stack_base);
+    std.debug.assert(@offsetOf(Ctx, "stack_end") == ctx_stack_end);
+    std.debug.assert(@offsetOf(Ctx, "undo_slots") == ctx_undo_slots);
+    std.debug.assert(@offsetOf(Ctx, "undo_vals") == ctx_undo_vals);
+    std.debug.assert(@offsetOf(Ctx, "undo_len") == ctx_undo_len);
+    std.debug.assert(@offsetOf(Ctx, "undo_cap") == ctx_undo_cap);
+    std.debug.assert(@offsetOf(Ctx, "budget") == ctx_budget);
+    std.debug.assert(@offsetOf(Ctx, "match_start") == ctx_match_start);
+    std.debug.assert(@offsetOf(Ctx, "match_end") == ctx_match_end);
+    std.debug.assert(@offsetOf(Ctx, "touched_backref") == ctx_touched);
+    std.debug.assert(@offsetOf(Ctx, "prog") == ctx_prog);
+    std.debug.assert(@offsetOf(Ctx, "scratch0") == ctx_scratch0);
+    std.debug.assert(@offsetOf(Ctx, "scratch1") == ctx_scratch1);
+    std.debug.assert(@offsetOf(Ctx, "scratch2") == ctx_scratch2);
+}
+
+/// Backtrack frame: resume address, position, undo length, and an auxiliary
+/// word (a repeat's retry floor).
+const frame_size = 32;
+const frame_resume = 0;
+const frame_pos = 8;
+const frame_undo = 16;
+const frame_aux = 24;
+
+/// `run` returns one of these.
+pub const Status = enum(i64) {
+    no_match = 0,
+    match = 1,
+    /// Budget, stack, or undo-log exhausted: the caller must fall back.
+    bail = -1,
+};
+
+pub const Fn = *const fn (ctx: *Ctx) callconv(.c) i64;
+
+// Registers holding machine state.
+const r_input: Reg = .rbx;
+const r_len: Reg = .r12;
+const r_pos: Reg = .r13;
+const r_slots: Reg = .r14;
+const r_stack: Reg = .r15;
+const r_ctx: Reg = .rbp;
+
+fn ctxMem(off: i32) Mem {
+    return .{ .base = r_ctx, .disp = off };
+}
+
+/// `[input + pos]`.
+fn inputAt(pos: Reg, disp: i32) Mem {
+    return .{ .base = r_input, .index = pos, .scale = 0, .disp = disp };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers called from generated code for the paths not worth inlining.
+
+/// Length in bytes of the codepoint at `pos`, matching `common.decode`.
+fn helperCpLen(ctx: *Ctx, pos: usize) callconv(.c) usize {
+    return common.decode(ctx.input[0..ctx.input_len], pos).len;
+}
+
+/// Length in bytes of the codepoint ending at `pos`.
+fn helperCpLenBefore(ctx: *Ctx, pos: usize) callconv(.c) usize {
+    return common.decodeBefore(ctx.input[0..ctx.input_len], pos).len;
+}
+
+/// Next position at or after `pos` holding `byte`, or the input length. Uses
+/// the standard library's vectorized scan, which beats any byte loop the
+/// generator could emit.
+fn helperMemchr(ctx: *Ctx, pos: usize, byte: usize) callconv(.c) usize {
+    const input = ctx.input[0..ctx.input_len];
+    if (pos >= input.len) return input.len;
+    return std.mem.indexOfScalarPos(u8, input, pos, @intCast(byte)) orelse input.len;
+}
+
+/// Consumed length + 1 if the consuming instruction at `pc` matches at `pos`,
+/// else 0. Reuses the interpreter's semantics for the non-ASCII cases.
+fn helperTest(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
+    const prog = ctx.prog;
+    const input = ctx.input[0..ctx.input_len];
+    if (pos >= input.len) return 0;
+    const d = common.decode(input, pos);
+    const ok = switch (prog.insts[pc]) {
+        .char => |c| common.charEq(c.cp, d.cp, c.ci),
+        .class => |cl| common.classMatches(
+            prog.ranges[cl.start..][0..cl.len],
+            cl.negated,
+            cl.ci,
+            d.cp,
+        ),
+        .any => true,
+        .any_not_nl => d.cp != '\n',
+        else => unreachable,
+    };
+    return if (ok) d.len + 1 else 0;
+}
+
+/// Consumed length + 1 if the backreference at `pc` matches at `pos`.
+fn helperBackref(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
+    const br = ctx.prog.insts[pc].backref;
+    const input = ctx.input[0..ctx.input_len];
+    const a = ctx.slots[2 * @as(usize, br.group)];
+    const b = ctx.slots[2 * @as(usize, br.group) + 1];
+    // `unset` mirrors the interpreter's null slot: an unset group matches empty.
+    if (a == unset or b == unset) return 1;
+    const text = input[a..b];
+    if (pos + text.len > input.len) return 0;
+    const hay = input[pos..][0..text.len];
+    if (br.ci) {
+        for (text, hay) |x, y| {
+            if (common.foldLower(x) != common.foldLower(y)) return 0;
+        }
+    } else if (!std.mem.eql(u8, text, hay)) return 0;
+    return text.len + 1;
+}
+
+/// Slot sentinel for "did not participate"; the interpreter uses `null`.
+pub const unset: usize = std.math.maxInt(usize);
+
+// ---------------------------------------------------------------------------
+
+pub const Support = struct {
+    /// Instructions this generator can emit.
+    pub fn canCompile(prog: compiler.Program) bool {
+        for (prog.insts, 0..) |inst, pc| {
+            switch (inst) {
+                .char, .any, .any_not_nl, .class, .split, .jmp, .save, .assert, .match, .backref, .set_pos, .fail_if_same, .rep => {},
+                .look => |l| {
+                    // Only single-codepoint sub-programs are inlined; anything
+                    // longer needs the interpreter's recursive matcher.
+                    if (l.target + 1 >= prog.insts.len) return false;
+                    if (prog.insts[l.target + 1] != .match) return false;
+                    switch (prog.insts[l.target]) {
+                        .char, .class, .any, .any_not_nl => {},
+                        else => return false,
+                    }
+                    _ = pc;
+                },
+            }
+        }
+        return true;
+    }
+};
+
+/// Is every codepoint this instruction accepts below 0x80? When true a byte
+/// >= 0x80 can be rejected without decoding.
+fn asciiOnly(prog: compiler.Program, inst: compiler.Inst) bool {
+    return switch (inst) {
+        .char => |c| c.cp < 0x80,
+        .class => |cl| blk: {
+            if (cl.negated) break :blk false;
+            for (prog.ranges[cl.start..][0..cl.len]) |r| {
+                if (r.hi >= 0x80) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+const Blob = struct {
+    label: x64.Label,
+    bytes: [16]u8,
+};
+
+/// Identical classes appear once per emit site (a repeat emits its child
+/// several times); one table each is enough.
+const BitsCache = struct {
+    bits: [16]u8,
+    label: x64.Label,
+};
+
+pub const Gen = struct {
+    a: x64.Asm,
+    prog: compiler.Program,
+    gpa: std.mem.Allocator,
+    pc_labels: []x64.Label,
+    /// Instructions inside lookaround sub-programs: never entered directly.
+    dead: []bool,
+    blobs: std.ArrayList(Blob) = .empty,
+    bits_cache: std.ArrayList(BitsCache) = .empty,
+    l_fail: x64.Label = undefined,
+    l_bail: x64.Label = undefined,
+    l_no_match: x64.Label = undefined,
+    l_epilogue: x64.Label = undefined,
+    l_attempt: x64.Label = undefined,
+    l_attempt_failed: x64.Label = undefined,
+    l_word_table: x64.Label = undefined,
+    prefilter_label: ?x64.Label = null,
+    prefilter: *const compiler.Prefilter,
+
+    const Error = std.mem.Allocator.Error;
+
+    fn emitBlob(self: *Gen, bits: [16]u8) Error!x64.Label {
+        for (self.bits_cache.items) |c| {
+            if (std.mem.eql(u8, &c.bits, &bits)) return c.label;
+        }
+        const l = try self.a.label();
+        try self.blobs.append(self.gpa, .{ .label = l, .bytes = bits });
+        try self.bits_cache.append(self.gpa, .{ .bits = bits, .label = l });
+        return l;
+    }
+
+    /// 128-bit acceptance table for codepoints 0..127.
+    fn classBits(self: *Gen, cl: compiler.ClassOp) [16]u8 {
+        var bits: [16]u8 = @splat(0);
+        const ranges = self.prog.ranges[cl.start..][0..cl.len];
+        for (0..128) |cp| {
+            if (common.classMatches(ranges, cl.negated, cl.ci, @intCast(cp)))
+                bits[cp / 8] |= @as(u8, 1) << @intCast(cp % 8);
+        }
+        return bits;
+    }
+
+    fn call(self: *Gen, func: anytype) void {
+        self.a.movRegImm64(.r11, @intFromPtr(func));
+        self.a.callReg(.r11);
+    }
+
+    /// Test the consuming instruction at `pc` against the codepoint at r_pos.
+    /// On failure jumps to `on_fail`; on success, if `advance`, r_pos moves
+    /// past the codepoint. Clobbers rax/rcx/rsi/rdi/rdx/r11.
+    fn emitTest(self: *Gen, pc: u32, on_fail: x64.Label, advance: bool) Error!void {
+        const a = &self.a;
+        const inst = self.prog.insts[pc];
+        a.cmpRegReg(r_pos, r_len);
+        a.jcc(.ae, on_fail);
+
+        const l_done = try a.label();
+        const ascii_only = asciiOnly(self.prog, inst);
+
+        switch (inst) {
+            .char => |c| {
+                if (c.cp < 0x80) {
+                    const lo: u8 = @intCast(common.foldLower(c.cp));
+                    const folds = c.ci and ((c.cp >= 'a' and c.cp <= 'z') or (c.cp >= 'A' and c.cp <= 'Z'));
+                    if (!folds) {
+                        a.cmpMem8Imm(inputAt(r_pos, 0), @intCast(c.cp));
+                        a.jcc(.ne, on_fail);
+                    } else {
+                        a.movzxRegMem8(.rax, inputAt(r_pos, 0));
+                        const l_ok = try a.label();
+                        a.cmpReg8Imm(.rax, lo);
+                        a.jcc(.e, l_ok);
+                        a.cmpReg8Imm(.rax, lo - 32); // upper case
+                        a.jcc(.ne, on_fail);
+                        a.place(l_ok);
+                    }
+                    if (advance) a.incReg(r_pos);
+                    a.place(l_done);
+                    return;
+                }
+                // Non-ASCII literal: always the helper.
+                try self.emitHelperTest(pc, on_fail, advance);
+                a.place(l_done);
+                return;
+            },
+            .class => |cl| {
+                const l_high = try a.label();
+                a.movzxRegMem8(.rax, inputAt(r_pos, 0));
+                a.cmpReg8Imm(.rax, 0x80);
+                a.jcc(.ae, l_high);
+                const bits = try self.emitBlob(self.classBits(cl));
+                a.btLabelReg(bits, .rax);
+                a.jcc(.ae, on_fail); // CF clear == bit not set
+                if (advance) a.incReg(r_pos);
+                a.jmp(l_done);
+                a.place(l_high);
+                if (ascii_only) {
+                    a.jmp(on_fail);
+                } else {
+                    try self.emitHelperTest(pc, on_fail, advance);
+                }
+                a.place(l_done);
+                return;
+            },
+            .any, .any_not_nl => {
+                const l_high = try a.label();
+                a.movzxRegMem8(.rax, inputAt(r_pos, 0));
+                a.cmpReg8Imm(.rax, 0x80);
+                a.jcc(.ae, l_high);
+                if (inst == .any_not_nl) {
+                    a.cmpReg8Imm(.rax, '\n');
+                    a.jcc(.e, on_fail);
+                }
+                if (advance) a.incReg(r_pos);
+                a.jmp(l_done);
+                a.place(l_high);
+                // Non-ASCII is never '\n', so both forms just consume it.
+                if (advance) {
+                    a.movRegReg(.rdi, r_ctx);
+                    a.movRegReg(.rsi, r_pos);
+                    self.call(&helperCpLen);
+                    a.addRegReg(r_pos, .rax);
+                }
+                a.place(l_done);
+                return;
+            },
+            else => unreachable,
+        }
+    }
+
+    /// The generic path: call `helperTest` and advance by what it consumed.
+    fn emitHelperTest(self: *Gen, pc: u32, on_fail: x64.Label, advance: bool) Error!void {
+        const a = &self.a;
+        a.movRegReg(.rdi, r_ctx);
+        a.movRegImm64(.rsi, pc);
+        a.movRegReg(.rdx, r_pos);
+        self.call(&helperTest);
+        a.testRegReg(.rax, .rax);
+        a.jcc(.e, on_fail);
+        if (advance) {
+            a.decReg(.rax); // length + 1 -> length
+            a.addRegReg(r_pos, .rax);
+        }
+    }
+
+    /// Push a backtrack frame resuming at `resume_label`; `aux` may be null.
+    fn emitPushFrame(self: *Gen, resume_label: x64.Label, pos_reg: Reg, aux: ?Reg) void {
+        const a = &self.a;
+        a.leaRegMem(.rax, .{ .base = r_stack, .disp = frame_size });
+        a.cmpRegMem(.rax, ctxMem(ctx_stack_end));
+        a.jcc(.a, self.l_bail);
+        // `aux` is stored first: callers pass it in rcx, which the resume
+        // address and undo length below both use as scratch.
+        if (aux) |r| a.movMemReg(.{ .base = r_stack, .disp = frame_aux }, r);
+        a.leaLabel(.rcx, resume_label);
+        a.movMemReg(.{ .base = r_stack, .disp = frame_resume }, .rcx);
+        a.movMemReg(.{ .base = r_stack, .disp = frame_pos }, pos_reg);
+        a.movRegMem(.rcx, ctxMem(ctx_undo_len));
+        a.movMemReg(.{ .base = r_stack, .disp = frame_undo }, .rcx);
+        a.movRegReg(r_stack, .rax);
+    }
+
+    /// Record a slot write so backtracking can undo it, then perform it.
+    fn emitSlotWrite(self: *Gen, slot: u16) void {
+        const a = &self.a;
+        a.movRegMem(.rax, ctxMem(ctx_undo_len));
+        a.cmpRegMem(.rax, ctxMem(ctx_undo_cap));
+        a.jcc(.ae, self.l_bail);
+        a.movRegMem(.rcx, ctxMem(ctx_undo_slots));
+        a.movMemImm32(.{ .base = .rcx, .index = .rax, .scale = 3 }, slot);
+        a.movRegMem(.rdx, .{ .base = r_slots, .disp = @as(i32, slot) * 8 });
+        a.movRegMem(.rcx, ctxMem(ctx_undo_vals));
+        a.movMemReg(.{ .base = .rcx, .index = .rax, .scale = 3 }, .rdx);
+        a.incReg(.rax);
+        a.movMemReg(ctxMem(ctx_undo_len), .rax);
+        a.movMemReg(.{ .base = r_slots, .disp = @as(i32, slot) * 8 }, r_pos);
+    }
+
+    /// prev/next word-character flags for `\b`, in rax and rdx.
+    fn emitWordFlags(self: *Gen) Error!void {
+        const a = &self.a;
+        const l_p_done = try a.label();
+        const l_n_done = try a.label();
+        a.xorRegReg(.rax, .rax);
+        a.testRegReg(r_pos, r_pos);
+        a.jcc(.e, l_p_done);
+        a.movzxRegMem8(.rcx, inputAt(r_pos, -1));
+        a.cmpReg8Imm(.rcx, 0x80);
+        a.jcc(.ae, l_p_done); // non-ASCII is never a word char
+        a.btLabelReg(self.l_word_table, .rcx);
+        a.jcc(.ae, l_p_done);
+        a.movRegImm64(.rax, 1);
+        a.place(l_p_done);
+
+        a.xorRegReg(.rdx, .rdx);
+        a.cmpRegReg(r_pos, r_len);
+        a.jcc(.ae, l_n_done);
+        a.movzxRegMem8(.rcx, inputAt(r_pos, 0));
+        a.cmpReg8Imm(.rcx, 0x80);
+        a.jcc(.ae, l_n_done);
+        a.btLabelReg(self.l_word_table, .rcx);
+        a.jcc(.ae, l_n_done);
+        a.movRegImm64(.rdx, 1);
+        a.place(l_n_done);
+    }
+
+    /// Move r_pos back over the preceding codepoint.
+    fn emitStepBack(self: *Gen) Error!void {
+        const a = &self.a;
+        const l_one = try a.label();
+        const l_done = try a.label();
+        a.movzxRegMem8(.rax, inputAt(r_pos, -1));
+        a.cmpReg8Imm(.rax, 0x80);
+        a.jcc(.b, l_one);
+        a.movRegReg(.rdi, r_ctx);
+        a.movRegReg(.rsi, r_pos);
+        self.call(&helperCpLenBefore);
+        a.subRegReg(r_pos, .rax);
+        a.jmp(l_done);
+        a.place(l_one);
+        a.decReg(r_pos);
+        a.place(l_done);
+    }
+
+    /// Lookaround over a single-codepoint sub-program, inlined.
+    fn emitLook(self: *Gen, l: compiler.LookOp) Error!void {
+        const a = &self.a;
+        const child_pc = l.target;
+        switch (l.kind) {
+            .ahead_pos => try self.emitTest(child_pc, self.l_fail, false),
+            .ahead_neg => {
+                const l_ok = try a.label();
+                try self.emitTest(child_pc, l_ok, false);
+                a.jmp(self.l_fail); // the sub-program matched, so this fails
+                a.place(l_ok);
+            },
+            .behind_pos, .behind_neg => {
+                const positive = l.kind == .behind_pos;
+                const l_nomatch = try a.label();
+                const l_restore_fail = try a.label();
+                const l_done = try a.label();
+                a.testRegReg(r_pos, r_pos);
+                a.jcc(.e, l_nomatch); // nothing precedes the start of input
+                a.movMemReg(ctxMem(ctx_scratch2), r_pos);
+                try self.emitStepBack();
+                try self.emitTest(child_pc, l_restore_fail, false);
+                a.movRegMem(r_pos, ctxMem(ctx_scratch2));
+                if (positive) a.jmp(l_done) else a.jmp(self.l_fail);
+                a.place(l_restore_fail);
+                a.movRegMem(r_pos, ctxMem(ctx_scratch2));
+                a.place(l_nomatch);
+                if (positive) a.jmp(self.l_fail);
+                a.place(l_done);
+            },
+        }
+    }
+
+    /// Emit `count` mandatory iterations of a repeat's child, peeling when
+    /// there are few and looping on a counter when there are many.
+    fn emitMandatory(self: *Gen, child_pc: u32, count: u32, on_fail: x64.Label) Error!void {
+        const a = &self.a;
+        const max_peel = 8;
+        if (count <= max_peel) {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) try self.emitTest(child_pc, on_fail, true);
+            return;
+        }
+        a.movMemImm32(ctxMem(ctx_scratch1), @intCast(count));
+        const l_loop = try a.here();
+        const l_done = try a.label();
+        a.movRegMem(.rax, ctxMem(ctx_scratch1));
+        a.testRegReg(.rax, .rax);
+        a.jcc(.e, l_done);
+        try self.emitTest(child_pc, on_fail, true);
+        a.movRegMem(.rax, ctxMem(ctx_scratch1));
+        a.decReg(.rax);
+        a.movMemReg(ctxMem(ctx_scratch1), .rax);
+        a.jmp(l_loop);
+        a.place(l_done);
+    }
+
+    /// Fused repeat: consume in a tight loop, then leave one frame that stands
+    /// for every retry, exactly as the interpreter's rep frames do.
+    fn emitRep(self: *Gen, pc: u32, r: compiler.RepOp) Error!void {
+        const a = &self.a;
+        const child_pc = pc + 1;
+        const cont = self.pc_labels[pc + 2];
+        const max_peel = 8;
+
+        try self.emitMandatory(child_pc, r.min, self.l_fail);
+
+        if (!r.greedy) {
+            if (r.max <= r.min) {
+                a.jmp(cont);
+                return;
+            }
+            const retry = try a.label();
+            const remaining: u64 = if (r.max == compiler.RepOp.unbounded)
+                std.math.maxInt(u64)
+            else
+                r.max - r.min;
+            a.movRegImm64(.rcx, remaining);
+            self.emitPushFrame(retry, r_pos, .rcx);
+            a.jmp(cont);
+
+            a.place(retry);
+            const l_pop_fail = try a.label();
+            const aux: Mem = .{ .base = r_stack, .disp = -frame_size + frame_aux };
+            a.movRegMem(.rcx, aux);
+            a.testRegReg(.rcx, .rcx);
+            a.jcc(.e, l_pop_fail);
+            try self.emitTest(child_pc, l_pop_fail, true);
+            a.movRegMem(.rcx, aux);
+            a.decReg(.rcx);
+            a.movMemReg(aux, .rcx);
+            a.movMemReg(.{ .base = r_stack, .disp = -frame_size + frame_pos }, r_pos);
+            a.jmp(cont);
+            a.place(l_pop_fail);
+            a.subRegImm(r_stack, frame_size);
+            a.jmp(self.l_fail);
+            return;
+        }
+
+        // Greedy: the position after exactly `min` items is the retry floor.
+        a.movMemReg(ctxMem(ctx_scratch0), r_pos);
+        const l_loop_done = try a.label();
+        if (r.max == compiler.RepOp.unbounded) {
+            const l_loop = try a.here();
+            try self.emitTest(child_pc, l_loop_done, true);
+            a.jmp(l_loop);
+        } else {
+            const remaining = r.max - r.min;
+            if (remaining <= max_peel) {
+                var i: u32 = 0;
+                while (i < remaining) : (i += 1) try self.emitTest(child_pc, l_loop_done, true);
+            } else {
+                a.movMemImm32(ctxMem(ctx_scratch1), @intCast(remaining));
+                const l_loop = try a.here();
+                a.movRegMem(.rax, ctxMem(ctx_scratch1));
+                a.testRegReg(.rax, .rax);
+                a.jcc(.e, l_loop_done);
+                try self.emitTest(child_pc, l_loop_done, true);
+                a.movRegMem(.rax, ctxMem(ctx_scratch1));
+                a.decReg(.rax);
+                a.movMemReg(ctxMem(ctx_scratch1), .rax);
+                a.jmp(l_loop);
+            }
+        }
+        a.place(l_loop_done);
+
+        const l_noframe = try a.label();
+        const retry = try a.label();
+        a.movRegMem(.rcx, ctxMem(ctx_scratch0));
+        a.cmpRegReg(r_pos, .rcx);
+        a.jcc(.be, l_noframe);
+        self.emitPushFrame(retry, r_pos, .rcx);
+        a.place(l_noframe);
+        a.jmp(cont);
+
+        // Retry stub: entered from the fail path with r_pos already restored
+        // from this frame and the undo log unwound.
+        a.place(retry);
+        const l_pop_fail = try a.label();
+        const floor: Mem = .{ .base = r_stack, .disp = -frame_size + frame_aux };
+        const stored_pos: Mem = .{ .base = r_stack, .disp = -frame_size + frame_pos };
+        a.movRegMem(.rcx, floor);
+        if (retryScanChar(self.prog, pc + 2)) |sc| {
+            // Every skipped position would fail at this literal, so jump
+            // straight to its occurrences, largest first to keep greedy order.
+            const l_scan = try a.here();
+            const l_found = try a.label();
+            a.cmpRegReg(r_pos, .rcx);
+            a.jcc(.be, l_pop_fail);
+            a.decReg(r_pos);
+            a.cmpMem8Imm(inputAt(r_pos, 0), sc.byte);
+            a.jcc(.e, l_found);
+            if (sc.ci) {
+                const other: u8 = if (sc.byte >= 'a') sc.byte - 32 else sc.byte + 32;
+                a.cmpMem8Imm(inputAt(r_pos, 0), other);
+                a.jcc(.e, l_found);
+            }
+            a.jmp(l_scan);
+            a.place(l_found);
+        } else {
+            a.cmpRegReg(r_pos, .rcx);
+            a.jcc(.be, l_pop_fail);
+            try self.emitStepBack();
+        }
+        a.movMemReg(stored_pos, r_pos);
+        a.jmp(cont);
+        a.place(l_pop_fail);
+        a.subRegImm(r_stack, frame_size);
+        a.jmp(self.l_fail);
+    }
+
+    fn emitAssert(self: *Gen, kind: common.Assertion) Error!void {
+        const a = &self.a;
+        switch (kind) {
+            .begin_text => {
+                a.testRegReg(r_pos, r_pos);
+                a.jcc(.ne, self.l_fail);
+            },
+            .end_text => {
+                a.cmpRegReg(r_pos, r_len);
+                a.jcc(.ne, self.l_fail);
+            },
+            .begin_line => {
+                const l_ok = try a.label();
+                a.testRegReg(r_pos, r_pos);
+                a.jcc(.e, l_ok);
+                a.cmpMem8Imm(inputAt(r_pos, -1), '\n');
+                a.jcc(.ne, self.l_fail);
+                a.place(l_ok);
+            },
+            .end_line => {
+                const l_ok = try a.label();
+                a.cmpRegReg(r_pos, r_len);
+                a.jcc(.e, l_ok);
+                a.cmpMem8Imm(inputAt(r_pos, 0), '\n');
+                a.jcc(.ne, self.l_fail);
+                a.place(l_ok);
+            },
+            .word_boundary, .not_word_boundary => {
+                try self.emitWordFlags();
+                a.cmpRegReg(.rax, .rdx);
+                a.jcc(if (kind == .word_boundary) .e else .ne, self.l_fail);
+            },
+        }
+    }
+};
+
+/// A literal the continuation of a greedy repeat must match next, letting
+/// retries jump between its occurrences (the JIT's form of the interpreter's
+/// required-literal scanning).
+const ScanChar = struct { byte: u8, ci: bool };
+
+fn retryScanChar(prog: compiler.Program, cont_pc: u32) ?ScanChar {
+    var pc = cont_pc;
+    var hops: u8 = 0;
+    while (hops < 16) : (hops += 1) {
+        if (pc >= prog.insts.len) return null;
+        switch (prog.insts[pc]) {
+            .save => pc += 1,
+            .jmp => |t| pc = t,
+            else => break,
+        }
+    }
+    if (pc >= prog.insts.len) return null;
+    const c: compiler.CharOp = switch (prog.insts[pc]) {
+        .char => |c| c,
+        .look => |l| blk: {
+            if (l.kind != .ahead_pos) return null;
+            switch (prog.insts[l.target]) {
+                .char => |c| break :blk c,
+                else => return null,
+            }
+        },
+        else => return null,
+    };
+    if (c.cp >= 0x80) return null;
+    const folds = c.ci and ((c.cp >= 'a' and c.cp <= 'z') or (c.cp >= 'A' and c.cp <= 'Z'));
+    return .{ .byte = @intCast(c.cp), .ci = folds };
+}
+
+/// Detects the leading greedy unbounded repeat that lets a failed attempt skip
+/// the whole run it consumed (see `backtrack.run`).
+fn leadSkipChild(prog: compiler.Program) ?u32 {
+    var pc: u32 = 0;
+    while (pc < prog.insts.len and prog.insts[pc] == .save) pc += 1;
+    if (pc >= prog.insts.len or prog.insts[pc] != .rep) return null;
+    const r = prog.insts[pc].rep;
+    if (!r.greedy or r.max != compiler.RepOp.unbounded) return null;
+    return pc + 1;
+}
+
+/// Generate a matcher for `prog` into `code_buf`. Returns the code length, or
+/// null when the program uses something the generator does not implement or
+/// the code does not fit.
+pub fn compile(
+    gpa: std.mem.Allocator,
+    prog: compiler.Program,
+    prefilter: *const compiler.Prefilter,
+    code_buf: []u8,
+) std.mem.Allocator.Error!?u32 {
+    if (!Support.canCompile(prog)) return null;
+
+    var g = Gen{
+        .a = x64.Asm.init(gpa, code_buf),
+        .prog = prog,
+        .gpa = gpa,
+        .pc_labels = try gpa.alloc(x64.Label, prog.insts.len),
+        .dead = try gpa.alloc(bool, prog.insts.len),
+        .prefilter = prefilter,
+    };
+    defer gpa.free(g.pc_labels);
+    defer gpa.free(g.dead);
+    defer g.blobs.deinit(gpa);
+    defer g.bits_cache.deinit(gpa);
+    defer g.a.deinit();
+
+    const a = &g.a;
+    for (g.pc_labels) |*l| l.* = try a.label();
+    @memset(g.dead, false);
+    // Lookaround sub-programs are reached only through the `look` instruction,
+    // which is inlined, so their instructions never need code.
+    for (prog.insts) |inst| {
+        if (inst == .look) {
+            g.dead[inst.look.target] = true;
+            g.dead[inst.look.target + 1] = true;
+        }
+    }
+
+    g.l_fail = try a.label();
+    g.l_bail = try a.label();
+    g.l_no_match = try a.label();
+    g.l_epilogue = try a.label();
+    g.l_attempt = try a.label();
+    g.l_attempt_failed = try a.label();
+    g.l_word_table = try a.label();
+
+    // -- prologue -----------------------------------------------------------
+    a.push(.rbp);
+    a.push(.rbx);
+    a.push(.r12);
+    a.push(.r13);
+    a.push(.r14);
+    a.push(.r15);
+    // Six pushes leave rsp 8 past a 16-byte boundary; this realigns it so the
+    // helper calls see the stack the System V ABI requires.
+    a.subRegImm(.rsp, 8);
+    a.movRegReg(r_ctx, .rdi);
+    a.movRegMem(r_input, ctxMem(ctx_input));
+    a.movRegMem(r_len, ctxMem(ctx_input_len));
+    a.movRegMem(r_pos, ctxMem(ctx_start));
+    a.movRegMem(r_slots, ctxMem(ctx_slots));
+
+    // -- one match attempt starting at r_pos --------------------------------
+    a.place(g.l_attempt);
+    if (prefilter.usable) {
+        // Skip positions that cannot begin a match. A usable prefilter implies
+        // the pattern cannot match empty, so running off the end means failure.
+        const pf_table = try a.label();
+        if (prefilter.single) |byte| {
+            // One candidate byte: hand the scan to a vectorized search.
+            a.movRegReg(.rdi, r_ctx);
+            a.movRegReg(.rsi, r_pos);
+            a.movRegImm64(.rdx, byte);
+            g.call(&helperMemchr);
+            a.movRegReg(r_pos, .rax);
+            a.cmpRegReg(r_pos, r_len);
+            a.jcc(.ae, g.l_no_match);
+        } else {
+            const l_scan = try a.here();
+            const l_ok = try a.label();
+            a.cmpRegReg(r_pos, r_len);
+            a.jcc(.ae, g.l_no_match);
+            a.movzxRegMem8(.rax, inputAt(r_pos, 0));
+            a.leaLabel(.rsi, pf_table);
+            a.cmpMem8Imm(.{ .base = .rsi, .index = .rax, .scale = 0 }, 0);
+            a.jcc(.ne, l_ok);
+            if (prefilter.ascii_only) {
+                // Every candidate byte is ASCII, so stepping bytes cannot land
+                // inside a codepoint.
+                a.incReg(r_pos);
+            } else {
+                const l_one = try a.label();
+                const l_stepped = try a.label();
+                a.cmpReg8Imm(.rax, 0x80);
+                a.jcc(.b, l_one);
+                a.movRegReg(.rdi, r_ctx);
+                a.movRegReg(.rsi, r_pos);
+                g.call(&helperCpLen);
+                a.addRegReg(r_pos, .rax);
+                a.jmp(l_stepped);
+                a.place(l_one);
+                a.incReg(r_pos);
+                a.place(l_stepped);
+            }
+            a.jmp(l_scan);
+            a.place(l_ok);
+            // The table is data; park it with the other blobs at the end.
+            const bytes: [16]u8 = @splat(0);
+            try g.blobs.append(gpa, .{ .label = pf_table, .bytes = bytes });
+            g.prefilter_label = pf_table;
+        }
+    }
+    a.movRegMem(r_stack, ctxMem(ctx_stack_base));
+    a.movMemImm32(ctxMem(ctx_undo_len), 0);
+    a.movMemImm32(ctxMem(ctx_touched), 0);
+    a.movMemReg(ctxMem(ctx_match_start), r_pos);
+    a.jmp(g.pc_labels[0]);
+
+    // -- instruction bodies -------------------------------------------------
+    for (prog.insts, 0..) |inst, pci| {
+        const pc: u32 = @intCast(pci);
+        a.place(g.pc_labels[pc]);
+        if (g.dead[pc]) continue;
+        switch (inst) {
+            .char, .class, .any, .any_not_nl => try g.emitTest(pc, g.l_fail, true),
+            .assert => |k| try g.emitAssert(k),
+            .jmp => |t| a.jmp(g.pc_labels[t]),
+            .split => |t| {
+                const stub = try a.label();
+                g.emitPushFrame(stub, r_pos, null);
+                a.jmp(g.pc_labels[t[0]]);
+                a.place(stub);
+                a.subRegImm(r_stack, frame_size);
+                a.jmp(g.pc_labels[t[1]]);
+            },
+            .save, .set_pos => |slot| g.emitSlotWrite(slot),
+            .fail_if_same => |slot| {
+                a.cmpRegMem(r_pos, .{ .base = r_slots, .disp = @as(i32, slot) * 8 });
+                a.jcc(.e, g.l_fail);
+            },
+            .backref => {
+                a.movMemImm32(ctxMem(ctx_touched), 1);
+                a.movRegReg(.rdi, r_ctx);
+                a.movRegImm64(.rsi, pc);
+                a.movRegReg(.rdx, r_pos);
+                g.call(&helperBackref);
+                a.testRegReg(.rax, .rax);
+                a.jcc(.e, g.l_fail);
+                a.decReg(.rax);
+                a.addRegReg(r_pos, .rax);
+            },
+            .match => {
+                a.movMemReg(ctxMem(ctx_match_end), r_pos);
+                a.movRegImm64(.rax, 1);
+                a.jmp(g.l_epilogue);
+            },
+            .look => |l| try g.emitLook(l),
+            .rep => |r| try g.emitRep(pc, r),
+        }
+    }
+
+    // -- backtracking -------------------------------------------------------
+    a.place(g.l_fail);
+    {
+        const l_have = try a.label();
+        const l_unwind = try a.label();
+        const l_unwound = try a.label();
+        a.cmpRegMem(r_stack, ctxMem(ctx_stack_base));
+        a.jcc(.a, l_have);
+        // Stack empty: unwind every slot write and give up on this attempt.
+        a.xorRegReg(.rcx, .rcx);
+        a.leaLabel(.rax, g.l_attempt_failed);
+        a.jmp(l_unwind);
+
+        a.place(l_have);
+        a.movRegMem(.rax, ctxMem(ctx_budget));
+        a.decReg(.rax);
+        a.movMemReg(ctxMem(ctx_budget), .rax);
+        a.jcc(.s, g.l_bail);
+        // Peek, rather than pop: the resume stub decides whether its frame is
+        // exhausted, which is what lets one frame stand for a whole range of
+        // repeat retries.
+        a.movRegMem(.rax, .{ .base = r_stack, .disp = -frame_size + frame_resume });
+        a.movRegMem(r_pos, .{ .base = r_stack, .disp = -frame_size + frame_pos });
+        a.movRegMem(.rcx, .{ .base = r_stack, .disp = -frame_size + frame_undo });
+
+        a.place(l_unwind);
+        a.movRegMem(.rdx, ctxMem(ctx_undo_len));
+        a.cmpRegReg(.rdx, .rcx);
+        a.jcc(.be, l_unwound);
+        a.decReg(.rdx);
+        a.movMemReg(ctxMem(ctx_undo_len), .rdx);
+        a.movRegMem(.rsi, ctxMem(ctx_undo_slots));
+        a.movRegMem(.rdi, .{ .base = .rsi, .index = .rdx, .scale = 3 });
+        a.movRegMem(.rsi, ctxMem(ctx_undo_vals));
+        a.movRegMem(.r8, .{ .base = .rsi, .index = .rdx, .scale = 3 });
+        a.movMemReg(.{ .base = r_slots, .index = .rdi, .scale = 3 }, .r8);
+        a.jmp(l_unwind);
+        a.place(l_unwound);
+        a.jmpReg(.rax);
+    }
+
+    // -- advance to the next start position ---------------------------------
+    a.place(g.l_attempt_failed);
+    {
+        // Backtracking leaves r_pos wherever the last frame or retry loop put
+        // it; the next attempt starts one codepoint past where *this* attempt
+        // began, which is the value stashed at ctx.match_start.
+        a.movRegMem(r_pos, ctxMem(ctx_match_start));
+        a.cmpRegReg(r_pos, r_len);
+        a.jcc(.ae, g.l_no_match);
+        if (leadSkipChild(prog)) |child_pc| {
+            // Sound only when the attempt never read a capture: see
+            // `backtrack.run`, which makes the same check dynamically.
+            const l_no_skip = try a.label();
+            const l_skip_done = try a.label();
+            a.cmpMemImm32(ctxMem(ctx_touched), 0);
+            a.jcc(.ne, l_no_skip);
+            const l_loop = try a.here();
+            try g.emitTest(child_pc, l_skip_done, true);
+            a.jmp(l_loop);
+            a.place(l_skip_done);
+            a.cmpRegReg(r_pos, r_len);
+            a.jcc(.ae, g.l_no_match);
+            a.place(l_no_skip);
+        }
+        const l_one = try a.label();
+        a.movzxRegMem8(.rax, inputAt(r_pos, 0));
+        a.cmpReg8Imm(.rax, 0x80);
+        a.jcc(.b, l_one);
+        a.movRegReg(.rdi, r_ctx);
+        a.movRegReg(.rsi, r_pos);
+        g.call(&helperCpLen);
+        a.addRegReg(r_pos, .rax);
+        a.jmp(g.l_attempt);
+        a.place(l_one);
+        a.incReg(r_pos);
+        a.jmp(g.l_attempt);
+    }
+
+    // -- exits --------------------------------------------------------------
+    a.place(g.l_no_match);
+    a.xorRegReg(.rax, .rax);
+    a.jmp(g.l_epilogue);
+
+    a.place(g.l_bail);
+    a.movRegImm64(.rax, @bitCast(@as(i64, -1)));
+
+    a.place(g.l_epilogue);
+    a.addRegImm(.rsp, 8);
+    a.pop(.r15);
+    a.pop(.r14);
+    a.pop(.r13);
+    a.pop(.r12);
+    a.pop(.rbx);
+    a.pop(.rbp);
+    a.ret();
+
+    // -- data ---------------------------------------------------------------
+    // Word-character table for `\b`, then every class bitmap and, if used, the
+    // prefilter's byte table.
+    a.place(g.l_word_table);
+    {
+        var bits: [16]u8 = @splat(0);
+        for (0..128) |cp| {
+            if (common.isWordChar(@intCast(cp))) bits[cp / 8] |= @as(u8, 1) << @intCast(cp % 8);
+        }
+        a.data(&bits);
+    }
+    for (g.blobs.items) |blob| {
+        if (g.prefilter_label != null and blob.label == g.prefilter_label.?) continue;
+        a.place(blob.label);
+        a.data(&blob.bytes);
+    }
+    if (g.prefilter_label) |l| {
+        a.place(l);
+        var table: [256]u8 = @splat(0);
+        for (prefilter.bytes, 0..) |set, i| table[i] = @intFromBool(set);
+        a.data(&table);
+    }
+
+    const len = a.finish() catch return null;
+    return len;
+}

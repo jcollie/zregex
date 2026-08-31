@@ -189,13 +189,13 @@ test "inline flags at comptime" {
 test "engine selection" {
     var re = try Regex.compile(gpa, "a+b");
     defer re.deinit();
-    try std.testing.expectEqual(zregex.Engine.pike, re.engine);
+    try std.testing.expectEqual(zregex.Engine.pike, re.fallback_engine);
     var re2 = try Regex.compile(gpa, "(a)\\1");
     defer re2.deinit();
-    try std.testing.expectEqual(zregex.Engine.backtrack, re2.engine);
+    try std.testing.expectEqual(zregex.Engine.backtrack, re2.fallback_engine);
     var re3 = try Regex.compile(gpa, "(?=a)b");
     defer re3.deinit();
-    try std.testing.expectEqual(zregex.Engine.backtrack, re3.engine);
+    try std.testing.expectEqual(zregex.Engine.backtrack, re3.fallback_engine);
 }
 
 test "backreferences" {
@@ -222,7 +222,7 @@ test "no catastrophic backtracking without backrefs" {
     // Classic blowup pattern; on the Pike VM this is linear and just fails.
     var re = try Regex.compile(gpa, "(a+)+$");
     defer re.deinit();
-    try std.testing.expectEqual(zregex.Engine.pike, re.engine);
+    try std.testing.expectEqual(zregex.Engine.pike, re.fallback_engine);
     const haystack = "a" ** 60 ++ "b";
     try std.testing.expect(!try re.isMatch(gpa, haystack));
 }
@@ -240,7 +240,7 @@ test "empty-body loops terminate" {
 test "step limit" {
     var re = try Regex.compile(gpa, "(a+)+\\1$");
     defer re.deinit();
-    try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+    try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
     re.max_steps = 1000;
     const haystack = "a" ** 40 ++ "b";
     try std.testing.expectError(error.StepLimitExceeded, re.isMatch(gpa, haystack));
@@ -285,7 +285,7 @@ test "iterator with empty matches" {
 
 test "comptime compilation" {
     const re = comptime Regex.compileComptime("(\\d{3})-(\\d{4})");
-    try std.testing.expectEqual(zregex.Engine.pike, re.engine);
+    try std.testing.expectEqual(zregex.Engine.pike, re.fallback_engine);
     var m = (try re.find(gpa, "call 555-0199 now")).?;
     defer m.deinit(gpa);
     try std.testing.expectEqualStrings("555-0199", m.span().slice("call 555-0199 now"));
@@ -300,7 +300,7 @@ test "comptime compilation with flags, names, and backtracking features" {
         "(?<word>\\w+) \\k<word>",
         .{ .case_insensitive = true },
     );
-    try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+    try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
     try std.testing.expectEqual(@as(?u8, 1), re.groupIndex("word"));
     try std.testing.expect(try re.isMatch(gpa, "Hey HEY!"));
     try std.testing.expect(!try re.isMatch(gpa, "hey ho"));
@@ -488,7 +488,7 @@ test "memoization tames exponential backtracking" {
     // 2^30-ish unmemoized; the memo makes it polynomial and it just fails.
     var re = try Regex.compile(gpa, "(a+)+\\1$");
     defer re.deinit();
-    try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+    try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
     const haystack = "a" ** 30 ++ "b";
     try std.testing.expect(!try re.isMatch(gpa, haystack));
     // Without the memo the same search must blow the step budget.
@@ -520,7 +520,7 @@ test "memoization preserves semantics" {
     for (cases) |c| {
         var re = try Regex.compile(gpa, c.p);
         defer re.deinit();
-        try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+        try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
         re.memo = true;
         const with = try re.find(gpa, c.h);
         re.memo = false;
@@ -567,4 +567,92 @@ test "dynamic lead-run skipping with backrefs" {
     try expectFind("(\\w+) \\1", "aaaa bbbb cc cc", "cc cc");
     // Backref executed but failed: no skip, later start in same run matches.
     try expectFind("(\\w+)\\1", "xabab", "abab");
+}
+
+test "jit agrees with the interpreters on every match and capture" {
+    if (!zregex.jit_available) return error.SkipZigTest;
+    // Deliberately mixes the constructs the generator inlines (fused repeats,
+    // classes, assertions, single-codepoint lookaround) with the ones it hands
+    // to helpers (non-ASCII literals and classes, backreferences).
+    const patterns = [_][]const u8{
+        "abc",           "a+",              "a+?",           "a*b",
+        "(a|ab)(c|bcd)", "<.+>",            "<.+?>",         "(\\w+)@([\\w.]+)",
+        "^\\w+",         "\\w+$",           "\\bcat\\b",     "\\Babc",
+        "x{2,4}",        "(a*)*b",          "(|a)*b",        "[^x]y",
+        ".at",           "a$",              "^",             "a?",
+        "é+",
+        "(.)(.)",        "\\d{2,}",         "colou?r",       "(?:ab|cd)+",
+        "(a)(b)?c?",     "^$",              "\\x{1F600}+",   "(\\w+) \\1",
+        "(a+)\\1",       "(\\w{2,})-\\1",   "(?i)(abc)\\1",  "\\w+(?=@)",
+        "a(?!b)",        "(?<=\\$)\\d+",    "(?<!x)y",       "(?i)HeLLo",
+        "(?m)^b$",       "(?s)a.b",
+        "[à-ö]+",
+        "(a{2,})\\1",    "(?=\\d)\\d{2,4}", "(\\S+)-(\\S+)", "\\d{3,5}x",
+    };
+    const haystacks = [_][]const u8{
+        "",
+        "a",
+        "abc abc",
+        "aaabbb",
+        "the cat sat on a mat",
+        "x@y.z mail alice@example.org!",
+        "line one\nline two\ncat\n",
+        "xxxxx",
+        "abcbcd",
+        "aébé\xFFcé",
+        "color colour",
+        "ababcdab",
+        "hi 😀😀 there",
+        "wordcat catword cat",
+        "12 345 6789",
+        "say ho ho and hey hey!",
+        "cost: $42, was $7",
+        "aa-aa bb-bb cc-dd",
+        "ABC abc AbC abcabc",
+        "aaaaaaaaaaaaaaaaaaaab",
+    };
+    for (patterns) |pat| {
+        var re = try Regex.compile(gpa, pat);
+        defer re.deinit();
+        if (re.jit_code == null) continue;
+        for (haystacks) |hay| {
+            re.jit_mode = .on;
+            var it_jit = re.iterator(gpa, hay);
+            defer it_jit.deinit();
+            re.jit_mode = .off;
+            var it_ref = re.iterator(gpa, hay);
+            defer it_ref.deinit();
+            while (true) {
+                re.jit_mode = .on;
+                const a = try it_jit.next();
+                re.jit_mode = .off;
+                const b = try it_ref.next();
+                if (a == null or b == null) {
+                    std.testing.expectEqual(b == null, a == null) catch |err| {
+                        std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
+                        return err;
+                    };
+                    break;
+                }
+                var ma = a.?;
+                defer ma.deinit(gpa);
+                var mb = b.?;
+                defer mb.deinit(gpa);
+                std.testing.expectEqualSlices(?zregex.Span, mb.groups, ma.groups) catch |err| {
+                    std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "jit bails instead of blowing up, and the answer still comes back" {
+    if (!zregex.jit_available) return error.SkipZigTest;
+    // The generated code has no memoization, so this exhausts its budget; the
+    // memoizing interpreter behind it still produces the right answer.
+    var re = try Regex.compile(gpa, "(a+)+\\1$");
+    defer re.deinit();
+    try std.testing.expectEqual(zregex.Engine.jit, re.engine);
+    try std.testing.expect(!try re.isMatch(gpa, "a" ** 30 ++ "b"));
 }

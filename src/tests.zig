@@ -571,11 +571,15 @@ test "dynamic lead-run skipping with backrefs" {
 
 test "jit agrees with the interpreters on every match and capture" {
     if (!zregex.jit_available) return error.SkipZigTest;
-    // Both vector widths generate different code for the same repeats, so
-    // each is checked against the interpreters in turn.
-    defer zregex.overrideAvx2(null);
-    for ([_]bool{ false, true }) |avx2| {
-        zregex.overrideAvx2(avx2);
+    // On x86-64 the two vector widths generate different code for the same
+    // repeats, so each is checked against the interpreters in turn.
+    if (@import("builtin").cpu.arch == .x86_64) {
+        defer zregex.overrideAvx2(null);
+        for ([_]bool{ false, true }) |avx2| {
+            zregex.overrideAvx2(avx2);
+            try jitDifferential();
+        }
+    } else {
         try jitDifferential();
     }
 }

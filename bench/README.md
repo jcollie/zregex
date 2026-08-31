@@ -95,6 +95,16 @@ exponentially many ways to split a run — go to the lazy DFA, which is linear
 by construction. That single rule routes every benchmark correctly and is
 what keeps `pathological` at 0.00 ms.
 
+The generator has two backends, x86-64 and aarch64, sharing the runtime
+layout, the helpers, and every analysis that decides what to compile; only
+instruction selection differs. AArch64 needs two things x86-64 does not:
+freshly written code must be pushed out of the data cache and the stale lines
+invalidated in the instruction cache before it can be executed, and NEON has
+no equivalent of `pmovmskb`, so the run scanner narrows its sixteen
+comparison lanes to sixteen nibbles with `shrn` and finds the first set one
+with `rbit`+`clz`. The suite runs for both architectures — the aarch64 one
+under QEMU, in CI as well — and the two agree match for match.
+
 AVX2 is used when the CPU and OS support it (checked with CPUID and XGETBV,
 since the OS must also be saving YMM state), which doubles the block and,
 being three-operand, drops the register copies the SSE2 form needs. On this

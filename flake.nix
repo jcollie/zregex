@@ -39,6 +39,8 @@
             name = "zregex";
             nativeBuildInputs = [
               pkgs.git-pages-cli
+              # Runs the aarch64 test suite via `zig build test -fqemu`.
+              pkgs.qemu
               pkgs.kcov
               pkgs.radicle-node
               pkgs.reuse

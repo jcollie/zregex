@@ -39,6 +39,11 @@ jobs:
       - name: Run tests
         run: nix develop .#default -c zig build test
 
+      - name: Run tests for aarch64 under emulation
+        # The JIT has a second backend; without this only the x86-64 one is
+        # ever executed, since the runner is x86-64.
+        run: nix develop .#default -c zig build test -Dtarget=aarch64-linux-gnu -fqemu
+
       - name: Build the benchmark harness
         # Compile check only; the comparative benchmarks themselves need a
         # quiet machine and are run by hand (see bench/run.sh).

@@ -9,10 +9,10 @@ A regular expression library for Zig 0.16.
 
 Three engines behind one API:
 
-- **JIT** — on x86-64, patterns are compiled to native machine code: literals
-  become byte compares, classes become bit-test tables, and repeats become
-  consume loops that scan sixteen bytes at a time with SSE2, or thirty-two
-  with AVX2 where the CPU and OS provide it. It backtracks, so it is used
+- **JIT** — on x86-64 and aarch64, patterns are compiled to native machine
+  code: literals become byte compares, classes become bit-test tables, and
+  repeats become consume loops that scan sixteen bytes at a time with SSE2 or
+  NEON, or thirty-two with AVX2 where the CPU and OS provide it. It backtracks, so it is used
   only where that backtracking is structurally bounded — every loop fused
   into a single repeat instruction, so frames are bounded by the pattern and
   not the input — and it carries a step budget besides; exhausting the budget

@@ -36,6 +36,8 @@ test {
     _ = @import("jit.zig");
     _ = @import("jit/mem.zig");
     _ = @import("jit/x64.zig");
+    _ = @import("jit/a64.zig");
+    _ = @import("jit/runtime.zig");
     _ = @import("jit/cpu.zig");
     _ = @import("parser.zig");
     _ = @import("compiler.zig");

@@ -18,9 +18,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("compiler.zig");
 const mem = @import("jit/mem.zig");
-const codegen = @import("jit/codegen.zig");
+const runtime = @import("jit/runtime.zig");
 
-pub const available = mem.supported and builtin.cpu.arch == .x86_64;
+/// The backend for this target, if there is one.
+const codegen = switch (builtin.cpu.arch) {
+    .x86_64 => @import("jit/codegen_x64.zig"),
+    .aarch64 => @import("jit/codegen_a64.zig"),
+    else => void,
+};
+
+pub const available = mem.supported and switch (builtin.cpu.arch) {
+    .x86_64, .aarch64 => true,
+    else => false,
+};
 
 pub const Result = enum { match, no_match, bail };
 
@@ -64,7 +74,7 @@ pub fn backtrackingIsBounded(prog: compiler.Program) bool {
 
 pub const Jit = struct {
     buf: mem.Buffer,
-    func: codegen.Fn,
+    func: runtime.Fn,
     /// A stable copy of the program: the generated code hands this pointer to
     /// its helpers, so it must not live in a struct the caller might move.
     prog: *compiler.Program,
@@ -78,7 +88,7 @@ pub const Jit = struct {
         prefilter: *const compiler.Prefilter,
     ) std.mem.Allocator.Error!?Jit {
         if (!available) return null;
-        if (!codegen.Support.canCompile(prog)) return null;
+        if (!runtime.Support.canCompile(prog)) return null;
 
         const estimate = 8192 + prog.insts.len * 768;
         var buf = mem.Buffer.init(estimate) catch return null;
@@ -97,7 +107,7 @@ pub const Jit = struct {
         prog_copy.* = prog;
         return .{
             .buf = buf,
-            .func = @ptrCast(buf.code.ptr),
+            .func = @ptrCast(@alignCast(buf.code.ptr)),
             .prog = prog_copy,
             .gpa = gpa,
         };
@@ -125,13 +135,13 @@ pub const Jit = struct {
     ) Result {
         if (slots_out.len > max_slots) return .bail;
         var slots: [max_slots]usize = undefined;
-        for (0..slots_out.len) |i| slots[i] = codegen.unset;
+        for (0..slots_out.len) |i| slots[i] = runtime.unset;
         var undo_slots: [max_undo]usize = undefined;
         var undo_vals: [max_undo]usize = undefined;
         var stack: [max_frames * 32]u8 align(@alignOf(usize)) = undefined;
         const stack_base: [*]u8 = &stack;
 
-        var ctx = codegen.Ctx{
+        var ctx = runtime.Ctx{
             .input = input.ptr,
             .input_len = input.len,
             .start = start,
@@ -156,7 +166,7 @@ pub const Jit = struct {
         return switch (status) {
             1 => blk: {
                 for (slots_out, 0..) |*s, i| {
-                    s.* = if (slots[i] == codegen.unset) null else slots[i];
+                    s.* = if (slots[i] == runtime.unset) null else slots[i];
                 }
                 // Group 0 has no save instructions; the code reports it here.
                 slots_out[0] = ctx.match_start;

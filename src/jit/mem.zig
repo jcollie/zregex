@@ -20,6 +20,45 @@ pub const supported = switch (builtin.os.tag) {
     else => false,
 };
 
+/// Make newly written instructions visible to the instruction fetcher.
+///
+/// On x86-64 the caches are coherent with stores and nothing is required. On
+/// AArch64 they are not: freshly written bytes can sit in the data cache
+/// while the instruction cache serves stale contents, so each line must be
+/// cleaned to the point of unification, then invalidated in the instruction
+/// cache, with barriers between. The line sizes come from CTR_EL0, which
+/// reports them as a log2 count of 4-byte words.
+fn syncInstructionCache(code: []const u8) void {
+    if (builtin.cpu.arch != .aarch64) return;
+    if (code.len == 0) return;
+    const ctr = asm volatile ("mrs %[out], ctr_el0"
+        : [out] "=r" (-> u64),
+    );
+    const dcache_line: usize = @as(usize, 4) << @intCast((ctr >> 16) & 0xF);
+    const icache_line: usize = @as(usize, 4) << @intCast(ctr & 0xF);
+    const start = @intFromPtr(code.ptr);
+    const end = start + code.len;
+
+    var addr = std.mem.alignBackward(usize, start, dcache_line);
+    while (addr < end) : (addr += dcache_line) {
+        asm volatile ("dc cvau, %[a]"
+            :
+            : [a] "r" (addr),
+            : .{ .memory = true });
+    }
+    asm volatile ("dsb ish" ::: .{ .memory = true });
+
+    addr = std.mem.alignBackward(usize, start, icache_line);
+    while (addr < end) : (addr += icache_line) {
+        asm volatile ("ic ivau, %[a]"
+            :
+            : [a] "r" (addr),
+            : .{ .memory = true });
+    }
+    asm volatile ("dsb ish" ::: .{ .memory = true });
+    asm volatile ("isb" ::: .{ .memory = true });
+}
+
 pub const Buffer = struct {
     /// The whole mapping; `len` is page-rounded and may exceed the code size.
     mapping: []align(std.heap.page_size_min) u8,
@@ -53,10 +92,8 @@ pub const Buffer = struct {
             .SUCCESS => {},
             else => return error.MemoryProtectionFailed,
         }
-        // Writes went through a different mapping permission than the one the
-        // CPU will fetch from; on x86-64 the icache is coherent, but other
-        // targets need an explicit flush and this is where it would go.
         self.code = self.mapping[0..code_len];
+        syncInstructionCache(self.code);
     }
 
     pub fn deinit(self: *Buffer) void {

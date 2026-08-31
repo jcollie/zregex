@@ -76,6 +76,17 @@ pub const Regex = struct {
     prefilter: compiler.Prefilter,
     /// Codepoint partition for the lazy DFA; `alphabet.ok == false` disables it.
     alphabet: compiler.Alphabet,
+    /// Whether the program guards an empty-bodied loop.
+    ///
+    /// Deciding the guard needs the position a thread recorded, which the DFA
+    /// does not carry, so such patterns stay off it. They also stay off the
+    /// JIT: whether a loop iteration that consumes nothing leaves its
+    /// captures behind, and how its alternatives are ordered against the rest
+    /// of the loop, is where backtracking and automaton engines part company.
+    /// Pinning these patterns to one engine keeps results consistent — and
+    /// keeps the linear-time guarantee, which routing them to a backtracker
+    /// would give up.
+    has_loop_guard: bool = false,
     /// Lazy DFA policy. `.auto` uses the DFA only when the byte prefilter is
     /// weak (a broad or unusable candidate set) — when the prefilter is
     /// highly selective, memchr-style skipping with the Pike VM alone is
@@ -201,6 +212,9 @@ pub const Regex = struct {
             .alphabet = alphabet,
             .gpa = gpa,
         };
+        for (insts) |inst| {
+            if (inst == .exit_if_same) re.has_loop_guard = true;
+        }
         re.fallback_engine = if (bt) .backtrack else .pike;
         re.jit_code = try jitmod.Jit.compile(gpa, re.jitProg(), &re.prefilter);
         re.engine = if (re.jitIsDefault()) .jit else re.fallback_engine;
@@ -268,6 +282,12 @@ pub const Regex = struct {
                 .fallback_engine = if (p.has_backref or p.has_look) .backtrack else .pike,
                 .prefilter = prefilter,
                 .alphabet = alphabet,
+                .has_loop_guard = blk: {
+                    for (&final_insts) |inst| {
+                        if (inst == .exit_if_same) break :blk true;
+                    }
+                    break :blk false;
+                },
                 .gpa = null,
             };
         }
@@ -325,6 +345,13 @@ pub const Regex = struct {
     /// prefilter is selective enough that few start positions are ever tried.
     fn jitIsDefault(self: *const Regex) bool {
         if (self.jit_code == null) return false;
+        // A loop whose body can match empty is the one place the backtracking
+        // and automaton engines genuinely differ (see `has_loop_guard`), so
+        // such patterns are kept on a single engine and the difference never
+        // becomes visible. When there is a linear engine that can run it, it
+        // wins; behind a backreference or lookaround there is not, and the
+        // JIT and the backtracker agree with each other anyway.
+        if (self.has_loop_guard and self.fallback_engine == .pike) return false;
         // Native code runs when its backtracking is structurally bounded (see
         // `jit.backtrackingIsBounded`). Behind a backreference or lookaround
         // there is no linear engine to fall back to anyway, so the JIT is
@@ -345,6 +372,7 @@ pub const Regex = struct {
 
     fn dfaEligible(self: *const Regex) bool {
         if (self.fallback_engine != .pike or !self.alphabet.ok) return false;
+        if (self.has_loop_guard) return false;
         return switch (self.dfa_mode) {
             .off => false,
             .on => true,
@@ -443,7 +471,12 @@ pub const Regex = struct {
         for (groups, 0..) |*g, i| {
             const a = slots[2 * i];
             const b = slots[2 * i + 1];
-            g.* = if (a != null and b != null) .{ .start = a.?, .end = b.? } else null;
+            // A half-open group can leave start past end; report that as not
+            // having participated rather than as a backwards span.
+            g.* = if (a != null and b != null and a.? <= b.?)
+                .{ .start = a.?, .end = b.? }
+            else
+                null;
         }
         return .{ .groups = groups };
     }

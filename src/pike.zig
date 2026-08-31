@@ -68,11 +68,17 @@ const Ctx = struct {
     }
 
     /// Add `pc0` and its epsilon closure to `list` in priority (DFS) order.
+    ///
+    /// An instruction is marked visited when its path is actually *taken*,
+    /// never when a path to it is merely queued. Marking at queue time lets a
+    /// deferred low-priority branch pre-empt a higher-priority one that
+    /// reaches the same instruction later, which silently drops that path —
+    /// and with it the captures it had recorded.
+    ///
     /// Force-inlined: when the Pike VM lost single-call-site inlining (the
     /// lazy DFA added callers), the outlined closure cost ~2x on scan-heavy
     /// patterns.
     inline fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, start: usize, slots0: ?*const SlotNode) !void {
-        if (!self.tryEnter(gen, pc0)) return;
         var sp: usize = 0;
         self.stack[sp] = .{ .pc = pc0, .start = start, .slots = slots0 };
         sp += 1;
@@ -80,6 +86,7 @@ const Ctx = struct {
             sp -= 1;
             var pc = self.stack[sp].pc;
             var slots = self.stack[sp].slots;
+            if (!self.tryEnter(gen, pc)) continue :next_path;
             while (true) {
                 switch (self.prog.insts[pc]) {
                     .jmp => |t| {
@@ -87,10 +94,10 @@ const Ctx = struct {
                         pc = t;
                     },
                     .split => |t| {
-                        if (self.tryEnter(gen, t[1])) {
-                            self.stack[sp] = .{ .pc = t[1], .start = start, .slots = slots };
-                            sp += 1;
-                        }
+                        // Queued unmarked; whichever path reaches it first
+                        // when actually taken is the one that wins.
+                        self.stack[sp] = .{ .pc = t[1], .start = start, .slots = slots };
+                        sp += 1;
                         if (!self.tryEnter(gen, t[0])) continue :next_path;
                         pc = t[0];
                     },
@@ -99,10 +106,12 @@ const Ctx = struct {
                         if (!self.tryEnter(gen, pc + 1)) continue :next_path;
                         pc += 1;
                     },
-                    .fail_if_same => |s| {
-                        if (slotLookup(slots, s) == pos) continue :next_path;
-                        if (!self.tryEnter(gen, pc + 1)) continue :next_path;
-                        pc += 1;
+                    .exit_if_same => |g| {
+                        // An empty iteration ends the loop, keeping whatever
+                        // it captured, rather than failing the path.
+                        const next = if (slotLookup(slots, g.slot) == pos) g.target else pc + 1;
+                        if (!self.tryEnter(gen, next)) continue :next_path;
+                        pc = next;
                     },
                     .assert => |a| {
                         if (!common.assertHolds(a, self.input, pos)) continue :next_path;
@@ -140,7 +149,8 @@ pub fn run(
         .input = input,
         .arena = arena,
         .seen = try arena.alloc(u32, n),
-        .stack = try arena.alloc(Thread, n),
+        // One stack entry per split actually processed, plus the seed.
+        .stack = try arena.alloc(Thread, n + 1),
     };
     @memset(ctx.seen, 0);
 
@@ -156,8 +166,17 @@ pub fn run(
         // With no live threads and no match yet, only candidate first bytes
         // matter: skip straight to the next one.
         if (!matched and clist.len == 0 and pf.usable) {
-            pos = pf.scan(input, pos);
-            if (pos >= input.len) break;
+            const next = pf.scan(input, pos);
+            if (next >= input.len) break;
+            if (next != pos) {
+                pos = next;
+                // The visited marks belong to the position just left behind —
+                // they were written by the (empty) next-list closure — so a
+                // fresh generation is needed before seeding somewhere else.
+                // Reusing the old one silently blocks instructions the seed
+                // closure needs to enter.
+                gen += 1;
+            }
         }
         const d: ?common.DecodeResult = if (pos < input.len) common.decode(input, pos) else null;
 

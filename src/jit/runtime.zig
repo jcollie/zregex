@@ -140,8 +140,11 @@ pub fn helperBackref(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
     const input = ctx.input[0..ctx.input_len];
     const a = ctx.slots[2 * @as(usize, br.group)];
     const b = ctx.slots[2 * @as(usize, br.group) + 1];
-    // `unset` mirrors the interpreter's null slot: an unset group matches empty.
-    if (a == unset or b == unset) return 1;
+    // An unset group matches empty. So does an inconsistent one: re-entering
+    // a group overwrites its start before its end, so a backreference reached
+    // while the group is open — from inside it, or from a later iteration —
+    // sees a start past the end of the previous iteration's capture.
+    if (a == unset or b == unset or a > b) return 1;
     const text = input[a..b];
     if (pos + text.len > input.len) return 0;
     const hay = input[pos..][0..text.len];
@@ -163,7 +166,7 @@ pub const Support = struct {
     pub fn canCompile(prog: compiler.Program) bool {
         for (prog.insts, 0..) |inst, pc| {
             switch (inst) {
-                .char, .any, .any_not_nl, .class, .split, .jmp, .save, .assert, .match, .backref, .set_pos, .fail_if_same, .rep => {},
+                .char, .any, .any_not_nl, .class, .split, .jmp, .save, .assert, .match, .backref, .set_pos, .exit_if_same, .rep => {},
                 .look => |l| {
                     // Only single-codepoint sub-programs are inlined; anything
                     // longer needs the interpreter's recursive matcher.

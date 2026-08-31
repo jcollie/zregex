@@ -682,10 +682,11 @@ pub fn compile(
                 a.b(g.pc_labels[t[1]]);
             },
             .save, .set_pos => |slot| g.emitSlotWrite(slot),
-            .fail_if_same => |slot| {
-                a.ldr(.x9, r_slots, @as(u32, slot) * 8);
+            .exit_if_same => |guard| {
+                // An empty iteration leaves the loop; it does not fail.
+                a.ldr(.x9, r_slots, @as(u32, guard.slot) * 8);
                 a.cmpReg(r_pos, .x9);
-                a.bcond(.eq, g.l_fail);
+                a.bcond(.eq, g.pc_labels[guard.target]);
             },
             .backref => {
                 g.storeCtxImm(1, runtime.ctx_touched);

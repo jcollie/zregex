@@ -223,13 +223,36 @@ only part that cares where it is:
 | macOS, Intel | yes |
 | anything else | no — the interpreters run instead |
 
-On Apple platforms the code is mapped with `MAP_JIT` and made writable per
-thread with `pthread_jit_write_protect_np`, because Apple Silicon enforces
-W^X in hardware and rejects the `mprotect` transition used elsewhere. A
-process using the **hardened runtime** must carry the
-`com.apple.security.cs.allow-jit` entitlement for that mapping to be granted;
-without it zregex falls back to `mprotect`, which is usually enough on Intel
-but not on Apple Silicon.
+### If you ship a macOS app that uses this library
+
+**Add the `com.apple.security.cs.allow-jit` entitlement.** Any application
+built with the **hardened runtime** — which is required for notarization, so
+in practice any app you distribute — is denied the `MAP_JIT` mapping without
+it, and on Apple Silicon there is no second way to get executable memory. Put
+it in the app's `.entitlements` file before signing:
+
+```xml
+<key>com.apple.security.cs.allow-jit</key>
+<true/>
+```
+
+```sh
+codesign --sign "Developer ID Application: …" \
+         --options runtime \
+         --entitlements MyApp.entitlements MyApp.app
+```
+
+Without the entitlement nothing breaks and nothing needs handling: zregex
+notices the refusal, leaves `Regex.engine` reporting an interpreter, and
+returns exactly the same matches — just several times slower on
+repeat-heavy patterns. Command-line tools and unsigned or ad-hoc-signed
+builds are unaffected, since they do not use the hardened runtime.
+
+The mechanism, for the curious: Apple Silicon enforces W^X in hardware and
+rejects the `mmap`-then-`mprotect` transition used on other platforms, so the
+code region is mapped with `MAP_JIT` and made writable per thread with
+`pthread_jit_write_protect_np` instead. zregex tries that first and falls back
+to `mprotect`, which is usually enough on Intel but never on Apple Silicon.
 
 Every one of those failures is graceful. If a mapping is refused, the pattern
 simply has no native code: `Regex.engine` reports `.pike` or `.backtrack`
@@ -244,6 +267,11 @@ instead of `.jit`, and matches and captures are identical either way. Check
   branch. Captures persist across repeat iterations (PCRE, not JS, semantics).
 - `\d \w \s`, case folding, and `\b` are **ASCII-only**.
 - Lookarounds are atomic; a backreference to an unset group matches empty.
+- A loop iteration that consumes nothing ends the loop rather than failing, so
+  `(a*?)*` matches empty as PCRE and Python do. Whether such an iteration's
+  captures are kept is where backtracking and automaton engines differ, so
+  patterns containing an empty-bodied loop are pinned to a single engine and
+  always answer consistently.
 - Backreferences to a group require the group to appear earlier in the pattern.
 
 ## Building

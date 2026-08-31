@@ -785,9 +785,10 @@ pub fn compile(
                 a.jmp(g.pc_labels[t[1]]);
             },
             .save, .set_pos => |slot| g.emitSlotWrite(slot),
-            .fail_if_same => |slot| {
-                a.cmpRegMem(r_pos, .{ .base = r_slots, .disp = @as(i32, slot) * 8 });
-                a.jcc(.e, g.l_fail);
+            .exit_if_same => |guard| {
+                // An empty iteration leaves the loop; it does not fail.
+                a.cmpRegMem(r_pos, .{ .base = r_slots, .disp = @as(i32, guard.slot) * 8 });
+                a.jcc(.e, g.pc_labels[guard.target]);
             },
             .backref => {
                 a.movMemImm32(ctxMem(ctx_touched), 1);

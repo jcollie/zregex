@@ -39,6 +39,16 @@ pub const BackrefOp = struct {
 /// interpreter consumes greedily in one tight loop and backtracking retries
 /// are a single range frame instead of one frame per iteration. The Pike VM
 /// and DFA never see this instruction.
+/// An iteration that consumed nothing ends the loop — it does not fail. The
+/// distinction is observable: `(a*)*` against "aa" must report the final
+/// empty iteration's capture, and `(a*?)*` must match empty rather than be
+/// forced to consume. PCRE and Python agree on both.
+pub const ExitIfSame = struct {
+    slot: u16,
+    /// The instruction after the loop.
+    target: u32,
+};
+
 pub const RepOp = struct {
     min: u32,
     /// `unbounded` (maxInt) means no upper bound.
@@ -78,8 +88,8 @@ pub const Inst = union(enum) {
     rep: RepOp,
     /// Scratch slot write, guards empty-body loops.
     set_pos: u16,
-    /// Kill this path if no progress since `set_pos` on the same slot.
-    fail_if_same: u16,
+    /// Leave the loop if the body consumed nothing since `set_pos`.
+    exit_if_same: ExitIfSame,
 };
 
 /// A compiled program plus everything needed to run it.
@@ -126,6 +136,10 @@ pub const Compiler = struct {
 
     fn patchJmp(self: *Self, at: u32, target: u32) void {
         if (!self.counting) self.insts[at] = .{ .jmp = target };
+    }
+
+    fn patchExit(self: *Self, at: u32, slot: u16, target: u32) void {
+        if (!self.counting) self.insts[at] = .{ .exit_if_same = .{ .slot = slot, .target = target } };
     }
 
     fn compileRoot(self: *Self, root: parser.NodeIndex) CompileError!void {
@@ -240,10 +254,12 @@ pub const Compiler = struct {
         const body = self.len;
         if (guarded) _ = try self.emit(.{ .set_pos = slot });
         try self.emitNode(child);
-        if (guarded) _ = try self.emit(.{ .fail_if_same = slot });
+        var guard: u32 = 0;
+        if (guarded) guard = try self.emit(.{ .exit_if_same = .{ .slot = slot, .target = 0 } });
         _ = try self.emit(.{ .jmp = top });
         const exit = self.len;
         self.patchSplit(s, if (greedy) .{ body, exit } else .{ exit, body });
+        if (guarded) self.patchExit(guard, slot, exit);
     }
 
     /// `e{0,n}` as a chain of nested options: skipping one copy skips them all.
@@ -363,7 +379,11 @@ test "count matches emit and programs are well-formed" {
             .jmp => |t| try std.testing.expect(t < r.insts.len),
             .look => |l| try std.testing.expect(l.target < r.insts.len),
             .save => |s| try std.testing.expect(s < r.slots),
-            .set_pos, .fail_if_same => |s| try std.testing.expect(s < r.slots),
+            .set_pos => |s| try std.testing.expect(s < r.slots),
+            .exit_if_same => |g| {
+                try std.testing.expect(g.slot < r.slots);
+                try std.testing.expect(g.target <= r.insts.len);
+            },
             else => {},
         };
     }
@@ -375,13 +395,13 @@ test "nullable star bodies get progress guards" {
     defer gpa.free(r.insts);
     var has_guard = false;
     for (r.insts) |inst| {
-        if (inst == .fail_if_same) has_guard = true;
+        if (inst == .exit_if_same) has_guard = true;
     }
     try std.testing.expect(has_guard);
     // Non-nullable body: no guard.
     const r2 = try compileForTest(gpa, "a*", .{});
     defer gpa.free(r2.insts);
-    for (r2.insts) |inst| try std.testing.expect(inst != .fail_if_same);
+    for (r2.insts) |inst| try std.testing.expect(inst != .exit_if_same);
 }
 
 test "program size cap" {
@@ -529,7 +549,12 @@ pub fn computeFirstBytes(
             },
             // Zero-width: keep walking. Lookarounds only constrain a match,
             // so skipping over them keeps the byte set an over-approximation.
-            .save, .set_pos, .fail_if_same, .assert, .look => push(visited, stack, &sp, pc + 1),
+            .save, .set_pos, .assert, .look => push(visited, stack, &sp, pc + 1),
+            // Either way out of the loop can begin a match.
+            .exit_if_same => |g| {
+                push(visited, stack, &sp, pc + 1);
+                push(visited, stack, &sp, g.target);
+            },
             .char => |c| fb.addChar(c.cp, c.ci),
             .class => |cl| {
                 if (cl.negated) {

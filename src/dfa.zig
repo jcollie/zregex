@@ -113,7 +113,8 @@ pub const Machine = struct {
         // Allocate all scratch before building the struct literal: the
         // literal copies arena_state, so it must already know these buffers.
         const seen = try arena.alloc(u32, n);
-        const stack = try arena.alloc(u32, n);
+        // One stack entry per split actually processed, plus the seed.
+        const stack = try arena.alloc(u32, n + 1);
         const list_buf = try arena.alloc(u32, n);
         const raw_buf = try arena.alloc(u32, n);
         const key_buf = try arena.alloc(u8, 1 + n * 4);
@@ -213,11 +214,12 @@ pub const Machine = struct {
                             m.seen[t[0]] = m.gen;
                             pc = t[0];
                         },
-                        // No capture tracking in the DFA. fail_if_same guards
-                        // empty-body loops; within one closure the pc dedup
-                        // already breaks the cycle, and across positions the
-                        // guard always passes, so it is a plain epsilon here.
-                        .save, .set_pos, .fail_if_same => {
+                        // `exit_if_same` cannot be evaluated here: deciding
+                        // it needs the position recorded by `set_pos`, which
+                        // is per thread and the DFA tracks only pc sets.
+                        // Programs containing one stay off the DFA entirely
+                        // (see `Regex.dfaEligible`).
+                        .save, .set_pos => {
                             if (m.seen[pc + 1] == m.gen) continue :next_path;
                             m.seen[pc + 1] = m.gen;
                             pc += 1;
@@ -240,7 +242,7 @@ pub const Machine = struct {
                             matched = true;
                             break :outer;
                         },
-                        .backref, .look, .rep => unreachable, // never routed to the DFA
+                        .backref, .look, .rep, .exit_if_same => unreachable, // never routed to the DFA
                     }
                 }
             }

@@ -379,8 +379,9 @@ const Bt = struct {
                     pc += 1;
                     continue :step;
                 },
-                .fail_if_same => |s| if (self.slots[s] != pos) {
-                    pc += 1;
+                .exit_if_same => |g| {
+                    // An empty iteration ends the loop rather than failing.
+                    pc = if (self.slots[g.slot] == pos) g.target else pc + 1;
                     continue :step;
                 },
                 .rep => |r| {
@@ -395,8 +396,12 @@ const Bt = struct {
                     self.touched_backref = true;
                     const a = self.slots[2 * @as(u16, br.group)];
                     const b = self.slots[2 * @as(u16, br.group) + 1];
-                    if (a == null or b == null) {
-                        // Unset group: matches empty (JS semantics).
+                    // Unset group: matches empty (JS semantics). So does an
+                    // inconsistent one: re-entering a group overwrites its
+                    // start before its end, so a backreference reached while
+                    // the group is open sees a start past the previous
+                    // iteration's end.
+                    if (a == null or b == null or a.? > b.?) {
                         pc += 1;
                         continue :step;
                     }

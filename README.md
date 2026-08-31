@@ -277,15 +277,18 @@ instead of `.jit`, and matches and captures are identical either way. Check
 - `\d \w \s`, case folding, and `\b` are **ASCII-only**.
 - Lookarounds are atomic. A backreference to a group that has not captured
   fails, as in PCRE; JavaScript is the odd one out in matching empty.
-- A backreference to the group that *encloses* it, as in `(a|x\1)`, reads that
+- A backreference to the group that *encloses* it, as in `(a|b\1)`, reads that
   group's value from its last completed iteration, and fails before there has
   been one. PCRE instead treats the enclosing group as unavailable while it is
   open — though not consistently, since it matches `1(\1*)` and fails
   `1(2|\1*)`, which differ only in the order of the alternatives. Python
-  rejects the construct outright.
+  rejects the construct outright. This is the one construct where zregex does
+  not follow PCRE, because PCRE has no single answer to follow.
 - A loop iteration that consumes nothing ends the loop rather than failing, so
   `(a*?)*` matches empty and `(a*)*` against `aa` reports group 1 as the empty
-  span at 2 — as PCRE and Python do. Every engine agrees; patterns with an
+  span at 2 — as PCRE and Python do. This takes effect only once the repeat's
+  minimum is met: `e{2,}` still runs a second iteration after an empty first
+  one, while `e+` stops at it. Every engine agrees; patterns with an
   empty-bodied loop are simply kept off the lazy DFA, whose states cannot
   carry the position an iteration began at.
 - Backreferences to a group require the group to appear earlier in the pattern.

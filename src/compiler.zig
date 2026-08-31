@@ -189,13 +189,38 @@ pub const Compiler = struct {
                         return;
                     }
                 }
+                // An iteration that consumes nothing ends the loop, but
+                // only once the minimum is met: below it the repeat has to
+                // keep going however little it matches. So for `e{n,}` the
+                // copy that meets the minimum carries a guard of its own,
+                // and an empty one skips the unbounded tail entirely rather
+                // than letting it run further iterations. Without this,
+                // `(?:()|a\1)+` would keep looping past an empty first
+                // iteration and let a later one read what it captured.
+                var min_guard: ?u32 = null;
+                var min_slot: u16 = 0;
                 var i: u32 = 0;
-                while (i < r.min) : (i += 1) try self.emitNode(r.child);
+                while (i < r.min) : (i += 1) {
+                    const guard_this = r.max == null and
+                        i + 1 == r.min and
+                        self.nullable(r.child);
+                    if (guard_this) {
+                        min_slot = self.next_slot;
+                        self.next_slot += 1;
+                        _ = try self.emit(.{ .set_pos = min_slot });
+                    }
+                    try self.emitNode(r.child);
+                    if (guard_this) {
+                        min_guard = try self.emit(.{ .exit_if_same = .{ .slot = min_slot, .target = 0 } });
+                    }
+                }
                 if (r.max) |m| {
                     try self.emitOptChain(m - r.min, r.child, r.greedy);
                 } else {
                     try self.emitStar(r.child, r.greedy);
                 }
+                // The star's exit is wherever emission has reached.
+                if (min_guard) |g| self.patchExit(g, min_slot, self.len);
             },
             .group => |g| {
                 if (g.index) |gi| {

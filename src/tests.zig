@@ -860,16 +860,32 @@ test "an empty loop iteration keeps its captures, on every engine" {
     }
 }
 
+test "an empty iteration ends the loop only once the minimum is met" {
+    // PCRE stops repeating as soon as an iteration consumes nothing, so the
+    // mandatory iteration of `e+` ends the loop just as a later one does, and
+    // no further iteration can read what it captured. Below the minimum the
+    // repeat has to keep going regardless, which is why `{2,}` still reaches
+    // a second iteration and matches from 0. Python allows the `+` case;
+    // zregex follows PCRE.
+    try expectFind("(?:()|[a]\\1)+1", "a1", "1");
+    try expectFind("(?:()|[a]\\1)*1", "a1", "1");
+    try expectFind("(?:()|[a]\\1){1,}1", "a1", "1");
+    try expectFind("(?:()|[a]\\1){2,}1", "a1", "a1");
+    // Repeats whose body can match empty but that do consume are unaffected.
+    try expectFind("(a*)+", "aa", "aa");
+    try expectFind("(a?)+b", "ab", "ab");
+}
+
 test "a backreference to the group enclosing it" {
     // PCRE treats a group as unavailable while it is open, so `\1` inside
     // group 1 fails there; zregex reads the value that group captured on its
-    // last completed iteration. PCRE is not self-consistent about this — it
-    // matches `1(\1*)` but not `1(2|\1*)`, which differ only in which
-    // alternative comes first — and Python rejects the construct outright as
-    // a reference to an open group. These pin zregex's answer rather than
-    // claiming PCRE agrees; see the README.
+    // last completed iteration. All but one of these agree with PCRE anyway.
+    // The exception is `1(2|\1*)`, left as zregex answers it because PCRE
+    // has no single answer to follow: it matches `1(\1*)` but fails
+    // `1(2|\1*)`, which differ only in which alternative comes first, and
+    // Python rejects the construct outright as a reference to an open group.
     try expectFind("(a\\1)", "a", null);
     try expectFind("1(\\1*)", "1", "1");
     try expectFind("1(2|\\1*)", "1", "1");
-    try expectFind("(|[a]\\1)+1", "a1", "a1");
+    try expectFind("(|[a]\\1)+1", "a1", "1");
 }

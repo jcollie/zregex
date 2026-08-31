@@ -69,7 +69,9 @@ pub const Inst = union(enum) {
 pub const Program = struct {
     insts: []const Inst,
     ranges: []const common.ClassRange,
-    /// 2 per capture group, then scratch slots for loop guards.
+    /// 2 per capture group (slots 0 and 1, for group 0, are written by the
+    /// engines rather than by save instructions), then scratch slots for
+    /// loop guards.
     slot_count: u16,
     /// Includes group 0.
     group_count: u8,
@@ -108,9 +110,12 @@ pub const Compiler = struct {
     }
 
     fn compileRoot(self: *Self, root: parser.NodeIndex) CompileError!void {
-        _ = try self.emit(.{ .save = 0 });
+        // Group 0 is not compiled as save instructions: both engines track
+        // the match span directly (seed position and position at `match`),
+        // so threads that never enter a capture group touch no slots at all.
+        // Slots 0 and 1 stay reserved in the layout and are filled by the
+        // engines on success.
         try self.emitNode(root);
-        _ = try self.emit(.{ .save = 1 });
         _ = try self.emit(.match);
     }
 
@@ -292,8 +297,8 @@ test "count matches emit and programs are well-formed" {
     for (patterns) |pat| {
         const r = try compileForTest(gpa, pat, .{});
         defer gpa.free(r.insts);
-        try std.testing.expect(r.insts.len >= 3); // save 0, save 1, match
-        try std.testing.expect(r.insts[0].save == 0);
+        try std.testing.expect(r.insts.len >= 1);
+        try std.testing.expect(r.insts[r.insts.len - 1] == .match);
         // All jump targets must be in range.
         for (r.insts) |inst| switch (inst) {
             .split => |t| {

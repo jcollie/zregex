@@ -10,9 +10,29 @@ const std = @import("std");
 const common = @import("common.zig");
 const compiler = @import("compiler.zig");
 
+/// One capture-slot write. Threads share history: a save prepends a node
+/// instead of cloning an array, so branching costs nothing and a save is one
+/// small arena allocation. The latest write for a slot is the first hit
+/// walking from the head.
+const SlotNode = struct {
+    slot: u16,
+    pos: usize,
+    prev: ?*const SlotNode,
+};
+
+fn slotLookup(chain: ?*const SlotNode, slot: u16) ?usize {
+    var node = chain;
+    while (node) |n| : (node = n.prev) {
+        if (n.slot == slot) return n.pos;
+    }
+    return null;
+}
+
 const Thread = struct {
     pc: u32,
-    slots: []?usize,
+    /// Where this thread's match attempt began (group 0 start).
+    start: usize,
+    slots: ?*const SlotNode,
 };
 
 const ThreadList = struct {
@@ -41,11 +61,17 @@ const Ctx = struct {
         return true;
     }
 
+    fn prepend(self: *Ctx, chain: ?*const SlotNode, slot: u16, pos: usize) !*const SlotNode {
+        const node = try self.arena.create(SlotNode);
+        node.* = .{ .slot = slot, .pos = pos, .prev = chain };
+        return node;
+    }
+
     /// Add `pc0` and its epsilon closure to `list` in priority (DFS) order.
-    fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, slots0: []?usize) !void {
+    fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, start: usize, slots0: ?*const SlotNode) !void {
         if (!self.tryEnter(gen, pc0)) return;
         var sp: usize = 0;
-        self.stack[sp] = .{ .pc = pc0, .slots = slots0 };
+        self.stack[sp] = .{ .pc = pc0, .start = start, .slots = slots0 };
         sp += 1;
         next_path: while (sp > 0) {
             sp -= 1;
@@ -59,28 +85,19 @@ const Ctx = struct {
                     },
                     .split => |t| {
                         if (self.tryEnter(gen, t[1])) {
-                            self.stack[sp] = .{ .pc = t[1], .slots = slots };
+                            self.stack[sp] = .{ .pc = t[1], .start = start, .slots = slots };
                             sp += 1;
                         }
                         if (!self.tryEnter(gen, t[0])) continue :next_path;
                         pc = t[0];
                     },
-                    .save => |s| {
-                        const copy = try self.arena.dupe(?usize, slots);
-                        copy[s] = pos;
-                        slots = copy;
-                        if (!self.tryEnter(gen, pc + 1)) continue :next_path;
-                        pc += 1;
-                    },
-                    .set_pos => |s| {
-                        const copy = try self.arena.dupe(?usize, slots);
-                        copy[s] = pos;
-                        slots = copy;
+                    .save, .set_pos => |s| {
+                        slots = try self.prepend(slots, s, pos);
                         if (!self.tryEnter(gen, pc + 1)) continue :next_path;
                         pc += 1;
                     },
                     .fail_if_same => |s| {
-                        if (slots[s] == pos) continue :next_path;
+                        if (slotLookup(slots, s) == pos) continue :next_path;
                         if (!self.tryEnter(gen, pc + 1)) continue :next_path;
                         pc += 1;
                     },
@@ -91,7 +108,7 @@ const Ctx = struct {
                     },
                     // Consuming instructions and `match` land in the list.
                     .char, .any, .any_not_nl, .class, .match => {
-                        list.append(.{ .pc = pc, .slots = slots });
+                        list.append(.{ .pc = pc, .start = start, .slots = slots });
                         continue :next_path;
                     },
                     .backref, .look => unreachable, // never routed to the Pike VM
@@ -127,9 +144,6 @@ pub fn run(
     var clist = ThreadList{ .items = try arena.alloc(Thread, n) };
     var nlist = ThreadList{ .items = try arena.alloc(Thread, n) };
 
-    const base_slots = try arena.alloc(?usize, prog.slot_count);
-    @memset(base_slots, null);
-
     const pf = &prog.prefilter;
     var gen: u32 = 1;
     var pos = start;
@@ -147,7 +161,7 @@ pub fn run(
         // Seed a new lowest-priority thread at this position until we have a
         // match; this is what makes the search unanchored and leftmost.
         if (!matched and (!pf.usable or (pos < input.len and pf.bytes[input[pos]]))) {
-            try ctx.addThread(&clist, gen, 0, pos, base_slots);
+            try ctx.addThread(&clist, gen, 0, pos, pos, null);
         }
 
         var i: usize = 0;
@@ -156,25 +170,32 @@ pub fn run(
             switch (prog.insts[th.pc]) {
                 .char => |c| if (d) |dd| {
                     if (common.charEq(c.cp, dd.cp, c.ci))
-                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
+                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.start, th.slots);
                 },
                 .any => if (d) |dd| {
-                    try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
+                    try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.start, th.slots);
                 },
                 .any_not_nl => if (d) |dd| {
                     if (dd.cp != '\n')
-                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
+                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.start, th.slots);
                 },
                 .class => |cl| if (d) |dd| {
                     const ranges = prog.ranges[cl.start..][0..cl.len];
                     if (common.classMatches(ranges, cl.negated, cl.ci, dd.cp))
-                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.slots);
+                        try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.start, th.slots);
                 },
                 .match => {
                     // Every thread after i is lower priority: discard them.
                     // Threads already in nlist are higher priority and may
                     // still improve (lengthen) the match on later steps.
-                    @memcpy(slots_out, th.slots);
+                    @memset(slots_out, null);
+                    var node = th.slots;
+                    while (node) |sn| : (node = sn.prev) {
+                        // First hit walking from the head is the latest write.
+                        if (slots_out[sn.slot] == null) slots_out[sn.slot] = sn.pos;
+                    }
+                    slots_out[0] = th.start;
+                    slots_out[1] = pos;
                     matched = true;
                     break;
                 },

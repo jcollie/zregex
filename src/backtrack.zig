@@ -59,12 +59,13 @@ const Bt = struct {
         }
     }
 
-    /// Anchored attempt from (`pc0`, `pos0`). If `required_end` is set, `match`
-    /// only succeeds at exactly that position (used for lookbehind).
+    /// Anchored attempt from (`pc0`, `pos0`); returns the end position on
+    /// success, null on failure. If `required_end` is set, `match` only
+    /// succeeds at exactly that position (used for lookbehind).
     ///
     /// On success, frames pushed by this attempt are discarded (lookarounds are
     /// atomic) and slot writes are kept. On failure, slots are rewound.
-    fn matchFrom(self: *Bt, pc0: u32, pos0: usize, required_end: ?usize) Error!bool {
+    fn matchFrom(self: *Bt, pc0: u32, pos0: usize, required_end: ?usize) Error!?usize {
         const stack_base = self.stack.items.len;
         const undo_base = self.undo.items.len;
         const insts = self.prog.insts;
@@ -161,13 +162,13 @@ const Bt = struct {
                     const undo_mark = self.undo.items.len;
                     switch (l.kind) {
                         .ahead_pos => {
-                            if (try self.matchFrom(l.target, pos, null)) {
+                            if (try self.matchFrom(l.target, pos, null) != null) {
                                 pc += 1;
                                 continue :step;
                             }
                         },
                         .ahead_neg => {
-                            if (!try self.matchFrom(l.target, pos, null)) {
+                            if (try self.matchFrom(l.target, pos, null) == null) {
                                 pc += 1;
                                 continue :step;
                             }
@@ -180,7 +181,7 @@ const Bt = struct {
                             // length lookbehind is supported.
                             var s = pos;
                             const hit = while (true) {
-                                if (try self.matchFrom(l.target, s, pos)) break true;
+                                if (try self.matchFrom(l.target, s, pos) != null) break true;
                                 if (s == 0) break false;
                                 s -= common.decodeBefore(input, s).len;
                             };
@@ -196,7 +197,7 @@ const Bt = struct {
                 .match => {
                     if (required_end == null or pos == required_end.?) {
                         self.stack.shrinkRetainingCapacity(stack_base);
-                        return true;
+                        return pos;
                     }
                 },
             }
@@ -210,7 +211,7 @@ const Bt = struct {
                 continue :step;
             }
             self.rewindUndo(undo_base);
-            return false;
+            return null;
         }
     }
 };
@@ -250,7 +251,12 @@ pub fn run(
         // start position gets a fresh allowance, so scanning a large haystack
         // is not itself budget-limited while any single attempt stays bounded.
         bt.steps = 0;
-        if (try bt.matchFrom(0, s, null)) return true;
+        if (try bt.matchFrom(0, s, null)) |end| {
+            // Group 0 has no save instructions; fill it here.
+            slots_out[0] = s;
+            slots_out[1] = end;
+            return true;
+        }
         if (s >= input.len) return false;
         s += common.decode(input, s).len;
     }

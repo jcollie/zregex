@@ -546,3 +546,25 @@ test "lookahead sub-runs are re-evaluated correctly under memoization" {
     // backref can never fit (PCRE agrees: no match).
     try expectFind("(?=(\\w+))x\\1", "axaa", null);
 }
+
+test "literal retry scanning preserves greedy semantics" {
+    // The scan jumps between '-' occurrences largest-first: same result as
+    // stepping back one position at a time.
+    try expectGroups("(?=.)(\\S+)-(\\S+)", "a-b-c", &.{ "a-b-c", "a-b", "c" });
+    try expectFind("(\\w+)-\\1", "aaa-bbb ab-ab x", "ab-ab");
+    // Case-insensitive continuation char uses the folded reverse scan.
+    try expectFind("(?i)(\\d+)A\\1", "x12a12y", "12a12");
+    // Lookahead continuation: scan for the looked-at char.
+    try expectGroups("(\\w+)(?=@)", "mail jeff@x", &.{ "jeff", "jeff" });
+    // No occurrence in range: the frame dies without a match.
+    try expectFind("(\\w{2,})=\\1", "aaaa bbbb", null);
+}
+
+test "dynamic lead-run skipping with backrefs" {
+    // Failing words never execute the backref, so whole runs are skipped;
+    // the word that does match must still be found with correct captures.
+    try expectGroups("(\\w{3,})-\\1", "aaaa bbbb ccc-ccc dd", &.{ "ccc-ccc", "ccc" });
+    try expectFind("(\\w+) \\1", "aaaa bbbb cc cc", "cc cc");
+    // Backref executed but failed: no skip, later start in same run matches.
+    try expectFind("(\\w+)\\1", "xabab", "abab");
+}

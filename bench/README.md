@@ -26,8 +26,8 @@ backtracker):
 | ing_suffix   | 39.2      | 203.4   | 6.97      | 64.8   | 54.7   | 1007.5  |
 | spanning     | 0.4       | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
 | groups       | 28.1      | 129.6   | 5.70      | 157.3  | 42.1   | 289.7   |
-| lookahead    | 62.5 (bt) | 297.5   | 8.78      | 171.9  | 41.2   | —       |
-| backref      | 238.9 (bt)| 134.9   | 17.22     | 133.0  | 181.7  | —       |
+| lookahead    | 43.5 (bt) | 305.2   | 8.99      | 175.5  | 41.3   | —       |
+| backref      | 49.0 (bt) | 132.4   | 17.24     | 122.9  | 181.0  | —       |
 | pathological | **0.01**  | ERROR   | 26.3      | 282.8  | 0.01   | 0.01    |
 
 (bt) = zregex backtracking engine; everything else runs on the Pike VM.
@@ -57,5 +57,10 @@ found while profiling the backtracker, cut every engine's inner loop by
 2-3x (`email`: 69 -> 25 ms, `groups`: 73 -> 28 ms). Backref-aware
 memoization prunes proven-failing backtracker states, taming classic ReDoS
 patterns (`(a+)+\1$` on 40 chars: step-budget error -> 0.5 ms correct
-answer) at zero cost to split-free programs. Costs remain flat and
+answer) at zero cost to split-free programs. Required-literal scanning makes
+greedy-repeat retries jump straight to occurrences of the literal the
+continuation must match next (a char or single-char lookahead), and lead-run
+skipping applies dynamically to backref patterns whenever a failed attempt
+never executed a backref — together taking `backref` from 232 to 49 ms and
+`lookahead` from 63 to 43. Costs remain flat and
 predictable where backtrackers swing wildly in both directions.

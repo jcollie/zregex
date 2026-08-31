@@ -95,6 +95,10 @@ const Bt = struct {
     steps: usize = 0,
     max_steps: usize,
     memo: std.AutoHashMapUnmanaged(MemoKey, void) = .empty,
+    /// Did the current attempt execute any backref? While false, the
+    /// attempt's control flow is a pure function of positions, which is what
+    /// makes lead-run skipping sound even in backref patterns.
+    touched_backref: bool = false,
     memo_on: bool = false,
     /// Slot indices contributing to the key.
     memo_slots: [max_memo_slots]u16 = @splat(0),
@@ -172,6 +176,55 @@ const Bt = struct {
             });
         }
         return p;
+    }
+
+    const ScanChar = struct { byte: u8, ci: bool };
+
+    /// If every retry of a greedy rep must next match a literal ASCII char
+    /// (the continuation, skipping saves, is that char — or a single-char
+    /// positive lookahead), return it: retries can then jump straight to its
+    /// occurrences instead of stepping back one position at a time.
+    fn retryScanChar(self: *Bt, cont_pc: u32) ?ScanChar {
+        var pc = cont_pc;
+        var hops: u8 = 0;
+        while (hops < 16) : (hops += 1) {
+            switch (self.prog.insts[pc]) {
+                .save => pc += 1,
+                // Lookaround sub-programs are laid out behind a jmp.
+                .jmp => |t| pc = t,
+                else => break,
+            }
+        }
+        const c: compiler.CharOp = switch (self.prog.insts[pc]) {
+            .char => |c| c,
+            .look => |l| blk: {
+                if (l.kind != .ahead_pos) return null;
+                if (self.prog.insts[l.target + 1] != .match) return null;
+                switch (self.prog.insts[l.target]) {
+                    .char => |c| break :blk c,
+                    else => return null,
+                }
+            },
+            else => return null,
+        };
+        if (c.cp >= 0x80) return null; // ASCII only: always a boundary
+        const folds = c.ci and ((c.cp >= 'a' and c.cp <= 'z') or (c.cp >= 'A' and c.cp <= 'Z'));
+        return .{ .byte = @intCast(c.cp), .ci = folds };
+    }
+
+    /// Last position in [lo, hi) holding `sc` (case-folded if ci).
+    fn revFindChar(input: []const u8, lo: usize, hi: usize, sc: ScanChar) ?usize {
+        if (!sc.ci) {
+            const i = std.mem.lastIndexOfScalar(u8, input[lo..hi], sc.byte) orelse return null;
+            return lo + i;
+        }
+        const want = common.foldLower(sc.byte);
+        var i = hi;
+        while (i > lo) {
+            i -= 1;
+            if (common.foldLower(input[i]) == want) return i;
+        }
+        return null;
     }
 
     /// If the lookaround's sub-program is a single consuming instruction,
@@ -321,6 +374,7 @@ const Bt = struct {
                     // min unmet: fall through to backtracking
                 },
                 .backref => |br| {
+                    self.touched_backref = true;
                     const a = self.slots[2 * @as(u16, br.group)];
                     const b = self.slots[2 * @as(u16, br.group) + 1];
                     if (a == null or b == null) {
@@ -375,6 +429,19 @@ const Bt = struct {
                     .rep_greedy => {
                         // Retry the continuation with one fewer iteration.
                         if (top.pos <= top.aux) {
+                            _ = self.stack.pop();
+                            continue;
+                        }
+                        if (self.retryScanChar(top.pc)) |sc| {
+                            // Every skipped position fails at the literal
+                            // before anything observable happens: jump to the
+                            // next occurrence (largest first: greedy order).
+                            if (revFindChar(input, top.aux, top.pos, sc)) |e| {
+                                top.pos = e;
+                                pc = top.pc;
+                                pos = e;
+                                continue :step;
+                            }
                             _ = self.stack.pop();
                             continue;
                         }
@@ -462,21 +529,20 @@ pub fn run(
     }
 
     const pf = &prog.prefilter;
-    // When the program leads with a greedy unbounded fused rep and there are
-    // no backrefs, a failed attempt at s covers every later start inside the
-    // run of codepoints the rep consumed (its retry set is a strict subset of
-    // ours), so the whole run can be skipped. This turns the classic
-    // quadratic leading-\w+ scan linear.
+    // When the program leads with a greedy unbounded fused rep (possibly
+    // behind the saves of enclosing groups), a failed attempt at s covers
+    // every later start inside the run of codepoints the rep consumed (its
+    // retry set is a strict subset of ours) — provided the attempt never
+    // executed a backref, since only backrefs can observe the enclosing
+    // groups' start-dependent slots. That is checked dynamically per attempt
+    // via `touched_backref`. This turns quadratic leading-\w+ scans linear.
     const lead_skip: ?compiler.Inst = blk: {
-        if (prog.insts[0] != .rep) break :blk null;
-        const r = prog.insts[0].rep;
+        var pc: u32 = 0;
+        while (pc < prog.insts.len and prog.insts[pc] == .save) pc += 1;
+        if (prog.insts[pc] != .rep) break :blk null;
+        const r = prog.insts[pc].rep;
         if (!r.greedy or r.max != compiler.RepOp.unbounded) break :blk null;
-        for (prog.insts) |inst| {
-            // A backref makes the continuation depend on where the match
-            // started, invalidating the subsumption argument.
-            if (inst == .backref) break :blk null;
-        }
-        break :blk prog.insts[1];
+        break :blk prog.insts[pc + 1];
     };
     var s = start;
     while (true) {
@@ -491,6 +557,7 @@ pub fn run(
         // start position gets a fresh allowance, so scanning a large haystack
         // is not itself budget-limited while any single attempt stays bounded.
         bt.steps = 0;
+        bt.touched_backref = false;
         if (try bt.matchFrom(0, s, null, true)) |end| {
             // Group 0 has no save instructions; fill it here.
             slots_out[0] = s;
@@ -498,7 +565,9 @@ pub fn run(
             return true;
         }
         if (s >= input.len) return false;
-        if (lead_skip) |child| {
+        if (lead_skip != null and bt.touched_backref) {
+            // The attempt read captures; subsumption does not apply here.
+        } else if (lead_skip) |child| {
             // Skip to the end of the accepting run; the position at the run's
             // end was already tested as a retry of this attempt.
             while (s < input.len) {

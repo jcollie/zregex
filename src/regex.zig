@@ -99,6 +99,9 @@ pub const Regex = struct {
     gpa: ?std.mem.Allocator,
     /// Owned storage for group-name strings (runtime compiles only).
     names_buf: []const u8 = &.{},
+    /// A second, fused program for the JIT, when the interpreters need the
+    /// expanded one. Empty means the JIT shares `program`.
+    jit_program: []const compiler.Inst = &.{},
 
     pub const default_max_steps: usize = 1_000_000;
 
@@ -129,11 +132,26 @@ pub const Regex = struct {
         };
         const root = try p.parse();
 
+        // Fused repeats are for backtracking only; the Pike VM and DFA need
+        // the expanded form. When both are in play the JIT gets its own
+        // fused program, built from the same AST.
         const bt = p.has_backref or p.has_look;
         const counts = try compiler.count(nodes[0..p.nodes_len], root, p.group_count, bt);
         const insts = try gpa.alloc(compiler.Inst, counts.insts);
         errdefer gpa.free(insts);
         try compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, bt, insts);
+
+        var jit_insts: []compiler.Inst = &.{};
+        var slot_count = counts.slots;
+        if (!bt) {
+            const jc = try compiler.count(nodes[0..p.nodes_len], root, p.group_count, true);
+            jit_insts = try gpa.alloc(compiler.Inst, jc.insts);
+            try compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, true, jit_insts);
+            // Engines only ever read their own scratch slots, and the capture
+            // slots below them are identical, so one shared size works.
+            slot_count = @max(slot_count, jc.slots);
+        }
+        errdefer if (jit_insts.len != 0) gpa.free(jit_insts);
 
         const ranges = try gpa.dupe(common.ClassRange, ranges_tmp[0..p.ranges_len]);
         errdefer gpa.free(ranges);
@@ -174,7 +192,8 @@ pub const Regex = struct {
             .names = names,
             .names_buf = names_buf,
             .group_count = p.group_count,
-            .slot_count = counts.slots,
+            .slot_count = slot_count,
+            .jit_program = jit_insts,
             .flags = flags,
             .engine = .pike, // replaced below, once the JIT has had its turn
             .fallback_engine = .pike,
@@ -182,8 +201,8 @@ pub const Regex = struct {
             .alphabet = alphabet,
             .gpa = gpa,
         };
-        re.fallback_engine = if (p.has_backref or p.has_look) .backtrack else .pike;
-        re.jit_code = try jitmod.Jit.compile(gpa, re.prog(), &re.prefilter);
+        re.fallback_engine = if (bt) .backtrack else .pike;
+        re.jit_code = try jitmod.Jit.compile(gpa, re.jitProg(), &re.prefilter);
         re.engine = if (re.jitIsDefault()) .jit else re.fallback_engine;
         return re;
     }
@@ -262,8 +281,16 @@ pub const Regex = struct {
             gpa.free(self.names);
             gpa.free(self.names_buf);
             gpa.free(self.alphabet.starts);
+            if (self.jit_program.len != 0) gpa.free(self.jit_program);
         }
         self.* = undefined;
+    }
+
+    /// The program the JIT runs: the fused one when it exists.
+    fn jitProg(self: *const Regex) compiler.Program {
+        var p = self.prog();
+        if (self.jit_program.len != 0) p.insts = self.jit_program;
+        return p;
     }
 
     fn prog(self: *const Regex) compiler.Program {
@@ -298,8 +325,12 @@ pub const Regex = struct {
     /// prefilter is selective enough that few start positions are ever tried.
     fn jitIsDefault(self: *const Regex) bool {
         if (self.jit_code == null) return false;
+        // Native code runs when its backtracking is structurally bounded (see
+        // `jit.backtrackingIsBounded`). Behind a backreference or lookaround
+        // there is no linear engine to fall back to anyway, so the JIT is
+        // always the better bet there.
         if (self.fallback_engine == .backtrack) return true;
-        return self.prefilter.usable and self.prefilter.count <= 16;
+        return jitmod.backtrackingIsBounded(self.jitProg());
     }
 
     /// Native code, when it is compiled and the policy allows it.

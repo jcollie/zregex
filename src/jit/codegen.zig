@@ -22,6 +22,7 @@ const std = @import("std");
 const common = @import("../common.zig");
 const compiler = @import("../compiler.zig");
 const x64 = @import("x64.zig");
+const cpu = @import("cpu.zig");
 
 const Reg = x64.Reg;
 const Mem = x64.Mem;
@@ -234,7 +235,8 @@ fn asciiOnly(prog: compiler.Program, inst: compiler.Inst) bool {
 
 const Blob = struct {
     label: x64.Label,
-    bytes: [16]u8,
+    bytes: [32]u8,
+    len: u8,
 };
 
 /// Widest run scanner: two SSE registers hold each range's bounds, leaving
@@ -250,7 +252,8 @@ const AsciiSet = struct {
 /// Identical classes appear once per emit site (a repeat emits its child
 /// several times); one table each is enough.
 const BitsCache = struct {
-    bits: [16]u8,
+    bytes: [32]u8,
+    len: u8,
     label: x64.Label,
 };
 
@@ -275,13 +278,16 @@ pub const Gen = struct {
 
     const Error = std.mem.Allocator.Error;
 
-    fn emitBlob(self: *Gen, bits: [16]u8) Error!x64.Label {
+    fn emitBlob(self: *Gen, bytes: []const u8) Error!x64.Label {
+        std.debug.assert(bytes.len <= 32);
         for (self.bits_cache.items) |c| {
-            if (std.mem.eql(u8, &c.bits, &bits)) return c.label;
+            if (c.len == bytes.len and std.mem.eql(u8, c.bytes[0..c.len], bytes)) return c.label;
         }
         const l = try self.a.label();
-        try self.blobs.append(self.gpa, .{ .label = l, .bytes = bits });
-        try self.bits_cache.append(self.gpa, .{ .bits = bits, .label = l });
+        var padded: [32]u8 = @splat(0);
+        @memcpy(padded[0..bytes.len], bytes);
+        try self.blobs.append(self.gpa, .{ .label = l, .bytes = padded, .len = @intCast(bytes.len) });
+        try self.bits_cache.append(self.gpa, .{ .bytes = padded, .len = @intCast(bytes.len), .label = l });
         return l;
     }
 
@@ -334,14 +340,64 @@ pub const Gen = struct {
     /// then handles it. Exact for ASCII-only children, so the scalar loop
     /// only ever finishes the sub-16-byte tail.
     fn emitSimdRun(self: *Gen, set: AsciiSet) Error!void {
+        // AVX2 doubles the block and, being three-operand, drops the register
+        // copies the SSE2 form needs before each compare.
+        if (cpu.hasAvx2()) return self.emitSimdRunAvx2(set);
+        return self.emitSimdRunSse2(set);
+    }
+
+    fn emitSimdRunAvx2(self: *Gen, set: AsciiSet) Error!void {
         const a = &self.a;
         var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
         var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
             lo_regs[i] = @enumFromInt(2 + 2 * i);
             hi_regs[i] = @enumFromInt(3 + 2 * i);
-            a.movdquXmmLabel(lo_regs[i], try self.emitBlob(@splat(@intCast(r.lo))));
-            a.movdquXmmLabel(hi_regs[i], try self.emitBlob(@splat(@intCast(r.hi))));
+            const lo: [32]u8 = @splat(@intCast(r.lo));
+            const hi: [32]u8 = @splat(@intCast(r.hi));
+            a.vmovdquYmmLabel(lo_regs[i], try self.emitBlob(&lo));
+            a.vmovdquYmmLabel(hi_regs[i], try self.emitBlob(&hi));
+        }
+        const l_loop = try a.here();
+        const l_done = try a.label();
+        const l_partial = try a.label();
+        a.movRegReg(.rax, r_len);
+        a.subRegReg(.rax, r_pos);
+        a.cmpRegImm(.rax, 32);
+        a.jcc(.b, l_done);
+        a.vmovdquYmmMem(.xmm0, inputAt(r_pos, 0));
+        for (0..set.len) |i| {
+            const acc: x64.Xmm = if (i == 0) .xmm1 else .xmm14;
+            a.vpcmpgtbYmm(acc, lo_regs[i], .xmm0); // lo > v
+            a.vpcmpgtbYmm(.xmm15, .xmm0, hi_regs[i]); // v > hi
+            a.vporYmm(acc, acc, .xmm15); // outside this range
+            if (i != 0) a.vpandYmm(.xmm1, .xmm1, .xmm14);
+        }
+        a.vpmovmskbRegYmm(.rax, .xmm1);
+        a.testRegReg(.rax, .rax);
+        a.jcc(.ne, l_partial);
+        a.addRegImm(r_pos, 32);
+        a.jmp(l_loop);
+        a.place(l_partial);
+        a.bsfRegReg(.rax, .rax);
+        a.addRegReg(r_pos, .rax);
+        a.place(l_done);
+        // Leave no dirty upper state for the scalar code and helpers that
+        // follow, which would otherwise pay an AVX-to-SSE transition penalty.
+        a.vzeroupper();
+    }
+
+    fn emitSimdRunSse2(self: *Gen, set: AsciiSet) Error!void {
+        const a = &self.a;
+        var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
+        var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
+        for (set.ranges[0..set.len], 0..) |r, i| {
+            lo_regs[i] = @enumFromInt(2 + 2 * i);
+            hi_regs[i] = @enumFromInt(3 + 2 * i);
+            const lo: [16]u8 = @splat(@intCast(r.lo));
+            const hi: [16]u8 = @splat(@intCast(r.hi));
+            a.movdquXmmLabel(lo_regs[i], try self.emitBlob(&lo));
+            a.movdquXmmLabel(hi_regs[i], try self.emitBlob(&hi));
         }
         const l_loop = try a.here();
         const l_done = try a.label();
@@ -430,7 +486,7 @@ pub const Gen = struct {
                 a.movzxRegMem8(.rax, inputAt(r_pos, 0));
                 a.cmpReg8Imm(.rax, 0x80);
                 a.jcc(.ae, l_high);
-                const bits = try self.emitBlob(self.classBits(cl));
+                const bits = try self.emitBlob(&self.classBits(cl));
                 a.btLabelReg(bits, .rax);
                 a.jcc(.ae, on_fail); // CF clear == bit not set
                 if (advance) a.incReg(r_pos);
@@ -488,6 +544,13 @@ pub const Gen = struct {
     /// Push a backtrack frame resuming at `resume_label`; `aux` may be null.
     fn emitPushFrame(self: *Gen, resume_label: x64.Label, pos_reg: Reg, aux: ?Reg) void {
         const a = &self.a;
+        // Speculative work is metered here as well as on the failure path:
+        // a pattern can push frames indefinitely without ever backtracking,
+        // and the budget has to bound that too.
+        a.movRegMem(.rax, ctxMem(ctx_budget));
+        a.decReg(.rax);
+        a.movMemReg(ctxMem(ctx_budget), .rax);
+        a.jcc(.s, self.l_bail);
         a.leaRegMem(.rax, .{ .base = r_stack, .disp = frame_size });
         a.cmpRegMem(.rax, ctxMem(ctx_stack_end));
         a.jcc(.a, self.l_bail);
@@ -964,8 +1027,8 @@ pub fn compile(
             a.jmp(l_scan);
             a.place(l_ok);
             // The table is data; park it with the other blobs at the end.
-            const bytes: [16]u8 = @splat(0);
-            try g.blobs.append(gpa, .{ .label = pf_table, .bytes = bytes });
+            const bytes: [32]u8 = @splat(0);
+            try g.blobs.append(gpa, .{ .label = pf_table, .bytes = bytes, .len = 0 });
             g.prefilter_label = pf_table;
         }
     }
@@ -1132,7 +1195,7 @@ pub fn compile(
     for (g.blobs.items) |blob| {
         if (g.prefilter_label != null and blob.label == g.prefilter_label.?) continue;
         a.place(blob.label);
-        a.data(&blob.bytes);
+        a.data(blob.bytes[0..blob.len]);
     }
     if (g.prefilter_label) |l| {
         a.place(l);

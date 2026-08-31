@@ -26,11 +26,17 @@ pub const RunError = regex.RunError;
 /// pattern runs on an interpreter and `Regex.engine` is never `.jit`.
 pub const jit_available = @import("jit.zig").available;
 
+/// Forces the JIT's choice of vector width, so both the SSE2 and AVX2 code
+/// paths can be exercised on one machine. Pass null to restore detection.
+/// Only affects patterns compiled after the call.
+pub const overrideAvx2 = @import("jit/cpu.zig").overrideAvx2;
+
 test {
     _ = @import("common.zig");
     _ = @import("jit.zig");
     _ = @import("jit/mem.zig");
     _ = @import("jit/x64.zig");
+    _ = @import("jit/cpu.zig");
     _ = @import("parser.zig");
     _ = @import("compiler.zig");
     _ = @import("tests.zig");

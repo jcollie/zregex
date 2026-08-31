@@ -533,6 +533,71 @@ pub const Asm = struct {
         self.modrm(3, dst.low(), src.low());
     }
 
+    // -- AVX2 (VEX-encoded, 256-bit) ----------------------------------------
+    //
+    // Always the three-byte VEX form: one byte longer than the compact form
+    // but uniform, and the only one that can reach the upper registers.
+
+    /// byte1 carries inverted R/X/B and the opcode map; byte2 carries W, the
+    /// inverted second source register, the 256-bit flag, and the prefix.
+    /// `vvvv` is the logical register number, so instructions without a
+    /// second source pass 0 and the encoded field becomes all ones.
+    fn vex3(self: *Asm, r: u1, x: u1, bb: u1, map: u5, w: u1, vvvv: u4, l: u1, pp: u2) void {
+        self.b(0xC4);
+        self.b((@as(u8, ~r & 1) << 7) | (@as(u8, ~x & 1) << 6) | (@as(u8, ~bb & 1) << 5) | @as(u8, map));
+        self.b((@as(u8, w) << 7) | (@as(u8, ~vvvv) << 3) | (@as(u8, l) << 2) | @as(u8, pp));
+    }
+
+    /// `vmovdqu dst, [mem]` (256-bit).
+    pub fn vmovdquYmmMem(self: *Asm, dst: Xmm, m: Mem) void {
+        const rb = memRexBits(m);
+        self.vex3(dst.ext(), rb.x, rb.b, 1, 0, 0, 1, 0b10); // F3 0F
+        self.b(0x6F);
+        self.emitMem(dst.low(), m);
+    }
+
+    /// `vmovdqu dst, [rip+label]` (256-bit).
+    pub fn vmovdquYmmLabel(self: *Asm, dst: Xmm, l: Label) void {
+        self.vex3(dst.ext(), 0, 0, 1, 0, 0, 1, 0b10);
+        self.b(0x6F);
+        self.modrm(0, dst.low(), 5); // rip-relative
+        self.fixup(l);
+    }
+
+    fn vexRegRegReg(self: *Asm, opcode: u8, dst: Xmm, src1: Xmm, src2: Xmm) void {
+        self.vex3(dst.ext(), 0, src2.ext(), 1, 0, @intFromEnum(src1), 1, 0b01); // 66 0F
+        self.b(opcode);
+        self.modrm(3, dst.low(), src2.low());
+    }
+
+    /// `vpcmpgtb dst, src1, src2` — three-operand, so no copy is needed first.
+    pub fn vpcmpgtbYmm(self: *Asm, dst: Xmm, src1: Xmm, src2: Xmm) void {
+        self.vexRegRegReg(0x64, dst, src1, src2);
+    }
+
+    pub fn vporYmm(self: *Asm, dst: Xmm, src1: Xmm, src2: Xmm) void {
+        self.vexRegRegReg(0xEB, dst, src1, src2);
+    }
+
+    pub fn vpandYmm(self: *Asm, dst: Xmm, src1: Xmm, src2: Xmm) void {
+        self.vexRegRegReg(0xDB, dst, src1, src2);
+    }
+
+    /// `vpmovmskb dst, src` — 32 lane bits into a general register.
+    pub fn vpmovmskbRegYmm(self: *Asm, dst: Reg, src: Xmm) void {
+        self.vex3(dst.ext(), 0, src.ext(), 1, 0, 0, 1, 0b01);
+        self.b(0xD7);
+        self.modrm(3, dst.low(), src.low());
+    }
+
+    /// Clears the upper halves so following legacy SSE code pays no
+    /// AVX-to-SSE transition penalty.
+    pub fn vzeroupper(self: *Asm) void {
+        self.b(0xC5);
+        self.b(0xF8);
+        self.b(0x77);
+    }
+
     /// Emit raw data (alignment is the caller's business).
     pub fn data(self: *Asm, bytes: []const u8) void {
         for (bytes) |x| self.b(x);

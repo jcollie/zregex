@@ -14,25 +14,26 @@ all implementations agree).
 
 Snapshot (2026-08-31, Linux, corpus 4.2 MB, times in ms, best of 5, with the
 first-byte prefilter, lazy capture handling, the lazy DFA, the fused
-backtracker, and the x86-64 JIT with SSE2 run scanning):
+backtracker, and the x86-64 JIT with SSE2/AVX2 run scanning):
 
 | benchmark    | zregex          | pcre2   | pcre2-jit | python | perl   | posix   |
 |--------------|----------------:|--------:|----------:|-------:|-------:|--------:|
-| literal      | 1.8 (jit)       | 4.5     | 0.17      | 1.9    | 1.7    | 6.5     |
-| ci_literal   | 2.9 (jit)       | 1921.8  | 0.19      | 16.8   | 2.7    | 8.3     |
-| date         | 2.2 (jit)       | 2.7     | 0.61      | 41.7   | 5.1    | 245.5   |
-| email        | 26.4 (dfa)      | 83.0    | 5.96      | 88.7   | 39.5   | 240.5   |
-| alt          | 12.1 (jit)      | 29.6    | 4.81      | 22.9   | 17.4   | 285.7   |
-| ing_suffix   | 39.9 (dfa)      | 201.8   | 6.93      | 64.3   | 55.1   | 1006.0  |
-| spanning     | **0.09** (jit)  | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
-| groups       | 29.2 (dfa)      | 130.3   | 5.66      | 149.0  | 41.8   | 290.2   |
-| lookahead    | **5.5** (jit)   | 295.8   | 8.70      | 167.7  | 40.7   | —       |
-| backref      | **7.5** (jit)   | 133.3   | 17.06     | 124.7  | 180.2  | —       |
-| pathological | 0.26 (jit→pike) | ERROR   | 26.5      | 279.8  | 0.01   | 0.01    |
+| literal      | 1.8 (jit)       | 4.5     | 0.17      | 1.9    | 1.7    | 6.4     |
+| ci_literal   | 2.9 (jit)       | 1940.6  | 0.19      | 16.5   | 2.6    | 8.3     |
+| date         | 2.2 (jit)       | 2.7     | 0.63      | 40.7   | 4.9    | 251.1   |
+| email        | **5.2** (jit)   | 82.2    | 6.11      | 128.6  | 39.2   | 240.3   |
+| alt          | 12.4 (jit)      | 29.3    | 4.77      | 24.0   | 17.2   | 283.2   |
+| ing_suffix   | 11.0 (jit)      | 201.6   | 6.92      | 65.2   | 54.2   | 1013.2  |
+| spanning     | **0.08** (jit)  | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
+| groups       | 6.3 (jit)       | 127.8   | 5.67      | 157.7  | 41.5   | 288.4   |
+| lookahead    | **5.1** (jit)   | 294.7   | 8.66      | 175.0  | 40.5   | —       |
+| backref      | **7.4** (jit)   | 130.9   | 16.98     | 118.7  | 177.5  | —       |
+| pathological | **0.00** (pike) | ERROR   | 26.47     | 281.7  | 0.01   | 0.01    |
 
 The parenthesised engine is the one `Regex.engine` selected. zregex is
-fastest of the interpreted engines on eight of eleven rows, and beats PCRE2's
-JIT outright on `spanning`, `lookahead`, and `backref`.
+fastest of the interpreted engines on nine of eleven rows (Perl edges it out
+on the two plain-literal searches), and beats PCRE2's JIT outright on five:
+`email`, `spanning`, `lookahead`, `backref`, and `pathological`.
 "pathological" is `(a+)+$` against `"a"*22 + "!"`: PCRE2's interpreter aborts
 with a match-limit error and Python backtracks for ~280ms. The JIT spends a
 bounded number of native steps on it, bails, and the Pike VM answers — the
@@ -75,8 +76,32 @@ JIT's repeat-heavy rows: consume loops scan sixteen bytes per iteration with
 SSE2, and greedy repeats no longer leave a retry frame when the continuation
 must match a literal the repeat itself never matches (retries only ever
 resume *inside* the consumed run, so `\w+@` can never find an `@` there).
-Together those took `lookahead` to 5.5 ms and `backref` to 7.5, both now
-faster than PCRE2's JIT. Finally the JIT compiles patterns to
+Together those took `lookahead` to 5.5 ms and `backref` to 7.5.
+
+The JIT gets its own copy of the program, compiled with repeats fused. That
+sounds like a detail and was worth 5-12x: fusion had been enabled only for
+patterns using a backreference or lookaround, so everything else reached the
+JIT as split-loops — a backtrack frame per character, no repeat instruction
+for the vector scanner to accelerate, and a bail to the interpreter on any
+run longer than the 256-frame stack. With a fused program `email` went from
+62 to 5.2 ms, `groups` from 75 to 6.3, and `ing_suffix` from 58 to 11.
+
+Which engine runs is now decided by whether the JIT's backtracking is
+*structurally bounded*: a fused repeat leaves one frame however long the run
+is, so a program whose loops are all fused can only push frames in proportion
+to the pattern, never the input. Programs with an unfused loop — `(?:ab|cd)+`,
+and especially an ambiguous one like `(\w+|\d+)+x`, where the JIT explores
+exponentially many ways to split a run — go to the lazy DFA, which is linear
+by construction. That single rule routes every benchmark correctly and is
+what keeps `pathological` at 0.00 ms.
+
+AVX2 is used when the CPU and OS support it (checked with CPUID and XGETBV,
+since the OS must also be saving YMM state), which doubles the block and,
+being three-operand, drops the register copies the SSE2 form needs. On this
+corpus that is worth 2-8% — its tokens are short words, so a run usually ends
+inside the first block either way. It earns much more when runs are long: on
+synthetic input with 512-byte runs, 7.7 GB/s with SSE2 against 12.1 GB/s with
+AVX2. Finally the JIT compiles patterns to
 native code, taking over wherever few start positions get tried — literals,
 digits, alternations, and everything behind a backreference or lookaround
 (`backref`: 49 -> 16 ms, `lookahead`: 63 -> 15). Dense scans stay on the lazy

@@ -11,10 +11,13 @@ Three engines behind one API:
 
 - **JIT** — on x86-64, patterns are compiled to native machine code: literals
   become byte compares, classes become bit-test tables, and repeats become
-  consume loops that scan sixteen bytes at a time with SSE2 (baseline on
-  x86-64, so no CPU feature detection is involved). It backtracks, so it carries a step budget
-  proportional to the input; exhausting it hands the search to one of the
-  interpreters below, which is what keeps every guarantee below intact.
+  consume loops that scan sixteen bytes at a time with SSE2, or thirty-two
+  with AVX2 where the CPU and OS provide it. It backtracks, so it is used
+  only where that backtracking is structurally bounded — every loop fused
+  into a single repeat instruction, so frames are bounded by the pattern and
+  not the input — and it carries a step budget besides; exhausting the budget
+  hands the search to one of the interpreters below, which is what keeps
+  every guarantee below intact.
 - **Pike VM + lazy DFA** — patterns without backreferences or lookaround run
   in guaranteed linear time (no catastrophic backtracking, ever). An RE2-style
   lazy DFA finds match spans at one table transition per codepoint; the Pike
@@ -29,6 +32,9 @@ Three engines behind one API:
 
 Engine selection is automatic at compile time: `regex.engine` reports what
 will run and `regex.fallback_engine` what finishes anything the JIT bails on.
+A pattern whose loops cannot all be fused — `(?:ab|cd)+`, and above all an
+ambiguous one like `(\w+|\d+)+x` — goes to the DFA instead, where the answer
+is linear by construction rather than exponential.
 Set `regex.jit_mode` to `.off` to keep searches on the interpreters, or `.on`
 to force native code. Every engine skips ahead using a first-byte prefilter
 computed from the pattern (see `bench/` for numbers against PCRE2, Python,

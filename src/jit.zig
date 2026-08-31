@@ -37,6 +37,31 @@ const max_frames = 256;
 const max_undo = 256;
 const max_slots = 256;
 
+/// Does the program contain a loop the compiler could not fuse into a single
+/// repeat instruction?
+///
+/// This is the property that decides whether native code is worth running.
+/// A fused repeat consumes in a straight line and leaves one frame however
+/// long the run is, so a program without unfused loops can only push a number
+/// of frames bounded by the *pattern*, never by the input — its backtracking
+/// is structurally bounded. An unfused loop (`(?:ab|cd)+`, `(\w+|\d+)+x`)
+/// pushes a frame per iteration and, when its body is ambiguous, explores
+/// exponentially many splits. Those belong on the lazy DFA, which is linear
+/// by construction.
+///
+/// Unfused loops are exactly the backward jumps: `emitStar` is the only thing
+/// that emits one, and fusion replaces it.
+pub fn backtrackingIsBounded(prog: compiler.Program) bool {
+    for (prog.insts, 0..) |inst, pc| {
+        switch (inst) {
+            .jmp => |t| if (t <= pc) return false,
+            .split => |t| if (t[0] <= pc or t[1] <= pc) return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
 pub const Jit = struct {
     buf: mem.Buffer,
     func: codegen.Fn,

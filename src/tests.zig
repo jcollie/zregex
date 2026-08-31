@@ -483,3 +483,66 @@ test "fused repeats in the backtracker" {
     defer m.deinit(gpa);
     try std.testing.expectEqualStrings("15", m.span().slice("at 15% now"));
 }
+
+test "memoization tames exponential backtracking" {
+    // 2^30-ish unmemoized; the memo makes it polynomial and it just fails.
+    var re = try Regex.compile(gpa, "(a+)+\\1$");
+    defer re.deinit();
+    try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+    const haystack = "a" ** 30 ++ "b";
+    try std.testing.expect(!try re.isMatch(gpa, haystack));
+    // Without the memo the same search must blow the step budget.
+    re.memo = false;
+    re.max_steps = 100_000;
+    try std.testing.expectError(error.StepLimitExceeded, re.isMatch(gpa, haystack));
+
+    // Alternation-driven blowup, forced onto the backtracker by a lookahead.
+    var re2 = try Regex.compile(gpa, "(?=a)(a|a)*c$");
+    defer re2.deinit();
+    const haystack2 = "a" ** 26 ++ "b";
+    try std.testing.expect(!try re2.isMatch(gpa, haystack2));
+    re2.memo = false;
+    re2.max_steps = 100_000;
+    try std.testing.expectError(error.StepLimitExceeded, re2.isMatch(gpa, haystack2));
+}
+
+test "memoization preserves semantics" {
+    const cases = [_]struct { p: []const u8, h: []const u8 }{
+        .{ .p = "(a+)+\\1", .h = "aaaaaa" },
+        .{ .p = "(a|ab)+(c|bc)\\1", .h = "ababcab" },
+        .{ .p = "(\\w+) \\1", .h = "hey hey ho ho" },
+        .{ .p = "(?=(a+))(a|aa)+b", .h = "aaaab" },
+        .{ .p = "(?:(x)|(y))*\\1\\2", .h = "xyxy" },
+        .{ .p = "((a*)b\\2)+", .h = "aabaab ab" },
+        .{ .p = "(a{2,})\\1", .h = "aaaaa" },
+        .{ .p = "(?<=(b))a\\1", .h = "bab" },
+    };
+    for (cases) |c| {
+        var re = try Regex.compile(gpa, c.p);
+        defer re.deinit();
+        try std.testing.expectEqual(zregex.Engine.backtrack, re.engine);
+        re.memo = true;
+        const with = try re.find(gpa, c.h);
+        re.memo = false;
+        const without = try re.find(gpa, c.h);
+        if (with == null or without == null) {
+            try std.testing.expectEqual(with == null, without == null);
+            continue;
+        }
+        var a = with.?;
+        defer a.deinit(gpa);
+        var b = without.?;
+        defer b.deinit(gpa);
+        try std.testing.expectEqualSlices(?zregex.Span, b.groups, a.groups);
+    }
+}
+
+test "lookahead sub-runs are re-evaluated correctly under memoization" {
+    // The lookahead runs at several positions across attempts; sub-run
+    // states must not be poisoned by earlier (successful) runs.
+    try expectGroups("(?=(a+))\\1b", "aaab", &.{ "aaab", "aaa" });
+    try expectGroups("(?=(\\w+))(\\w)x", "ab cx", &.{ "cx", "cx", "c" });
+    // Atomic lookaround: the captured \\w+ cannot be retried shorter, so the
+    // backref can never fit (PCRE agrees: no match).
+    try expectFind("(?=(\\w+))x\\1", "axaa", null);
+}

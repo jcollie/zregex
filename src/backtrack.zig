@@ -68,6 +68,23 @@ inline fn repAccepts(prog: compiler.Program, child: compiler.Inst, cp: u21) bool
     };
 }
 
+/// Memoization key: program point, input position, and the values of every
+/// slot the remaining program can *read* (slots of backref-referenced groups
+/// plus loop-guard scratch slots). Those values fully determine whether the
+/// subtree from this state can match, so a re-arrival at a recorded key is a
+/// state whose exploration already failed.
+const MemoKey = struct {
+    pc: u32,
+    pos: u32,
+    caps: [max_memo_slots]u32,
+};
+
+const max_memo_slots = 6;
+/// Unset slot marker inside a key (input longer than this disables the memo).
+const memo_unset = std.math.maxInt(u32);
+/// Entry cap; when full the memo stops growing but is still consulted.
+const memo_cap = 1 << 20;
+
 const Bt = struct {
     gpa: std.mem.Allocator,
     prog: compiler.Program,
@@ -77,6 +94,29 @@ const Bt = struct {
     undo: std.ArrayList(Undo) = .empty,
     steps: usize = 0,
     max_steps: usize,
+    memo: std.AutoHashMapUnmanaged(MemoKey, void) = .empty,
+    memo_on: bool = false,
+    /// Slot indices contributing to the key.
+    memo_slots: [max_memo_slots]u16 = @splat(0),
+    memo_slot_count: u8 = 0,
+
+    fn memoKey(self: *Bt, pc: u32, pos: usize) MemoKey {
+        var caps: [max_memo_slots]u32 = @splat(0);
+        for (self.memo_slots[0..self.memo_slot_count], 0..) |sl, i| {
+            caps[i] = if (self.slots[sl]) |v| @intCast(v) else memo_unset;
+        }
+        return .{ .pc = pc, .pos = @intCast(pos), .caps = caps };
+    }
+
+    /// True when this (pc, pos, read-slots) state was already explored — its
+    /// subtree failed, so the caller should prune. Otherwise records it.
+    fn memoSeen(self: *Bt, pc: u32, pos: usize) Error!bool {
+        if (self.memo.count() < memo_cap) {
+            const gop = try self.memo.getOrPut(self.gpa, self.memoKey(pc, pos));
+            return gop.found_existing;
+        }
+        return self.memo.contains(self.memoKey(pc, pos));
+    }
 
     inline fn setSlot(self: *Bt, slot: u16, value: ?usize) Error!void {
         try self.undo.append(self.gpa, .{ .slot = slot, .old = self.slots[slot] });
@@ -161,9 +201,9 @@ const Bt = struct {
     fn lookGeneral(self: *Bt, l: compiler.LookOp, pos: usize) Error!bool {
         const undo_mark = self.undo.items.len;
         switch (l.kind) {
-            .ahead_pos => return try self.matchFrom(l.target, pos, null) != null,
+            .ahead_pos => return try self.matchFrom(l.target, pos, null, false) != null,
             .ahead_neg => {
-                if (try self.matchFrom(l.target, pos, null) == null) return true;
+                if (try self.matchFrom(l.target, pos, null, false) == null) return true;
                 // Sub matched: discard its captures and fail.
                 self.rewindUndo(undo_mark);
                 return false;
@@ -174,7 +214,7 @@ const Bt = struct {
                 // is supported.
                 var s = pos;
                 const hit = while (true) {
-                    if (try self.matchFrom(l.target, s, pos) != null) break true;
+                    if (try self.matchFrom(l.target, s, pos, false) != null) break true;
                     if (s == 0) break false;
                     s -= common.decodeBefore(self.input, s).len;
                 };
@@ -190,7 +230,10 @@ const Bt = struct {
     ///
     /// On success, frames pushed by this attempt are discarded (lookarounds are
     /// atomic) and slot writes are kept. On failure, slots are rewound.
-    fn matchFrom(self: *Bt, pc0: u32, pos0: usize, required_end: ?usize) Error!?usize {
+    /// `memo_ok` is true only for top-level attempts: lookaround sub-runs
+    /// must not mark states (a successful sub-run would leave visited-but-
+    /// not-failed marks) and lookbehind results are `required_end`-relative.
+    fn matchFrom(self: *Bt, pc0: u32, pos0: usize, required_end: ?usize, memo_ok: bool) Error!?usize {
         const stack_base = self.stack.items.len;
         const undo_base = self.undo.items.len;
         const insts = self.prog.insts;
@@ -244,13 +287,16 @@ const Bt = struct {
                     continue :step;
                 },
                 .split => |t| {
-                    try self.stack.append(self.gpa, .{
-                        .pc = t[1],
-                        .pos = pos,
-                        .undo_len = @intCast(self.undo.items.len),
-                    });
-                    pc = t[0];
-                    continue :step;
+                    if (!(self.memo_on and memo_ok) or !try self.memoSeen(pc, pos)) {
+                        try self.stack.append(self.gpa, .{
+                            .pc = t[1],
+                            .pos = pos,
+                            .undo_len = @intCast(self.undo.items.len),
+                        });
+                        pc = t[0];
+                        continue :step;
+                    }
+                    // Known-failing state: fall through to backtracking.
                 },
                 .save => |s| {
                     try self.setSlot(s, pos);
@@ -372,6 +418,7 @@ pub fn run(
     start: usize,
     slots_out: []?usize,
     max_steps: usize,
+    use_memo: bool,
 ) Error!bool {
     var bt = Bt{
         .gpa = gpa,
@@ -382,7 +429,37 @@ pub fn run(
     };
     defer bt.stack.deinit(gpa);
     defer bt.undo.deinit(gpa);
+    defer bt.memo.deinit(gpa);
     @memset(slots_out, null);
+
+    // Configure memoization: collect every slot the program can read — the
+    // slots of backref-referenced groups plus loop-guard scratch slots. Too
+    // many (rare) disables the memo; the step budget still guards.
+    if (use_memo and input.len < memo_unset) blk: {
+        var n: u8 = 0;
+        const first_scratch = 2 * @as(u16, prog.group_count);
+        var sl = first_scratch;
+        while (sl < prog.slot_count) : (sl += 1) {
+            if (n >= max_memo_slots) break :blk;
+            bt.memo_slots[n] = sl;
+            n += 1;
+        }
+        for (prog.insts) |inst| {
+            if (inst != .backref) continue;
+            const g = 2 * @as(u16, inst.backref.group);
+            var have = false;
+            for (bt.memo_slots[0..n]) |existing| {
+                if (existing == g) have = true;
+            }
+            if (have) continue;
+            if (n + 2 > max_memo_slots) break :blk;
+            bt.memo_slots[n] = g;
+            bt.memo_slots[n + 1] = g + 1;
+            n += 2;
+        }
+        bt.memo_slot_count = n;
+        bt.memo_on = true;
+    }
 
     const pf = &prog.prefilter;
     // When the program leads with a greedy unbounded fused rep and there are
@@ -414,7 +491,7 @@ pub fn run(
         // start position gets a fresh allowance, so scanning a large haystack
         // is not itself budget-limited while any single attempt stays bounded.
         bt.steps = 0;
-        if (try bt.matchFrom(0, s, null)) |end| {
+        if (try bt.matchFrom(0, s, null, true)) |end| {
             // Group 0 has no save instructions; fill it here.
             slots_out[0] = s;
             slots_out[1] = end;

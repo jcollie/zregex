@@ -13,9 +13,13 @@ Two engines behind one API:
   in guaranteed linear time (no catastrophic backtracking, ever). An RE2-style
   lazy DFA finds match spans at one table transition per codepoint; the Pike
   VM extracts captures from a small window.
-- **Backtracker** — patterns using backreferences or lookaround fall back to a
-  backtracking engine with a configurable step budget
-  (`error.StepLimitExceeded` instead of hanging).
+- **Backtracker** — patterns using backreferences or lookaround fall back to
+  a backtracking engine with backref-aware memoization: states whose failure
+  was already proven (keyed by position, program point, and every capture the
+  remaining program can read) are pruned, so classic ReDoS patterns like
+  `(a+)+\1$` complete in polynomial time instead of exploding. A configurable
+  step budget (`error.StepLimitExceeded` instead of hanging) remains as the
+  backstop for the rare shapes memoization cannot key.
 
 Engine selection is automatic at compile time; check `regex.engine` if you
 care which one you got. Both engines skip ahead using a first-byte prefilter

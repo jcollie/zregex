@@ -70,6 +70,11 @@ pub const Regex = struct {
     /// highly selective, memchr-style skipping with the Pike VM alone is
     /// faster than any per-codepoint automaton. `.on`/`.off` force it.
     dfa_mode: enum { auto, on, off } = .auto,
+    /// Backref-aware memoization in the backtracking engine: prunes states
+    /// whose failure was already proven, bounding pathological backtracking
+    /// polynomially. Keys include everything the remaining program can read
+    /// (referenced capture spans, loop guards), so semantics are unchanged.
+    memo: bool = true,
     /// Step budget for the backtracking engine, applied per match attempt
     /// (per start position, like PCRE's match limit); tune per regex if
     /// needed.
@@ -255,7 +260,7 @@ pub const Regex = struct {
     ) RunError!bool {
         return switch (self.engine) {
             .pike => pike.run(gpa, self.prog(), haystack, start, slots),
-            .backtrack => backtrack.run(gpa, self.prog(), haystack, start, slots, self.max_steps),
+            .backtrack => backtrack.run(gpa, self.prog(), haystack, start, slots, self.max_steps, self.memo),
         };
     }
 

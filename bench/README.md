@@ -54,5 +54,8 @@ with a greedy unbounded repeat and has no backrefs — skips the whole consumed
 run after a failed attempt, turning the classic quadratic leading-`\w+` scan
 linear (`lookahead`: 512 -> 63 ms). An ASCII fast path in the UTF-8 decoder,
 found while profiling the backtracker, cut every engine's inner loop by
-2-3x (`email`: 69 -> 25 ms, `groups`: 73 -> 28 ms). Costs remain flat and
+2-3x (`email`: 69 -> 25 ms, `groups`: 73 -> 28 ms). Backref-aware
+memoization prunes proven-failing backtracker states, taming classic ReDoS
+patterns (`(a+)+\1$` on 40 chars: step-budget error -> 0.5 ms correct
+answer) at zero cost to split-free programs. Costs remain flat and
 predictable where backtrackers swing wildly in both directions.

@@ -10,8 +10,11 @@
 //!
 //! Patterns are built from a grammar rather than from raw bytes, so the
 //! fuzzer spends its time on the engines instead of on the parser rejecting
-//! noise, and they are drawn from a deliberately tiny alphabet so that
-//! matches, backtracking, and ambiguity actually happen.
+//! noise, and both are drawn from deliberately tiny, overlapping alphabets
+//! so that matches, backtracking, and ambiguity actually happen. Those
+//! alphabets include multi-byte codepoints and bytes that are not valid
+//! UTF-8, which is what reaches the decoder's fallback, the helper paths the
+//! JIT takes for non-ASCII, and the lead-byte handling in the prefilter.
 //!
 //! The generator is driven through `Source`, which reads its decisions either
 //! from the fuzzer's `Smith` or from a seeded PRNG. Both are wired up: `zig
@@ -28,173 +31,17 @@ const std = @import("std");
 const zregex = @import("root.zig");
 const Regex = zregex.Regex;
 const Span = zregex.Span;
+const gen = @import("pattern_gen");
+const Source = gen.Source;
+const Builder = gen.Builder;
+const chunks = gen.chunks;
 
-/// Small on purpose: overlapping literals and classes are what produce
-/// interesting backtracking and capture disagreements.
-const alphabet = "aab@-. 1";
-
-const max_depth = 4;
-const max_pattern = 96;
-
-/// Where the generator's decisions come from. The fuzzer supplies bytes it
-/// can mutate under coverage feedback; the seeded PRNG supplies a
-/// reproducible stream.
-const Source = union(enum) {
-    smith: *std.testing.Smith,
-    random: std.Random,
-
-    fn index(self: Source, len: usize) usize {
-        return switch (self) {
-            .smith => |s| s.index(len),
-            .random => |r| r.uintLessThan(usize, len),
-        };
-    }
-
-    fn intRange(self: Source, comptime T: type, lo: T, hi: T) T {
-        return switch (self) {
-            .smith => |s| s.valueRangeAtMost(T, lo, hi),
-            .random => |r| r.intRangeAtMost(T, lo, hi),
-        };
-    }
-
-    fn boolean(self: Source) bool {
-        return switch (self) {
-            .smith => |s| s.value(bool),
-            .random => |r| r.boolean(),
-        };
-    }
-
-    fn choice(self: Source, comptime T: type) T {
-        return switch (self) {
-            .smith => |s| s.value(T),
-            .random => |r| r.enumValue(T),
-        };
-    }
-};
-
-const Builder = struct {
-    src: Source,
-    buf: std.ArrayList(u8) = .empty,
-    gpa: std.mem.Allocator,
-    /// Capture groups opened so far, so a backreference can name a real one.
-    groups: u8 = 0,
-
-    const Error = std.mem.Allocator.Error;
-
-    fn put(self: *Builder, bytes: []const u8) Error!void {
-        if (self.buf.items.len + bytes.len > max_pattern) return;
-        try self.buf.appendSlice(self.gpa, bytes);
-    }
-
-    fn literal(self: *Builder) Error!void {
-        const c = alphabet[self.src.index(alphabet.len)];
-        // '.' is the only alphabet character that is also syntax.
-        if (c == '.') try self.put("\\.") else try self.put(&.{c});
-    }
-
-    fn class(self: *Builder) Error!void {
-        switch (self.src.choice(enum { digit, word, space, set, negated, dot })) {
-            .digit => try self.put("\\d"),
-            .word => try self.put("\\w"),
-            .space => try self.put("\\s"),
-            .dot => try self.put("."),
-            .set => try self.put("[ab1]"),
-            .negated => try self.put("[^ab]"),
-        }
-    }
-
-    fn atom(self: *Builder, depth: u8) Error!void {
-        if (depth >= max_depth or self.buf.items.len > max_pattern - 8) {
-            try self.literal();
-            return;
-        }
-        switch (self.src.choice(enum {
-            literal,
-            class,
-            group,
-            noncapturing,
-            alternation,
-            anchor,
-            backref,
-            lookahead,
-            lookbehind,
-        })) {
-            .literal => try self.literal(),
-            .class => try self.class(),
-            .group => {
-                if (self.groups >= 8) return self.literal();
-                self.groups += 1;
-                try self.put("(");
-                try self.sequence(depth + 1);
-                try self.put(")");
-            },
-            .noncapturing => {
-                try self.put("(?:");
-                try self.sequence(depth + 1);
-                try self.put(")");
-            },
-            .alternation => {
-                try self.put("(?:");
-                try self.sequence(depth + 1);
-                try self.put("|");
-                try self.sequence(depth + 1);
-                try self.put(")");
-            },
-            .anchor => switch (self.src.choice(enum { start, end, word, not_word })) {
-                .start => try self.put("^"),
-                .end => try self.put("$"),
-                .word => try self.put("\\b"),
-                .not_word => try self.put("\\B"),
-            },
-            .backref => {
-                // Only ever names a group that is already open or closed.
-                if (self.groups == 0) return self.literal();
-                const n = self.src.intRange(u8, 1, self.groups);
-                try self.put(&.{ '\\', '0' + n });
-            },
-            .lookahead => {
-                try self.put(if (self.src.boolean()) "(?=" else "(?!");
-                try self.literal();
-                try self.put(")");
-            },
-            .lookbehind => {
-                try self.put(if (self.src.boolean()) "(?<=" else "(?<!");
-                try self.literal();
-                try self.put(")");
-            },
-        }
-    }
-
-    fn quantified(self: *Builder, depth: u8) Error!void {
-        try self.atom(depth);
-        if (self.src.boolean()) return;
-        switch (self.src.choice(enum { star, plus, opt, exact, range, open })) {
-            .star => try self.put("*"),
-            .plus => try self.put("+"),
-            .opt => try self.put("?"),
-            .exact => {
-                const n = self.src.intRange(u8, 0, 3);
-                try self.put(&.{ '{', '0' + n, '}' });
-            },
-            .range => {
-                const lo = self.src.intRange(u8, 0, 2);
-                const hi = self.src.intRange(u8, lo, 3);
-                try self.put(&.{ '{', '0' + lo, ',', '0' + hi, '}' });
-            },
-            .open => {
-                const n = self.src.intRange(u8, 0, 2);
-                try self.put(&.{ '{', '0' + n, ',', '}' });
-            },
-        }
-        if (self.src.boolean()) try self.put("?"); // lazy
-    }
-
-    fn sequence(self: *Builder, depth: u8) Error!void {
-        const n = self.src.intRange(u8, 1, 3);
-        for (0..n) |_| try self.quantified(depth);
-    }
-};
-
+/// Haystacks are built from these pieces rather than single bytes, so that
+/// multi-byte codepoints stay intact while the decoder's fallback still gets
+/// exercised: a lone 0xFF is not valid UTF-8 and must be treated as a
+/// one-byte codepoint of its own value, and a stray continuation byte or a
+/// truncated lead byte reaches the same path from the other side. Small and
+/// overlapping on purpose — that is what produces interesting backtracking.
 /// One engine configuration to compare. Not every one applies to every
 /// pattern: the Pike VM and the lazy DFA cannot run backreferences or
 /// lookaround, and the JIT is only present where it could be generated.
@@ -270,6 +117,33 @@ const configs = [_]Config{
     },
 };
 
+/// Properties that must hold of any result, whatever engine produced it and
+/// whether or not the engines agree with each other. Cross-checking finds
+/// disagreements; this finds the things they could get wrong together.
+fn checkInvariants(
+    re: *const Regex,
+    haystack: []const u8,
+    m: zregex.Match,
+    prev_end: ?usize,
+) !void {
+    const span = m.span();
+    try std.testing.expect(span.start <= span.end);
+    try std.testing.expect(span.end <= haystack.len);
+    // Group 0 is the match and always participates.
+    try std.testing.expect(m.groups[0] != null);
+    try std.testing.expectEqual(re.group_count, m.groups.len);
+    for (m.groups) |g| {
+        // A capture may sit outside the match — a lookahead can record one
+        // past the end — but never outside the haystack.
+        if (g) |sp| {
+            try std.testing.expect(sp.start <= sp.end);
+            try std.testing.expect(sp.end <= haystack.len);
+        }
+    }
+    // Iteration moves forward and never returns overlapping matches.
+    if (prev_end) |pe| try std.testing.expect(span.start >= pe);
+}
+
 /// Every match in `haystack`, flattened to spans so the results of two
 /// configurations can be compared directly.
 ///
@@ -285,9 +159,12 @@ fn collect(
     var it = re.iterator(gpa, haystack);
     defer it.deinit();
     var count: usize = 0;
+    var prev_end: ?usize = null;
     while (try it.next()) |m| {
         var mm = m;
         defer mm.deinit(gpa);
+        try checkInvariants(re, haystack, mm, prev_end);
+        prev_end = mm.span().end;
         if (groups_too) {
             try out.appendSlice(gpa, mm.groups);
         } else {
@@ -319,8 +196,8 @@ fn oneCase(src: Source) anyerror!void {
 
     var hay: std.ArrayList(u8) = .empty;
     defer hay.deinit(gpa);
-    const hay_len = src.intRange(u8, 0, 40);
-    for (0..hay_len) |_| try hay.append(gpa, alphabet[src.index(alphabet.len)]);
+    const hay_len = src.intRange(u8, 0, 24);
+    for (0..hay_len) |_| try hay.appendSlice(gpa, chunks[src.index(chunks.len)]);
 
     const needs_backtrack = re.fallback_engine == .backtrack;
 
@@ -381,6 +258,44 @@ fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "engines agree under fuzzing" {
     try std.testing.fuzz({}, testOne, .{});
+}
+
+/// `isMatch` and `find` must never disagree about whether there is a match.
+fn checkIsMatch(gpa: std.mem.Allocator, re: *const Regex, haystack: []const u8) !void {
+    const found = re.find(gpa, haystack) catch |err| switch (err) {
+        error.StepLimitExceeded => return,
+        else => return err,
+    };
+    const yes = re.isMatch(gpa, haystack) catch |err| switch (err) {
+        error.StepLimitExceeded => return,
+        else => return err,
+    };
+    if (found) |m| {
+        var mm = m;
+        mm.deinit(gpa);
+    }
+    try std.testing.expectEqual(found != null, yes);
+}
+
+test "arbitrary bytes never crash the parser or the engines" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x50a7_7e12);
+    const rand = prng.random();
+    var pattern: [24]u8 = undefined;
+    var hay: [16]u8 = undefined;
+    // Mostly syntax characters, so that random input has a real chance of
+    // parsing and reaching the engines rather than being rejected at once.
+    const soup = "ab01()[]{}|*+?.^$\\-,:<>=!  \u{e9}";
+    for (0..20000) |_| {
+        const plen = rand.uintLessThan(usize, pattern.len);
+        for (pattern[0..plen]) |*c| c.* = soup[rand.uintLessThan(usize, soup.len)];
+        var re = Regex.compile(gpa, pattern[0..plen]) catch continue;
+        defer re.deinit();
+        re.max_steps = 10_000;
+        const hlen = rand.uintLessThan(usize, hay.len);
+        for (hay[0..hlen]) |*c| c.* = soup[rand.uintLessThan(usize, soup.len)];
+        try checkIsMatch(gpa, &re, hay[0..hlen]);
+    }
 }
 
 test "engines agree on randomized patterns" {

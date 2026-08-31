@@ -132,8 +132,9 @@ All of these are zero-width: they match a position, not text.
 | Syntax | Matches at | Example | As a Zig `"..."` literal |
 |---|---|---|---|
 | `^` | start of text (start of line under the `m` flag) | `^abc` | `"^abc"` |
-| `$` | end of text (end of line under the `m` flag) | `abc$` | `"abc$"` |
-| `\A` / `\z` | start / end of text, regardless of `m` | `\Aabc\z` | `"\\Aabc\\z"` |
+| `$` | end of text, or just before a newline ending it (end of line under the `m` flag) | `bc$` matches in both `abc` and `abc\n` | `"bc$"` |
+| `\A` / `\z` | start / end of text, regardless of `m`; `\z` allows no trailing newline | `\Aabc\z` | `"\\Aabc\\z"` |
+| `\Z` | end of text, or just before a newline ending it — what `$` means outside `m` | `bc\Z` | `"bc\\Z"` |
 | `\b` / `\B` | word boundary / non-boundary | `\bcat\b` matches `cat` in `the cat.` but not in `concat` | `"\\bcat\\b"` |
 
 ### Quantifiers
@@ -172,9 +173,9 @@ Look up a named group's index with `re.groupIndex("year")`.
 | `\1` … `\99` | the same text group n captured | `(\w+) \1` matches `go go` | `"(\\w+) \\1"` |
 | `\k<name>` | same, by name | `(?<q>['"]).*?\k<q>` matches a quoted span | `"(?<q>['\"]).*?\\k<q>"` |
 
-Comparison honors `(?i)`. A backref to a group that has not participated
-matches the empty string (JavaScript semantics); referring to a group that
-appears later in the pattern is a compile error.
+Comparison honors `(?i)`. A backreference to a group that has not
+participated fails to match, following PCRE; referring to a group that appears
+later in the pattern is a compile error.
 
 ### Lookaround *(backtracking engine)*
 

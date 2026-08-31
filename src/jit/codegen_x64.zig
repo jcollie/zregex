@@ -656,6 +656,18 @@ pub const Gen = struct {
                 a.cmpRegReg(r_pos, r_len);
                 a.jcc(.ne, self.l_fail);
             },
+            .end_text_or_final_newline => {
+                const l_ok = try a.label();
+                a.cmpRegReg(r_pos, r_len);
+                a.jcc(.e, l_ok);
+                // Otherwise only a newline in the final position will do.
+                a.leaRegMem(.rax, .{ .base = r_pos, .disp = 1 });
+                a.cmpRegReg(.rax, r_len);
+                a.jcc(.ne, self.l_fail);
+                a.cmpMem8Imm(inputAt(r_pos, 0), '\n');
+                a.jcc(.ne, self.l_fail);
+                a.place(l_ok);
+            },
             .begin_line => {
                 const l_ok = try a.label();
                 a.testRegReg(r_pos, r_pos);

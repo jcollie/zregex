@@ -317,7 +317,13 @@ pub const Parser = struct {
             },
             '$' => {
                 self.pos += 1;
-                const a: common.Assertion = if (self.flags.multiline) .end_line else .end_text;
+                // Outside multiline mode `$` is PCRE's: the end of the text,
+                // or just before a newline that ends it. `\z` is the strict
+                // one.
+                const a: common.Assertion = if (self.flags.multiline)
+                    .end_line
+                else
+                    .end_text_or_final_newline;
                 return self.addNode(.{ .assertion = a });
             },
             '\\' => {
@@ -535,6 +541,10 @@ pub const Parser = struct {
                 if (in_class) return error.InvalidEscape;
                 return .{ .assertion = .end_text };
             },
+            'Z' => {
+                if (in_class) return error.InvalidEscape;
+                return .{ .assertion = .end_text_or_final_newline };
+            },
             'x' => {
                 if (self.peek() == '{') return .{ .literal = try self.parseBracedCodepoint() };
                 return .{ .literal = try self.parseHex(2) };
@@ -570,7 +580,7 @@ pub const Parser = struct {
                 self.has_backref = true;
                 return .{ .backref = index };
             },
-            'Q', 'E', 'c', 'p', 'P', 'G', 'K', 'R', 'Z' => return error.UnsupportedFeature,
+            'Q', 'E', 'c', 'p', 'P', 'G', 'K', 'R' => return error.UnsupportedFeature,
             else => {
                 // Identity escape for punctuation; escaping a letter or digit
                 // we don't know is an error (it may gain meaning later).
@@ -734,7 +744,7 @@ test "parses valid patterns" {
     try expectParses("[-a]");
     try expectParses("[a-]");
     try expectParses("\\x41\\x{1F600}\\u0041\\u{41}");
-    try expectParses("^ab$\\bx\\B\\Ay\\z");
+    try expectParses("^ab$\\bx\\B\\Ay\\z\\Z");
     try expectParses("(a)\\1");
     try expectParses("(?=a)(?!b)(?<=c)(?<!d)");
     try expectParses("a{b}");

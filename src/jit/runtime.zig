@@ -140,11 +140,12 @@ pub fn helperBackref(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
     const input = ctx.input[0..ctx.input_len];
     const a = ctx.slots[2 * @as(usize, br.group)];
     const b = ctx.slots[2 * @as(usize, br.group) + 1];
-    // An unset group matches empty. So does an inconsistent one: re-entering
-    // a group overwrites its start before its end, so a backreference reached
-    // while the group is open — from inside it, or from a later iteration —
-    // sees a start past the end of the previous iteration's capture.
-    if (a == unset or b == unset or a > b) return 1;
+    // A backreference to a group that never participated fails, as it does in
+    // PCRE; JavaScript is the odd one out in matching empty. The same goes for
+    // a group caught mid-flight: re-entering one overwrites its start before
+    // its end, so a backreference reached while it is open sees a start past
+    // the end of the previous iteration's capture.
+    if (a == unset or b == unset or a > b) return 0;
     const text = input[a..b];
     if (pos + text.len > input.len) return 0;
     const hay = input[pos..][0..text.len];

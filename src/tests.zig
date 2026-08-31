@@ -90,6 +90,15 @@ test "anchors and boundaries" {
     try expectFind("\\Bcat\\B", "concatenate", "cat");
     try expectFind("\\Aab", "abc", "ab");
     try expectFind("bc\\z", "abc", "bc");
+    // `$` also matches before a newline ending the text; `\z` never does,
+    // and `\Z` always does. One trailing newline only.
+    try expectFind("bc$", "abc\n", "bc");
+    try expectFind("bc$", "abc\n\n", null);
+    try expectFind("bc\\z", "abc\n", null);
+    try expectFind("bc\\Z", "abc\n", "bc");
+    try expectFind("bc\\Z", "abc", "bc");
+    try expectFind("^$", "\n", "");
+    try expectFind("c$", "abc", "c");
 }
 
 test "captures" {
@@ -203,8 +212,10 @@ test "backreferences" {
     try expectFind("(a+)\\1", "aba", null);
     try expectGroups("(\\w+) \\1", "say ho ho!", &.{ "ho ho", "ho" });
     try expectFind("(?<q>['\"]).*?\\k<q>", "say \"hi' there\" ok", "\"hi' there\"");
-    // Unset group backref matches empty (JS semantics).
-    try expectFind("(?:(a)|b)\\1c", "bc", "bc");
+    // A backreference to a group that never participated fails, as in PCRE.
+    try expectFind("(?:(a)|b)\\1c", "bc", null);
+    try expectFind("(a)?\\1b", "b", null);
+    try expectFind("(a)\\1b", "aab", "aab"); // it does participate here
 }
 
 test "lookaround" {
@@ -707,7 +718,10 @@ test "regressions found by differential fuzzing" {
     // sliced backwards. It must behave as an unset group and match empty.
     var re = try Regex.compile(gpa, "((a)|b)+\\2");
     defer re.deinit();
-    try std.testing.expect(try re.isMatch(gpa, "ab"));
+    // Group 2 never participates on the path that reaches the
+    // backreference, so this cannot match — what matters is that it does
+    // not slice backwards while deciding so.
+    try std.testing.expect(!try re.isMatch(gpa, "ab"));
 
     // A loop iteration that consumes nothing ends the loop; it does not fail
     // and force the body to consume. `(a*?)*` must therefore match empty,
@@ -726,4 +740,22 @@ test "prefilter skipping does not strand the Pike VM" {
     try expectFind("(?:@)?\\Bb", "@ab", "b");
     try expectFind("a?\\Bb", "@ab", "ab"); // leftmost: the optional 'a' is taken
     try expectGroups("(@)?\\Bb", "@ab", &.{ "b", null });
+}
+
+test "cases where PCRE2 is the one that is wrong" {
+    // Found by tools/oracle.zig. Both were checked against Python, which
+    // agrees with zregex; PCRE2 10.47 does not, and the tool steers around
+    // them so that it reports real differences.
+
+    // Adding `(?i)` can only ever add matches. PCRE2 loses the match when a
+    // caseless class holds a wide non-ASCII range, though it finds it both
+    // without `(?i)` and with the same character written as a literal.
+    try expectFind("(?i)[\u{a0}-\u{2fff}]+", "Aa\u{20ac}-x", "\u{20ac}");
+    try expectFind("[\u{a0}-\u{2fff}]+", "Aa\u{20ac}-x", "\u{20ac}");
+
+    // `X{0}` matches empty, so what follows decides the match. PCRE2 fails
+    // the whole pattern for some bodies.
+    try expectFind("(?:(?= ){8}){0}A", "A", "A");
+    try expectFind("(?:a){0,0}A", "A", "A");
+    try expectFind("(?:(?=x)+){0}A", "A", "A");
 }

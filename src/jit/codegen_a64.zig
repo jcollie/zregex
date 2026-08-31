@@ -297,6 +297,19 @@ const Gen = struct {
                 a.cmpReg(r_pos, r_len);
                 a.bcond(.ne, self.l_fail);
             },
+            .end_text_or_final_newline => {
+                const l_ok = try a.label();
+                a.cmpReg(r_pos, r_len);
+                a.bcond(.eq, l_ok);
+                // Otherwise only a newline in the final position will do.
+                a.addImm(.x9, r_pos, 1);
+                a.cmpReg(.x9, r_len);
+                a.bcond(.ne, self.l_fail);
+                a.ldrbReg(.x9, r_input, r_pos);
+                a.cmpImm(.x9, '\n');
+                a.bcond(.ne, self.l_fail);
+                a.place(l_ok);
+            },
             .begin_line => {
                 const l_ok = try a.label();
                 a.cbz(r_pos, l_ok);

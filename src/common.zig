@@ -3,6 +3,7 @@
 
 //! Shared types and helpers used by the parser, compiler, and both engines.
 const std = @import("std");
+const expect = std.testing.expect;
 
 /// Compile-time flags affecting pattern semantics.
 pub const Flags = struct {
@@ -24,6 +25,9 @@ pub const ClassRange = struct {
 pub const Assertion = enum {
     begin_text,
     end_text,
+    /// End of text, or just before a newline that ends it: what `$` means
+    /// outside multiline mode, and what `\Z` always means.
+    end_text_or_final_newline,
     begin_line,
     end_line,
     word_boundary,
@@ -110,6 +114,10 @@ pub fn assertHolds(a: Assertion, input: []const u8, pos: usize) bool {
     switch (a) {
         .begin_text => return pos == 0,
         .end_text => return pos == input.len,
+        .end_text_or_final_newline => {
+            if (pos == input.len) return true;
+            return pos + 1 == input.len and input[pos] == '\n';
+        },
         .begin_line => {
             if (pos == 0) return true;
             return input[pos - 1] == '\n';
@@ -142,6 +150,17 @@ test decodeBefore {
     try std.testing.expectEqual(DecodeResult{ .cp = 'é', .len = 2 }, decodeBefore(s, 3));
     try std.testing.expectEqual(DecodeResult{ .cp = '€', .len = 3 }, decodeBefore(s, 6));
     try std.testing.expectEqual(DecodeResult{ .cp = 'x', .len = 1 }, decodeBefore(s, 7));
+}
+
+test "end of text, with and without a final newline" {
+    try expect(assertHolds(.end_text, "ab", 2));
+    try expect(!assertHolds(.end_text, "ab\n", 2));
+    // `$` also matches before a newline that ends the text, but only there.
+    try expect(assertHolds(.end_text_or_final_newline, "ab", 2));
+    try expect(assertHolds(.end_text_or_final_newline, "ab\n", 2));
+    try expect(assertHolds(.end_text_or_final_newline, "ab\n", 3));
+    try expect(!assertHolds(.end_text_or_final_newline, "a\nb", 1));
+    try expect(!assertHolds(.end_text_or_final_newline, "ab\n\n", 2));
 }
 
 test assertHolds {

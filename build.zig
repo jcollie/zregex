@@ -13,6 +13,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Random pattern generation, shared by the in-tree fuzzer and the
+    // external-oracle tool, so it is a module rather than a plain file.
+    const gen_mod = b.addModule("pattern_gen", .{
+        .root_source_file = b.path("src/pattern_gen.zig"),
+        .target = target,
+    });
+    mod.addImport("pattern_gen", gen_mod);
+
     // On Windows the JIT maps executable memory through the Win32 API.
     // Lazy, so builds for other targets never fetch the bindings.
     if (target.result.os.tag == .windows) {
@@ -65,6 +73,35 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&exe.step);
+
+    // Differential testing against PCRE2. Needs that library to link, so it
+    // is opt-in rather than part of `zig build test`.
+    const pcre2_include = b.option([]const u8, "pcre2-include", "Directory holding pcre2.h");
+    const pcre2_lib = b.option([]const u8, "pcre2-lib", "Directory holding libpcre2-8");
+    if (pcre2_include) |inc| {
+        const oracle = b.addExecutable(.{
+            .name = "oracle",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/oracle.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "zregex", .module = mod },
+                    .{ .name = "pattern_gen", .module = gen_mod },
+                },
+            }),
+        });
+        oracle.root_module.addIncludePath(.{ .cwd_relative = inc });
+        if (pcre2_lib) |lib| oracle.root_module.addLibraryPath(.{ .cwd_relative = lib });
+        oracle.root_module.linkSystemLibrary("pcre2-8", .{});
+        oracle.root_module.link_libc = true;
+
+        const run_oracle = b.addRunArtifact(oracle);
+        run_oracle.stdio = .inherit;
+        if (b.args) |args| run_oracle.addArgs(args);
+        const oracle_step = b.step("oracle", "Differential-test against PCRE2");
+        oracle_step.dependOn(&run_oracle.step);
+    }
 
     // API documentation. Autodocs are emitted as a static site: index.html,
     // the viewer's wasm and javascript, and the sources it reads from.

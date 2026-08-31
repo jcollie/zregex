@@ -65,11 +65,16 @@ const BoundaryCtx = struct {
     next_word: bool,
     next_nl: bool,
     eof: bool,
+    /// Whether the codepoint about to be consumed ends the input. Unlike the
+    /// other fields this is not a property of that codepoint's class, so a
+    /// transition depending on it is computed rather than cached.
+    next_final: bool,
 
     fn holds(ctx: BoundaryCtx, a: common.Assertion) bool {
         return switch (a) {
             .begin_text => ctx.bof,
             .end_text => ctx.eof,
+            .end_text_or_final_newline => ctx.eof or (ctx.next_nl and ctx.next_final),
             .begin_line => ctx.bof or ctx.prev_nl,
             .end_line => ctx.eof or ctx.next_nl,
             .word_boundary => ctx.prev_word != ctx.next_word,
@@ -250,8 +255,13 @@ pub const Machine = struct {
         return .{ .len = out, .matched = matched };
     }
 
-    fn transition(m: *Machine, sid: u32, k: u16) Error!Entry {
-        if (m.states.items[sid].trans[k]) |e| return e;
+    fn transition(m: *Machine, sid: u32, k: u16, next_final: bool) Error!Entry {
+        // Only the ordinary case is memoized: at the last codepoint the answer
+        // can differ for the same state and class, and that happens once per
+        // search, so recomputing it costs nothing.
+        if (!next_final) {
+            if (m.states.items[sid].trans[k]) |e| return e;
+        }
         const st = m.states.items[sid];
         const raw = st.raw;
         const seeding = st.seeding;
@@ -264,6 +274,7 @@ pub const Machine = struct {
             .next_word = !eof and common.isWordChar(sample),
             .next_nl = !eof and sample == '\n',
             .eof = eof,
+            .next_final = next_final,
         };
         const c = m.closure(raw, seeding, ctx);
 
@@ -297,7 +308,7 @@ pub const Machine = struct {
                 seeding and !c.matched,
             );
         }
-        m.states.items[sid].trans[k] = entry;
+        if (!next_final) m.states.items[sid].trans[k] = entry;
         return entry;
     }
 };
@@ -359,7 +370,8 @@ pub fn search(
             k = m.alphabet.classOf(d.cp);
             cplen = d.len;
         }
-        const entry = m.transition(sid, k) catch |e| switch (e) {
+        const at_last = pos < input.len and pos + cplen == input.len;
+        const entry = m.transition(sid, k, at_last) catch |e| switch (e) {
             error.GiveUp => return .give_up,
             error.OutOfMemory => return error.OutOfMemory,
         };

@@ -396,22 +396,23 @@ const Bt = struct {
                     self.touched_backref = true;
                     const a = self.slots[2 * @as(u16, br.group)];
                     const b = self.slots[2 * @as(u16, br.group) + 1];
-                    // Unset group: matches empty (JS semantics). So does an
-                    // inconsistent one: re-entering a group overwrites its
-                    // start before its end, so a backreference reached while
-                    // the group is open sees a start past the previous
-                    // iteration's end.
+                    // A backreference to a group that never participated
+                    // fails, as it does in PCRE; JavaScript is the odd one
+                    // out in matching empty. The same goes for a group caught
+                    // mid-flight: re-entering one overwrites its start before
+                    // its end, so a backreference reached while it is open
+                    // sees a start past the previous iteration's end.
                     if (a == null or b == null or a.? > b.?) {
-                        pc += 1;
-                        continue :step;
-                    }
-                    const text = input[a.?..b.?];
-                    if (pos + text.len <= input.len and
-                        bytesEqFold(text, input[pos..][0..text.len], br.ci))
-                    {
-                        pos += text.len;
-                        pc += 1;
-                        continue :step;
+                        // fall through to backtracking
+                    } else {
+                        const text = input[a.?..b.?];
+                        if (pos + text.len <= input.len and
+                            bytesEqFold(text, input[pos..][0..text.len], br.ci))
+                        {
+                            pos += text.len;
+                            pc += 1;
+                            continue :step;
+                        }
                     }
                 },
                 .look => |l| {

@@ -71,13 +71,19 @@ pub const Builder = struct {
     groups: u8 = 0,
     /// Which of those were given a name, so `\k<name>` only uses real ones.
     named: std.bit_set.IntegerBitSet(16) = .initEmpty(),
+    /// Groups whose closing paren has not been emitted yet: a backreference
+    /// generated here would point at the group enclosing it.
+    open: std.bit_set.IntegerBitSet(16) = .initEmpty(),
     allow_backrefs: bool = true,
-    /// Steers around two constructs PCRE2 10.47 gets wrong, so that the
+    /// Steers around three constructs PCRE2 10.47 gets wrong, so that the
     /// oracle reports real differences rather than the reference's own bugs:
     /// a caseless class holding a wide non-ASCII range stops matching
-    /// characters it matches without `(?i)`, and a `{0}` repeat over some
-    /// bodies makes the whole pattern fail rather than matching empty.
-    /// Python agrees with zregex on both.
+    /// characters it matches without `(?i)`, a `{0}` repeat over some bodies
+    /// makes the whole pattern fail rather than matching empty, and a
+    /// backreference to the group enclosing it is honoured or not depending
+    /// on which alternative it sits in — `1(\1*)` matches while `1(2|\1*)`
+    /// does not. Python agrees with zregex on the first two and rejects the
+    /// third outright as a reference to an open group.
     avoid_pcre2_quirks: bool = false,
 
     const Error = std.mem.Allocator.Error;
@@ -158,6 +164,7 @@ pub const Builder = struct {
             .group => {
                 if (self.groups >= 8) return self.literal();
                 self.groups += 1;
+                self.open.set(self.groups);
                 // Half the groups are named, so that named capture and
                 // `\k<name>` are exercised alongside the numbered forms.
                 if (self.src.boolean()) {
@@ -168,8 +175,10 @@ pub const Builder = struct {
                 } else {
                     try self.put("(");
                 }
+                const opened = self.groups;
                 try self.sequence(depth + 1);
                 try self.put(")");
+                self.open.unset(opened);
             },
             .noncapturing => {
                 try self.put("(?:");
@@ -201,7 +210,12 @@ pub const Builder = struct {
             .backref => {
                 // Only ever refers to a group that is already open or closed.
                 if (!self.allow_backrefs or self.groups == 0) return self.literal();
-                const n = self.src.intRange(u8, 1, self.groups);
+                var n = self.src.intRange(u8, 1, self.groups);
+                if (self.avoid_pcre2_quirks) {
+                    // Walk down to the nearest group that is already closed.
+                    while (n > 0 and self.open.isSet(n)) n -= 1;
+                    if (n == 0) return self.literal();
+                }
                 if (self.named.isSet(n) and self.src.boolean()) {
                     try self.put("\\k<g");
                     try self.putDigits(n);

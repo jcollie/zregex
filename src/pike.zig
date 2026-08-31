@@ -28,6 +28,10 @@ fn slotLookup(chain: ?*const SlotNode, slot: u16) ?usize {
     return null;
 }
 
+/// How many empty-loop guards can be tracked separately in the visited key.
+/// Each one doubles the table, so this bounds it at 16 marks per instruction.
+const max_guard_bits = 4;
+
 const Thread = struct {
     pc: u32,
     /// Where this thread's match attempt began (group 0 start).
@@ -40,7 +44,8 @@ const ThreadList = struct {
     len: usize = 0,
 
     fn append(self: *ThreadList, t: Thread) void {
-        // Capacity is insts.len and pcs are deduped, so this cannot overflow.
+        // Capacity is one entry per visited key and keys are deduped, so
+        // this cannot overflow.
         self.items[self.len] = t;
         self.len += 1;
     }
@@ -50,14 +55,37 @@ const Ctx = struct {
     prog: compiler.Program,
     input: []const u8,
     arena: std.mem.Allocator,
-    /// Generation marks per pc; a pc is in a list iff seen[pc] == that list's gen.
+    /// Generation marks per visited key; a key is in a list iff its mark
+    /// equals that list's gen. Indexed by `(pc << key_shift) | mask`.
     seen: []u32,
     /// DFS stack for epsilon closure.
     stack: []Thread,
+    /// Guard mask per DFS stack entry, kept alongside `stack` rather than in
+    /// `Thread` so that the lists' element type stays as small as it was.
+    /// Meaningless once a thread lands in a list: every guard's bit is clear
+    /// again at the next position. See `tryEnter`.
+    stack_mask: []u8,
+    /// Guard slot -> its bit in a thread's mask, plus one; 0 for slots that
+    /// are not empty-loop guards.
+    guard_bit: []const u8,
+    /// How many bits of guard state the visited key carries.
+    key_shift: u5,
 
-    fn tryEnter(self: *Ctx, gen: u32, pc: u32) bool {
-        if (self.seen[pc] == gen) return false;
-        self.seen[pc] = gen;
+    /// Mark `pc` visited for this closure, or report that it already was.
+    ///
+    /// The key is the pc *and* the guard mask, not the pc alone. A thread's
+    /// future is otherwise not determined by its pc: `exit_if_same` branches
+    /// on whether the innermost iteration began at this position, which two
+    /// threads sharing a pc can disagree about. Deduplicating on pc alone
+    /// merges them and keeps whichever arrived first, which is the one that
+    /// has been round the loop -- so the empty iteration that PCRE runs (and
+    /// that ends the loop) is dropped, and a longer, lower-priority path
+    /// wins instead. Splitting on the bit costs a factor of two in visited
+    /// keys per guard and nothing at all for the patterns that have none.
+    fn tryEnter(self: *Ctx, gen: u32, pc: u32, mask: u8) bool {
+        const key = (@as(usize, pc) << self.key_shift) | mask;
+        if (self.seen[key] == gen) return false;
+        self.seen[key] = gen;
         return true;
     }
 
@@ -80,42 +108,60 @@ const Ctx = struct {
     /// patterns.
     inline fn addThread(self: *Ctx, list: *ThreadList, gen: u32, pc0: u32, pos: usize, start: usize, slots0: ?*const SlotNode) !void {
         var sp: usize = 0;
+        // Every guard bit is clear here. A guard slot holds the position an
+        // iteration began at, which is always one already passed, so none of
+        // them can equal `pos` until a `set_pos` in this very closure writes
+        // one -- no lookup needed to seed the mask.
         self.stack[sp] = .{ .pc = pc0, .start = start, .slots = slots0 };
+        self.stack_mask[sp] = 0;
         sp += 1;
         next_path: while (sp > 0) {
             sp -= 1;
             var pc = self.stack[sp].pc;
             var slots = self.stack[sp].slots;
-            if (!self.tryEnter(gen, pc)) continue :next_path;
+            var mask = self.stack_mask[sp];
+            if (!self.tryEnter(gen, pc, mask)) continue :next_path;
             while (true) {
                 switch (self.prog.insts[pc]) {
                     .jmp => |t| {
-                        if (!self.tryEnter(gen, t)) continue :next_path;
+                        if (!self.tryEnter(gen, t, mask)) continue :next_path;
                         pc = t;
                     },
                     .split => |t| {
                         // Queued unmarked; whichever path reaches it first
                         // when actually taken is the one that wins.
                         self.stack[sp] = .{ .pc = t[1], .start = start, .slots = slots };
+                        self.stack_mask[sp] = mask;
                         sp += 1;
-                        if (!self.tryEnter(gen, t[0])) continue :next_path;
+                        if (!self.tryEnter(gen, t[0], mask)) continue :next_path;
                         pc = t[0];
                     },
-                    .save, .set_pos => |s| {
+                    .save => |s| {
                         slots = try self.prepend(slots, s, pos);
-                        if (!self.tryEnter(gen, pc + 1)) continue :next_path;
+                        if (!self.tryEnter(gen, pc + 1, mask)) continue :next_path;
+                        pc += 1;
+                    },
+                    .set_pos => |s| {
+                        slots = try self.prepend(slots, s, pos);
+                        // This loop's iteration now starts here, which is
+                        // just what the guard below tests. Setting the bit
+                        // keeps the rest of this path distinct from one that
+                        // reached the same instructions mid-iteration.
+                        const b = self.guard_bit[s];
+                        if (b != 0) mask |= @as(u8, 1) << @intCast(b - 1);
+                        if (!self.tryEnter(gen, pc + 1, mask)) continue :next_path;
                         pc += 1;
                     },
                     .exit_if_same => |g| {
                         // An empty iteration ends the loop, keeping whatever
                         // it captured, rather than failing the path.
                         const next = if (slotLookup(slots, g.slot) == pos) g.target else pc + 1;
-                        if (!self.tryEnter(gen, next)) continue :next_path;
+                        if (!self.tryEnter(gen, next, mask)) continue :next_path;
                         pc = next;
                     },
                     .assert => |a| {
                         if (!common.assertHolds(a, self.input, pos)) continue :next_path;
-                        if (!self.tryEnter(gen, pc + 1)) continue :next_path;
+                        if (!self.tryEnter(gen, pc + 1, mask)) continue :next_path;
                         pc += 1;
                     },
                     // Consuming instructions and `match` land in the list.
@@ -144,18 +190,46 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // One mask bit per empty-loop guard, so that threads which disagree
+    // about whether the current iteration started here stay distinct; see
+    // `Ctx.tryEnter`. Programs without such a loop get `key_shift == 0` and
+    // the same single mark per instruction as before.
+    const guard_bit = try arena.alloc(u8, prog.slot_count);
+    @memset(guard_bit, 0);
+    var guard_count: u8 = 0;
+    for (prog.insts) |inst| {
+        if (inst != .exit_if_same) continue;
+        const s = inst.exit_if_same.slot;
+        // Past the ceiling the extra guards share the coarser key: the
+        // visited table would otherwise double in size for each one, and a
+        // pattern with that many nullable loops is already pathological.
+        if (guard_bit[s] == 0 and guard_count < max_guard_bits) {
+            guard_count += 1;
+            guard_bit[s] = guard_count;
+        }
+    }
+    const key_shift: u5 = @intCast(guard_count);
+    // Instructions times guard masks: how many distinct threads a single
+    // position can hold. Without a guard this is just the instruction count.
+    const keys = n << key_shift;
+
     var ctx = Ctx{
         .prog = prog,
         .input = input,
         .arena = arena,
-        .seen = try arena.alloc(u32, n),
-        // One stack entry per split actually processed, plus the seed.
-        .stack = try arena.alloc(Thread, n + 1),
+        .seen = try arena.alloc(u32, keys),
+        // One stack entry per split actually processed, plus the seed. A
+        // split can be processed once per guard mask, not just once per
+        // instruction, so this is sized in keys too.
+        .stack = try arena.alloc(Thread, keys + 1),
+        .stack_mask = try arena.alloc(u8, keys + 1),
+        .guard_bit = guard_bit,
+        .key_shift = key_shift,
     };
     @memset(ctx.seen, 0);
 
-    var clist = ThreadList{ .items = try arena.alloc(Thread, n) };
-    var nlist = ThreadList{ .items = try arena.alloc(Thread, n) };
+    var clist = ThreadList{ .items = try arena.alloc(Thread, keys) };
+    var nlist = ThreadList{ .items = try arena.alloc(Thread, keys) };
 
     const pf = &prog.prefilter;
     var gen: u32 = 1;

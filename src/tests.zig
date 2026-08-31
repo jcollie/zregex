@@ -443,11 +443,7 @@ test "dfa and pike agree on every match and capture" {
                 defer ma.deinit(gpa);
                 var mb = b.?;
                 defer mb.deinit(gpa);
-                // For an empty-bodied loop the engines legitimately differ on
-                // whether the final empty iteration's captures are kept (see
-                // src/fuzz.zig); their match spans still agree.
-                const n = if (re.has_loop_guard) 1 else mb.groups.len;
-                std.testing.expectEqualSlices(?zregex.Span, mb.groups[0..n], ma.groups[0..n]) catch |err| {
+                std.testing.expectEqualSlices(?zregex.Span, mb.groups, ma.groups) catch |err| {
                     std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
                     return err;
                 };
@@ -667,11 +663,7 @@ fn jitDifferential() !void {
                 defer ma.deinit(gpa);
                 var mb = b.?;
                 defer mb.deinit(gpa);
-                // For an empty-bodied loop the engines legitimately differ on
-                // whether the final empty iteration's captures are kept (see
-                // src/fuzz.zig); their match spans still agree.
-                const n = if (re.has_loop_guard) 1 else mb.groups.len;
-                std.testing.expectEqualSlices(?zregex.Span, mb.groups[0..n], ma.groups[0..n]) catch |err| {
+                std.testing.expectEqualSlices(?zregex.Span, mb.groups, ma.groups) catch |err| {
                     std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
                     return err;
                 };
@@ -807,4 +799,77 @@ test "searching from inside a multi-byte codepoint" {
             }
         }
     }
+}
+
+test "an empty loop iteration keeps its captures, on every engine" {
+    // PCRE and Python run a final iteration that consumes nothing, so the
+    // group ends up holding the empty span where the loop stopped rather than
+    // the last one that consumed something. The Pike VM used to report the
+    // latter: two threads sharing an instruction can disagree about whether
+    // the current iteration began at this position, and deduplicating on the
+    // instruction alone dropped the higher-priority path that ran the empty
+    // iteration. `\s(b|.??)*` also had the wrong *span* for the same reason.
+    const cases = [_]struct {
+        pat: []const u8,
+        hay: []const u8,
+        want: []const ?zregex.Span,
+    }{
+        .{ .pat = "(a*)*", .hay = "aa", .want = &.{ .{ .start = 0, .end = 2 }, .{ .start = 2, .end = 2 } } },
+        .{ .pat = "(a|)*", .hay = "aa", .want = &.{ .{ .start = 0, .end = 2 }, .{ .start = 2, .end = 2 } } },
+        .{ .pat = "(a*)*b", .hay = "aab", .want = &.{ .{ .start = 0, .end = 3 }, .{ .start = 2, .end = 2 } } },
+        .{ .pat = "(a*)+", .hay = "aa", .want = &.{ .{ .start = 0, .end = 2 }, .{ .start = 2, .end = 2 } } },
+        .{
+            .pat = "(a*)*(b*)*",
+            .hay = "aab",
+            .want = &.{ .{ .start = 0, .end = 3 }, .{ .start = 2, .end = 2 }, .{ .start = 3, .end = 3 } },
+        },
+        .{ .pat = "\\s(b|.??)*", .hay = " ba", .want = &.{ .{ .start = 0, .end = 2 }, .{ .start = 2, .end = 2 } } },
+        .{ .pat = "(|a)*", .hay = "aa", .want = &.{ .{ .start = 0, .end = 0 }, .{ .start = 0, .end = 0 } } },
+        .{ .pat = "(a?)*", .hay = "b", .want = &.{ .{ .start = 0, .end = 0 }, .{ .start = 0, .end = 0 } } },
+    };
+    for (cases) |c| {
+        for ([_]enum { pike, backtrack, jit }{ .pike, .backtrack, .jit }) |which| {
+            var re = try Regex.compile(gpa, c.pat);
+            defer re.deinit();
+            re.dfa_mode = .off;
+            switch (which) {
+                .jit => {
+                    re.jit_mode = .on;
+                    if (re.jit_code == null) continue;
+                },
+                .pike => {
+                    re.jit_mode = .off;
+                    re.fallback_engine = .pike;
+                },
+                .backtrack => {
+                    re.jit_mode = .off;
+                    re.fallback_engine = .backtrack;
+                },
+            }
+            const m = (try re.find(gpa, c.hay)) orelse {
+                std.debug.print("pattern={s} on {s}: no match\n", .{ c.pat, c.hay });
+                return error.TestUnexpectedResult;
+            };
+            var mm = m;
+            defer mm.deinit(gpa);
+            std.testing.expectEqualSlices(?zregex.Span, c.want, mm.groups) catch |err| {
+                std.debug.print("pattern={s} haystack={s} engine={t}\n", .{ c.pat, c.hay, which });
+                return err;
+            };
+        }
+    }
+}
+
+test "a backreference to the group enclosing it" {
+    // PCRE treats a group as unavailable while it is open, so `\1` inside
+    // group 1 fails there; zregex reads the value that group captured on its
+    // last completed iteration. PCRE is not self-consistent about this — it
+    // matches `1(\1*)` but not `1(2|\1*)`, which differ only in which
+    // alternative comes first — and Python rejects the construct outright as
+    // a reference to an open group. These pin zregex's answer rather than
+    // claiming PCRE agrees; see the README.
+    try expectFind("(a\\1)", "a", null);
+    try expectFind("1(\\1*)", "1", "1");
+    try expectFind("1(2|\\1*)", "1", "1");
+    try expectFind("(|[a]\\1)+1", "a1", "a1");
 }

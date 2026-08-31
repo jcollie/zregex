@@ -275,12 +275,19 @@ instead of `.jit`, and matches and captures are identical either way. Check
 - **Leftmost-greedy** (PCRE/Perl-style) matching; alternation prefers the left
   branch. Captures persist across repeat iterations (PCRE, not JS, semantics).
 - `\d \w \s`, case folding, and `\b` are **ASCII-only**.
-- Lookarounds are atomic; a backreference to an unset group matches empty.
+- Lookarounds are atomic. A backreference to a group that has not captured
+  fails, as in PCRE; JavaScript is the odd one out in matching empty.
+- A backreference to the group that *encloses* it, as in `(a|x\1)`, reads that
+  group's value from its last completed iteration, and fails before there has
+  been one. PCRE instead treats the enclosing group as unavailable while it is
+  open — though not consistently, since it matches `1(\1*)` and fails
+  `1(2|\1*)`, which differ only in the order of the alternatives. Python
+  rejects the construct outright.
 - A loop iteration that consumes nothing ends the loop rather than failing, so
-  `(a*?)*` matches empty as PCRE and Python do. Whether such an iteration's
-  captures are kept is where backtracking and automaton engines differ, so
-  patterns containing an empty-bodied loop are pinned to a single engine and
-  always answer consistently.
+  `(a*?)*` matches empty and `(a*)*` against `aa` reports group 1 as the empty
+  span at 2 — as PCRE and Python do. Every engine agrees; patterns with an
+  empty-bodied loop are simply kept off the lazy DFA, whose states cannot
+  carry the position an iteration began at.
 - Backreferences to a group require the group to appear earlier in the pattern.
 
 ## Building

@@ -78,14 +78,12 @@ pub const Regex = struct {
     alphabet: compiler.Alphabet,
     /// Whether the program guards an empty-bodied loop.
     ///
-    /// Deciding the guard needs the position a thread recorded, which the DFA
-    /// does not carry, so such patterns stay off it. They also stay off the
-    /// JIT: whether a loop iteration that consumes nothing leaves its
-    /// captures behind, and how its alternatives are ordered against the rest
-    /// of the loop, is where backtracking and automaton engines part company.
-    /// Pinning these patterns to one engine keeps results consistent — and
-    /// keeps the linear-time guarantee, which routing them to a backtracker
-    /// would give up.
+    /// Every engine agrees on these patterns, but not every engine can run
+    /// them. Deciding the guard needs the position the current iteration
+    /// began at, which the lazy DFA does not carry through its states, so
+    /// such patterns stay off it. They also stay off the JIT by default:
+    /// `(a*)*b` is the textbook exponential case for a backtracker, and the
+    /// Pike VM answers it in linear time.
     has_loop_guard: bool = false,
     /// Lazy DFA policy. `.auto` uses the DFA only when the byte prefilter is
     /// weak (a broad or unusable candidate set) — when the prefilter is
@@ -345,12 +343,11 @@ pub const Regex = struct {
     /// prefilter is selective enough that few start positions are ever tried.
     fn jitIsDefault(self: *const Regex) bool {
         if (self.jit_code == null) return false;
-        // A loop whose body can match empty is the one place the backtracking
-        // and automaton engines genuinely differ (see `has_loop_guard`), so
-        // such patterns are kept on a single engine and the difference never
-        // becomes visible. When there is a linear engine that can run it, it
-        // wins; behind a backreference or lookaround there is not, and the
-        // JIT and the backtracker agree with each other anyway.
+        // A loop whose body can match empty is the textbook exponential case
+        // for a backtracker — `(a*)*b` against a run of a's — so it goes to
+        // the Pike VM whenever that engine can run it at all. Behind a
+        // backreference or lookaround it cannot, and native code is then the
+        // best available.
         if (self.has_loop_guard and self.fallback_engine == .pike) return false;
         // Native code runs when its backtracking is structurally bounded (see
         // `jit.backtrackingIsBounded`). Behind a backreference or lookaround

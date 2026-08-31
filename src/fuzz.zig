@@ -50,16 +50,11 @@ const Config = struct {
     apply: *const fn (*Regex) void,
     /// Whether this configuration can run a pattern needing the backtracker.
     handles_backtrack_only: bool,
-    /// Which implementation strategy this is. The two families agree on
-    /// everything except empty-bodied loops, where `Regex` picks one family
-    /// and sticks to it, so the oracle compares within a family there.
-    family: enum { backtracking, automaton },
 };
 
 const configs = [_]Config{
     .{
         .name = "jit",
-        .family = .backtracking,
         .handles_backtrack_only = true,
         .apply = struct {
             fn f(re: *Regex) void {
@@ -69,7 +64,6 @@ const configs = [_]Config{
     },
     .{
         .name = "dfa",
-        .family = .automaton,
         .handles_backtrack_only = false,
         .apply = struct {
             fn f(re: *Regex) void {
@@ -80,7 +74,6 @@ const configs = [_]Config{
     },
     .{
         .name = "pike",
-        .family = .automaton,
         .handles_backtrack_only = false,
         .apply = struct {
             fn f(re: *Regex) void {
@@ -91,7 +84,6 @@ const configs = [_]Config{
     },
     .{
         .name = "backtrack",
-        .family = .backtracking,
         .handles_backtrack_only = true,
         .apply = struct {
             fn f(re: *Regex) void {
@@ -105,7 +97,6 @@ const configs = [_]Config{
     },
     .{
         .name = "backtrack-nomemo",
-        .family = .backtracking,
         .handles_backtrack_only = true,
         .apply = struct {
             fn f(re: *Regex) void {
@@ -147,13 +138,10 @@ fn checkInvariants(
 /// Every match in `haystack`, flattened to spans so the results of two
 /// configurations can be compared directly.
 ///
-/// `groups_too` is false for patterns with an empty-bodied loop, where the
-/// engines legitimately differ on one detail — see `oneCase`.
 fn collect(
     gpa: std.mem.Allocator,
     re: *const Regex,
     haystack: []const u8,
-    groups_too: bool,
     out: *std.ArrayList(?Span),
 ) !void {
     var it = re.iterator(gpa, haystack);
@@ -165,11 +153,7 @@ fn collect(
         defer mm.deinit(gpa);
         try checkInvariants(re, haystack, mm, prev_end);
         prev_end = mm.span().end;
-        if (groups_too) {
-            try out.appendSlice(gpa, mm.groups);
-        } else {
-            try out.append(gpa, mm.groups[0]);
-        }
+        try out.appendSlice(gpa, mm.groups);
         count += 1;
         // A pathological pattern should not turn one fuzz case into a hang;
         // agreement over the first matches is just as strong a signal.
@@ -215,24 +199,9 @@ fn oneCase(src: Source) anyerror!void {
 
     const needs_backtrack = re.fallback_engine == .backtrack;
 
-    // Whether a loop iteration that consumes nothing leaves its captures
-    // behind is where backtracking and automaton engines genuinely part
-    // company, and neither is wrong. For `(a*)*` against "aa", PCRE and
-    // Python run a final empty iteration and report group 1 as (2,2); RE2 and
-    // Go report (0,2), because a Pike VM cannot re-enter a loop body at a
-    // position it has already visited — the very rule that stops it looping
-    // forever. zregex inherits both behaviors from its two engine families,
-    // so for these patterns the oracle checks match spans, which do agree,
-    // and leaves the captures of empty iterations alone.
-    // With an empty-bodied loop the two families disagree by design, and
-    // `Regex` never mixes them for such a pattern, so compare within a family.
-    const per_family = re.has_loop_guard;
-    const compare_groups = !re.has_loop_guard;
-
     var reference: std.ArrayList(?Span) = .empty;
     defer reference.deinit(gpa);
     var reference_name: []const u8 = "";
-    var reference_family: @TypeOf(configs[0].family) = .backtracking;
 
     var actual: std.ArrayList(?Span) = .empty;
     defer actual.deinit(gpa);
@@ -253,7 +222,7 @@ fn oneCase(src: Source) anyerror!void {
         var probe = re;
         cfg.apply(&probe);
         actual.clearRetainingCapacity();
-        collect(gpa, &probe, hay.items, compare_groups, &actual) catch |err| switch (err) {
+        collect(gpa, &probe, hay.items, &actual) catch |err| switch (err) {
             error.StepLimitExceeded => continue :configs,
             else => return err,
         };
@@ -278,9 +247,8 @@ fn oneCase(src: Source) anyerror!void {
             }
         }
 
-        if (reference_name.len == 0 or (per_family and cfg.family != reference_family)) {
+        if (reference_name.len == 0) {
             reference_name = cfg.name;
-            reference_family = cfg.family;
             reference.clearRetainingCapacity();
             try reference.appendSlice(gpa, actual.items);
             continue;

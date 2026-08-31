@@ -120,3 +120,43 @@ budget is what `pathological` shows: `(a+)+$` spends a bounded number of
 native steps, bails, and the Pike VM answers — 0.26 ms instead of PCRE2's
 hard error or Python's 283 ms. Costs remain flat and predictable where
 backtrackers swing wildly in both directions.
+
+## Across platforms
+
+`.github/workflows/ci.yaml` runs this harness on every platform the JIT has a
+distinct path for, with `--builtin` so each measures a corpus generated from
+the same seed. Times in ms, best of 5, on GitHub-hosted runners — shared and
+noisy, so read the columns against each other rather than against the tuned
+numbers above:
+
+| benchmark    | x86-64 linux | aarch64 linux | aarch64 macOS | x86-64 Windows |
+|--------------|-------------:|--------------:|--------------:|---------------:|
+| literal      | 2.8          | 3.1           | 4.1           | 8.7            |
+| ci_literal   | 5.1          | 3.2           | 4.2           | 10.3           |
+| date         | 4.4          | 2.7           | 2.7           | 12.7           |
+| email        | 8.4          | 9.2           | 8.6           | 48.6           |
+| alt          | 19.5         | 15.5          | 17.9          | 38.6           |
+| ing_suffix   | 18.1         | 17.4          | 16.9          | 82.4           |
+| spanning     | 0.15         | 0.33          | 0.12          | 0.60           |
+| groups       | 10.1         | 10.1          | 8.2           | 46.4           |
+| lookahead    | 8.1          | 8.8           | 8.1           | 69.4           |
+| backref      | 12.0         | 11.0          | 13.9          | 77.8           |
+| pathological | 0.01         | 0.01          | 0.01          | 0.01           |
+| **engine**   | jit          | jit           | jit           | pike/backtrack |
+
+Match counts are identical in all four columns, across two architectures,
+three operating systems, and both the native-code and interpreter paths.
+
+Windows has no JIT — there is no equivalent there of the mapping dance the
+others do — so its column is the same code with the interpreters doing all
+the work, which makes it an unintentionally clean measure of what the JIT is
+worth: 4-6x on the repeat-heavy rows (`ing_suffix` 82 against 18, `email` 49
+against 8, `backref` 78 against 12), and nothing at all on `pathological`,
+where the lazy DFA was always the one answering.
+
+The aarch64 macOS column is the first execution of the `MAP_JIT` path
+anywhere: `jit_available=true`, and every row selected the JIT, so Apple's
+contract is being satisfied. Note that GitHub's runners execute unsigned
+processes; a shipping app under the hardened runtime still needs the
+`com.apple.security.cs.allow-jit` entitlement, and without it these rows
+would look like the Windows column rather than fail.

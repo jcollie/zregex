@@ -60,18 +60,138 @@ or inline: `(?i)`, `(?m)`, `(?s)` — see below.
 
 ## Supported syntax
 
-- Literals, `.`, alternation `|`, groups `(...)`, `(?:...)`, named groups
-  `(?<name>...)` / `(?P<name>...)` / `(?'name'...)`
-- Quantifiers `*` `+` `?` `{n}` `{n,}` `{n,m}` (max count 1000), lazy variants (`*?` …)
-- Classes `[a-z]`, `[^...]`, shorthands `\d \D \w \W \s \S` (also inside classes)
-- Anchors `^` `$` `\A` `\z`, boundaries `\b` `\B`
-- Escapes `\n \r \t \f \v \a \e \0`, `\xHH`, `\x{...}`, `\uHHHH`, `\u{...}`,
-  identity escapes for punctuation
-- Backreferences `\1`…`\99`, `\k<name>` *(backtracking engine)*
-- Lookaround `(?=)` `(?!)` `(?<=)` `(?<!)` — lookbehind may be
-  variable-length *(backtracking engine)*
-- Inline flags `(?ims)` / `(?-ims)` (effective until the end of the enclosing
-  group) and scoped groups `(?ims-ims:...)`
+### Writing patterns in Zig source
+
+Zig's normal `"..."` string literals process escapes, so every regex
+backslash must be doubled: the pattern `\d+\.\d+` is written
+`"\\d+\\.\\d+"`. Zig's multiline string literals do **no** escape
+processing, which makes them the nicest way to write non-trivial patterns —
+what you see is exactly the pattern:
+
+```zig
+var re = try Regex.compile(gpa,
+    \\(?<user>\w+)@(?<host>[\w.]+)
+);
+```
+
+The tables below show each pattern both ways. To match one literal backslash
+the regex is `\\`, which becomes `"\\\\"` in a quoted literal (four
+backslashes) — or a `\\\\` multiline line (the first two introduce the line).
+
+### Literals and escapes
+
+| Syntax | Matches | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `a`, `é`, `😀` | that codepoint (patterns are UTF-8) | `héllo` matches `héllo` | `"héllo"` |
+| `\n` `\r` `\t` `\f` `\v` `\a` `\e` `\0` | newline, CR, tab, FF, VT, bell, ESC, NUL | `foo\tbar` | `"foo\\tbar"` |
+| `\xHH` | codepoint from two hex digits | `\x41` matches `A` | `"\\x41"` |
+| `\x{...}`, `\u{...}` | codepoint from hex, up to `10FFFF` | `\x{1F600}+` matches `😀😀` | `"\\x{1F600}+"` |
+| `\uHHHH` | codepoint from four hex digits | `\u0041` matches `A` | `"\\u0041"` |
+| `\.` `\*` `\(` `\\` … | that punctuation character, literally | `3\.14` matches `3.14` | `"3\\.14"` |
+
+Escaping a letter or digit that has no defined meaning (say `\q`) is a
+compile error rather than silently matching `q`.
+
+### Character classes
+
+| Syntax | Matches | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `.` | any codepoint except `\n` (including `\n` under the `s` flag) | `a.c` matches `aéc` | `"a.c"` |
+| `[abc]` | any listed codepoint | `[nd]ope` matches `dope` | `"[nd]ope"` |
+| `[a-z0-9]` | codepoint ranges | `[a-fA-F0-9]+` matches `DEADbeef` | `"[a-fA-F0-9]+"` |
+| `[^...]` | anything *not* in the class | `"[^"]*"` matches `"hi"` | `"\"[^\"]*\""` |
+| `[]x]`, `[-x]`, `[x-]` | `]` first in a class and `-` at either edge are literal | `[]x]+` matches `]x]` | `"[]x]+"` |
+| `\d` / `\D` | ASCII digit / non-digit | `\d{4}` matches `2026` | `"\\d{4}"` |
+| `\w` / `\W` | ASCII word char `[A-Za-z0-9_]` / complement | `\w+` matches `hi_there2` | `"\\w+"` |
+| `\s` / `\S` | ASCII whitespace / complement | `\S+` matches `x9!` | `"\\S+"` |
+| `[\d\s]` | shorthands compose inside classes | `[^\d\s]+` matches `abc` | `"[^\\d\\s]+"` |
+| `[\b]` | backspace (U+0008) — only inside a class | | `"[\\b]"` |
+
+### Anchors and boundaries
+
+All of these are zero-width: they match a position, not text.
+
+| Syntax | Matches at | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `^` | start of text (start of line under the `m` flag) | `^abc` | `"^abc"` |
+| `$` | end of text (end of line under the `m` flag) | `abc$` | `"abc$"` |
+| `\A` / `\z` | start / end of text, regardless of `m` | `\Aabc\z` | `"\\Aabc\\z"` |
+| `\b` / `\B` | word boundary / non-boundary | `\bcat\b` matches `cat` in `the cat.` but not in `concat` | `"\\bcat\\b"` |
+
+### Quantifiers
+
+Greedy by default; append `?` for the lazy (shortest-first) variant.
+Counted repeats are capped at 1000.
+
+| Syntax | Matches | Example on `aaaa` | As a Zig `"..."` literal |
+|---|---|---|---|
+| `x*` / `x*?` | zero or more | `a*` matches `aaaa` | `"a*"` |
+| `x+` / `x+?` | one or more | `a+?` matches `a` | `"a+?"` |
+| `x?` / `x??` | zero or one | `colou?r` matches both spellings | `"colou?r"` |
+| `x{3}` | exactly n | `a{3}` matches `aaa` | `"a{3}"` |
+| `x{2,5}` / `x{2,5}?` | n through m | `a{2,3}` matches `aaa` | `"a{2,3}"` |
+| `x{2,}` | n or more | `a{2,}` matches `aaaa` | `"a{2,}"` |
+
+A `{` that does not form a valid quantifier is a literal (PCRE behavior):
+`a{x}` matches the four characters `a{x}`. Double quantifiers (`a**`) and
+possessive quantifiers (`a*+`) are errors.
+
+### Alternation and groups
+
+| Syntax | Meaning | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `x\|y` | `x` or `y`, preferring `x` | `cat\|dog` finds `cat` in `catalog` | `"cat\|dog"` |
+| `(...)` | capture group, numbered from 1 by `(` order (0 is the whole match) | `(a\|b)+c` on `abac` captures `a` | `"(a\|b)+c"` |
+| `(?:...)` | group without capturing | `(?:ab)+` | `"(?:ab)+"` |
+| `(?<name>...)` | named capture (also `(?P<name>...)`, `(?'name'...)`) | `(?<year>\d{4})-(?<month>\d{2})` | `"(?<year>\\d{4})-(?<month>\\d{2})"` |
+
+Look up a named group's index with `re.groupIndex("year")`.
+
+### Backreferences *(backtracking engine)*
+
+| Syntax | Matches | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `\1` … `\99` | the same text group n captured | `(\w+) \1` matches `go go` | `"(\\w+) \\1"` |
+| `\k<name>` | same, by name | `(?<q>['"]).*?\k<q>` matches a quoted span | `"(?<q>['\"]).*?\\k<q>"` |
+
+Comparison honors `(?i)`. A backref to a group that has not participated
+matches the empty string (JavaScript semantics); referring to a group that
+appears later in the pattern is a compile error.
+
+### Lookaround *(backtracking engine)*
+
+Zero-width; matched (or rejected) without consuming input. Lookarounds are
+atomic: once one succeeds, backtracking cannot re-enter it to try a
+different sub-match.
+
+| Syntax | Succeeds when | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `(?=x)` | `x` matches next | `\w+(?=@)` matches `jeff` in `jeff@host` | `"\\w+(?=@)"` |
+| `(?!x)` | `x` does not match next | `a(?!b)` matches the `a` in `ac` | `"a(?!b)"` |
+| `(?<=x)` | `x` ends here | `(?<=\$)\d+` matches `42` in `$42` | `"(?<=\\$)\\d+"` |
+| `(?<!x)` | `x` does not end here | `(?<!\$)\b\d+` | `"(?<!\\$)\\b\\d+"` |
+
+Lookbehind may be variable-length (`(?<=ab+)c` works), which PCRE does not
+allow.
+
+### Inline flags
+
+| Syntax | Meaning | Example | As a Zig `"..."` literal |
+|---|---|---|---|
+| `(?i)` `(?m)` `(?s)` | set case-insensitive / multiline / dot-matches-newline from here to the end of the enclosing group | `(?i)hello` matches `HeLLo` | `"(?i)hello"` |
+| `(?-ims)` | clear flags | `a(?-i)b` under `case_insensitive` requires exact-case `b` | `"a(?-i)b"` |
+| `(?ims-ims:...)` | flags scoped to the group | `(?i:zig) rocks` matches `ZIG rocks` | `"(?i:zig) rocks"` |
+
+Flag changes persist across `\|` until the enclosing group closes (PCRE
+semantics). The same three flags can be set for the whole pattern via
+`compileWithFlags`.
+
+### Not supported
+
+Possessive quantifiers (`a*+`), atomic groups (`(?>...)`), Unicode property
+classes (`\p{...}`), extended/whitespace mode (`(?x)`), octal escapes,
+`\Q...\E` quoting, conditionals, and recursion. All reject at compile time
+with a clear error rather than misbehaving.
 
 ## Semantics
 

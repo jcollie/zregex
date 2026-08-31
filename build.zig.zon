@@ -11,7 +11,9 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "tools",
         "LICENSES",
         "README.md",
+        "REUSE.toml",
     },
 }

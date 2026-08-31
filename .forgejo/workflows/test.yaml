@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+# Runs the test suite on every push, and publishes the API documentation
+# to https://jeff.ocj.page/zregex/ when the push was to main.
+#
+# The documentation is only published from main, so that a branch build
+# cannot replace the site with a work in progress. Everything goes
+# through `nix develop`, so the toolchain is the one in flake.nix rather
+# than whatever the runner happens to carry, and the two Zig cache
+# directories point at persistent storage on the runner so that a rebuild
+# does not start from nothing every time.
+
+name: test
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  ZIG_LOCAL_CACHE_DIR: /zig/local-cache
+  ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
+
+jobs:
+  test:
+    runs-on: nixos
+    steps:
+      - name: Check out
+        # Pinned to a commit rather than a tag, in the format pinact
+        # writes, so that what runs here cannot change under a moved tag.
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check formatting
+        run: nix develop .#default -c zig fmt --check .
+
+      - name: Check REUSE compliance
+        run: nix develop .#default -c reuse lint
+
+      - name: Run tests
+        run: nix develop .#default -c zig build test
+
+      - name: Build the benchmark harness
+        # Compile check only; the comparative benchmarks themselves need a
+        # quiet machine and are run by hand (see bench/run.sh).
+        run: nix develop .#default -c zig build bench
+
+  docs:
+    needs: test
+    if: ${{ forge.ref == 'refs/heads/main' }}
+    runs-on: nixos
+    steps:
+      - name: Check out
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build API docs
+        run: nix develop .#default -c zig build docs
+
+      - name: Publish docs
+        run: >
+          nix develop .#default -c git-pages-cli https://jeff.ocj.page/zregex/
+          --server ocj.page
+          --token ${{ forge.token }}
+          --upload-dir zig-out/docs

@@ -138,5 +138,6 @@ jobs:
 
       # Compiling for every target catches platform code that only breaks
       # under semantic analysis, which is how the Windows build broke once.
-      - name: Compile tests
-        run: zig test --test-no-exec -target ${{ matrix.target }} src/root.zig
+      # Through the build system, so that per-target module wiring applies.
+      - name: Compile for target
+        run: zig build check -Dtarget=${{ matrix.target }}

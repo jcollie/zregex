@@ -57,6 +57,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Compiles everything for the chosen target without running any of it,
+    // which is how cross-target coverage is checked. It goes through the
+    // build system rather than `zig test -target ...` so that per-target
+    // module wiring — the Win32 bindings, for one — is in place.
+    const check_step = b.step("check", "Compile everything for the target without running it");
+    check_step.dependOn(&mod_tests.step);
+    check_step.dependOn(&exe_tests.step);
+    check_step.dependOn(&exe.step);
+
     // API documentation. Autodocs are emitted as a static site: index.html,
     // the viewer's wasm and javascript, and the sources it reads from.
     const docs_library = b.addLibrary(.{

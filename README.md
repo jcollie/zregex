@@ -211,6 +211,31 @@ classes (`\p{...}`), extended/whitespace mode (`(?x)`), octal escapes,
 `\Q...\E` quoting, conditionals, and recursion. All reject at compile time
 with a clear error rather than misbehaving.
 
+## Platform support
+
+The library itself is pure Zig and runs anywhere Zig does. The JIT is the
+only part that cares where it is:
+
+| Platform | JIT |
+|---|---|
+| Linux / BSD, x86-64 and aarch64 | yes |
+| macOS, Apple Silicon | yes, with the entitlement below |
+| macOS, Intel | yes |
+| anything else | no — the interpreters run instead |
+
+On Apple platforms the code is mapped with `MAP_JIT` and made writable per
+thread with `pthread_jit_write_protect_np`, because Apple Silicon enforces
+W^X in hardware and rejects the `mprotect` transition used elsewhere. A
+process using the **hardened runtime** must carry the
+`com.apple.security.cs.allow-jit` entitlement for that mapping to be granted;
+without it zregex falls back to `mprotect`, which is usually enough on Intel
+but not on Apple Silicon.
+
+Every one of those failures is graceful. If a mapping is refused, the pattern
+simply has no native code: `Regex.engine` reports `.pike` or `.backtrack`
+instead of `.jit`, and matches and captures are identical either way. Check
+`Regex.engine` if you want to know which one you got.
+
 ## Semantics
 
 - **UTF-8 codepoint based**: `.` and `[^x]` consume one codepoint; invalid

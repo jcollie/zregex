@@ -240,7 +240,7 @@ pub const Machine = struct {
                             matched = true;
                             break :outer;
                         },
-                        .backref, .look => unreachable, // never routed to the DFA
+                        .backref, .look, .rep => unreachable, // never routed to the DFA
                     }
                 }
             }

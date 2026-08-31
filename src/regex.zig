@@ -108,10 +108,11 @@ pub const Regex = struct {
         };
         const root = try p.parse();
 
-        const counts = try compiler.count(nodes[0..p.nodes_len], root, p.group_count);
+        const bt = p.has_backref or p.has_look;
+        const counts = try compiler.count(nodes[0..p.nodes_len], root, p.group_count, bt);
         const insts = try gpa.alloc(compiler.Inst, counts.insts);
         errdefer gpa.free(insts);
-        try compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, insts);
+        try compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, bt, insts);
 
         const ranges = try gpa.dupe(common.ClassRange, ranges_tmp[0..p.ranges_len]);
         errdefer gpa.free(ranges);
@@ -184,10 +185,11 @@ pub const Regex = struct {
             };
             const root = p.parse() catch |e|
                 @compileError("zregex: invalid pattern \"" ++ pattern ++ "\": " ++ @errorName(e));
-            const counts = compiler.count(nodes[0..p.nodes_len], root, p.group_count) catch |e|
+            const bt = p.has_backref or p.has_look;
+            const counts = compiler.count(nodes[0..p.nodes_len], root, p.group_count, bt) catch |e|
                 @compileError("zregex: cannot compile \"" ++ pattern ++ "\": " ++ @errorName(e));
             var insts: [counts.insts]compiler.Inst = undefined;
-            compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, &insts) catch unreachable;
+            compiler.emitInto(nodes[0..p.nodes_len], root, p.group_count, bt, &insts) catch unreachable;
 
             // Copy into consts so the returned slices refer to static memory.
             const final_insts: [counts.insts]compiler.Inst = insts;

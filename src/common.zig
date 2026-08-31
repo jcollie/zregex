@@ -39,6 +39,7 @@ pub const DecodeResult = struct {
 /// single-byte codepoint (latin-1 style) so matching never fails mid-haystack.
 pub fn decode(input: []const u8, pos: usize) DecodeResult {
     const b = input[pos];
+    if (b < 0x80) return .{ .cp = b, .len = 1 }; // ASCII fast path
     const len = std.unicode.utf8ByteSequenceLength(b) catch return .{ .cp = b, .len = 1 };
     if (pos + len > input.len) return .{ .cp = b, .len = 1 };
     const cp = std.unicode.utf8Decode(input[pos..][0..len]) catch return .{ .cp = b, .len = 1 };
@@ -49,6 +50,8 @@ pub fn decode(input: []const u8, pos: usize) DecodeResult {
 /// Uses the same single-byte fallback as `decode`.
 pub fn decodeBefore(input: []const u8, pos: usize) DecodeResult {
     std.debug.assert(pos > 0);
+    const last = input[pos - 1];
+    if (last < 0x80) return .{ .cp = last, .len = 1 }; // ASCII fast path
     var n: usize = 1;
     while (n <= 4 and n <= pos) : (n += 1) {
         const start = pos - n;

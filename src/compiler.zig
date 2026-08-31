@@ -33,6 +33,21 @@ pub const BackrefOp = struct {
     ci: bool,
 };
 
+/// Fused single-element repeat, emitted only into backtracker programs
+/// (`for_backtrack`). The repeated element is the NEXT instruction (a char,
+/// class, or any), keeping `Inst` small; execution continues at pc + 2. The
+/// interpreter consumes greedily in one tight loop and backtracking retries
+/// are a single range frame instead of one frame per iteration. The Pike VM
+/// and DFA never see this instruction.
+pub const RepOp = struct {
+    min: u32,
+    /// `unbounded` (maxInt) means no upper bound.
+    max: u32,
+    greedy: bool,
+
+    pub const unbounded = std.math.maxInt(u32);
+};
+
 pub const LookOp = struct {
     kind: parser.LookKind,
     /// pc of the sub-program, which ends with its own `match`.
@@ -59,6 +74,8 @@ pub const Inst = union(enum) {
     backref: BackrefOp,
     /// Zero-width lookaround running a sub-program.
     look: LookOp,
+    /// Fused repeat (backtracker programs only).
+    rep: RepOp,
     /// Scratch slot write, guards empty-body loops.
     set_pos: u16,
     /// Kill this path if no progress since `set_pos` on the same slot.
@@ -88,6 +105,8 @@ pub const Counts = struct {
 pub const Compiler = struct {
     nodes: []const parser.Node,
     counting: bool,
+    /// Emit backtracker-only instructions (fused repeats).
+    for_backtrack: bool,
     insts: []Inst,
     len: u32 = 0,
     next_slot: u16,
@@ -145,6 +164,17 @@ pub const Compiler = struct {
                 self.patchJmp(j, self.len);
             },
             .repeat => |r| {
+                if (self.for_backtrack) {
+                    if (self.fusableChild(r.child)) |child_inst| {
+                        _ = try self.emit(.{ .rep = .{
+                            .min = r.min,
+                            .max = r.max orelse RepOp.unbounded,
+                            .greedy = r.greedy,
+                        } });
+                        _ = try self.emit(child_inst);
+                        return;
+                    }
+                }
                 var i: u32 = 0;
                 while (i < r.min) : (i += 1) try self.emitNode(r.child);
                 if (r.max) |m| {
@@ -173,6 +203,27 @@ pub const Compiler = struct {
                 _ = try self.emit(.{ .look = .{ .kind = l.kind, .target = sub } });
             },
         }
+    }
+
+    /// A repeat body that is a single codepoint test can be fused; unwrap
+    /// non-capturing groups on the way (captures inside a repeat cannot fuse).
+    fn fusableChild(self: *Self, idx: parser.NodeIndex) ?Inst {
+        var i = idx;
+        while (true) switch (self.nodes[i]) {
+            .group => |g| {
+                if (g.index != null) return null;
+                i = g.child;
+            },
+            .literal => |l| return .{ .char = .{ .cp = l.cp, .ci = l.ci } },
+            .class => |cl| return .{ .class = .{
+                .start = cl.start,
+                .len = cl.len,
+                .negated = cl.negated,
+                .ci = cl.ci,
+            } },
+            .any => |nl| return if (nl) .any else .any_not_nl,
+            else => return null,
+        };
     }
 
     /// `e*` (or the unbounded tail of `e{n,}`). Bodies that can match empty
@@ -225,10 +276,12 @@ pub fn count(
     nodes: []const parser.Node,
     root: parser.NodeIndex,
     group_count: u8,
+    for_backtrack: bool,
 ) CompileError!Counts {
     var c = Compiler{
         .nodes = nodes,
         .counting = true,
+        .for_backtrack = for_backtrack,
         .insts = &.{},
         .next_slot = 2 * @as(u16, group_count),
     };
@@ -241,11 +294,13 @@ pub fn emitInto(
     nodes: []const parser.Node,
     root: parser.NodeIndex,
     group_count: u8,
+    for_backtrack: bool,
     insts: []Inst,
 ) CompileError!void {
     var c = Compiler{
         .nodes = nodes,
         .counting = false,
+        .for_backtrack = for_backtrack,
         .insts = insts,
         .next_slot = 2 * @as(u16, group_count),
     };
@@ -275,10 +330,10 @@ fn compileForTest(
         .names = &names,
     };
     const root = try p.parse();
-    const counts = try count(p.nodes[0..p.nodes_len], root, p.group_count);
+    const counts = try count(p.nodes[0..p.nodes_len], root, p.group_count, p.has_backref or p.has_look);
     const insts = try gpa.alloc(Inst, counts.insts);
     errdefer gpa.free(insts);
-    try emitInto(p.nodes[0..p.nodes_len], root, p.group_count, insts);
+    try emitInto(p.nodes[0..p.nodes_len], root, p.group_count, p.has_backref or p.has_look, insts);
     return .{ .insts = insts, .slots = counts.slots, .p = p.group_count };
 }
 
@@ -482,6 +537,12 @@ pub fn computeFirstBytes(
                 } else {
                     for (ranges[cl.start..][0..cl.len]) |r| fb.addRange(r.lo, r.hi, cl.ci);
                 }
+            },
+            .rep => |r| {
+                // The child (next instruction) supplies the first bytes.
+                push(visited, stack, &sp, pc + 1);
+                // A rep with min == 0 is skippable: what follows can also start.
+                if (r.min == 0) push(visited, stack, &sp, pc + 2);
             },
             .any, .any_not_nl, .backref => fb.bail(),
             // Match reachable without consuming: the pattern can match empty

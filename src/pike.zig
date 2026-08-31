@@ -114,7 +114,7 @@ const Ctx = struct {
                         list.append(.{ .pc = pc, .start = start, .slots = slots });
                         continue :next_path;
                     },
-                    .backref, .look => unreachable, // never routed to the Pike VM
+                    .backref, .look, .rep => unreachable, // never routed to the Pike VM
                 }
             }
         }

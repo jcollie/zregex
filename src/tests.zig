@@ -454,3 +454,32 @@ test "dfa handles findAt context correctly" {
     defer re2.deinit();
     try std.testing.expectEqual(@as(?zregex.Match, null), try re2.findAt(gpa, "yx", 1));
 }
+
+test "fused repeats in the backtracker" {
+    // Greedy gives back one codepoint at a time down to min: a{2,} must
+    // shrink from 4 to 2 so the backref can match the rest.
+    try expectGroups("(a{2,})\\1", "aaaa", &.{ "aaaa", "aa" });
+    // Bounded {n,m}.
+    try expectFind("(?=\\d)\\d{2,4}", "12345 1", "1234");
+    try expectFind("(?=\\d)\\d{2,4}x", "12345x", "2345x");
+    try expectFind("(?=\\d)\\d{2,4}", "9!", null);
+    // Lazy fused repeat grows one at a time.
+    try expectGroups("(a+?)a\\1", "aaaa", &.{ "aaa", "a" });
+    try expectFind("(?<=x).*?y", "xaay", "aay");
+    // UTF-8 child codepoints step correctly in both directions.
+    try expectFind("(?=é)é+x", "ééx", "ééx");
+    try expectFind("(é{2,})\\1", "éééé", "éééé");
+    // A capturing group inside a repeat must not fuse (captures per iteration).
+    try expectGroups("(?=a)(a)+b", "aab", &.{ "aab", "a" });
+    // Non-capturing wrapper does fuse and stays correct.
+    try expectFind("(?=a)(?:a)+b", "aab", "aab");
+    // Fused rep at the start feeds the prefilter.
+    var re = try Regex.compile(gpa, "\\d+(?=%)");
+    defer re.deinit();
+    try std.testing.expect(re.prefilter.usable);
+    try std.testing.expect(re.prefilter.bytes['5']);
+    try std.testing.expect(!re.prefilter.bytes['x']);
+    var m = (try re.find(gpa, "at 15% now")).?;
+    defer m.deinit(gpa);
+    try std.testing.expectEqualStrings("15", m.span().slice("at 15% now"));
+}

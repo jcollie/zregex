@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+# Check everything out with LF, on Windows too, so `zig fmt --check` agrees
+# across the CI matrix.
+* text=auto eol=lf

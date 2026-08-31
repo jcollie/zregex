@@ -111,4 +111,12 @@ pub fn build(b: *std.Build) void {
     });
     const bench_step = b.step("bench", "Build the benchmark harness");
     bench_step.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+
+    // Runs it too, which saves callers from knowing the executable suffix.
+    // `zig build bench-run -- --builtin` needs no corpus file.
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.stdio = .inherit;
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_run_step = b.step("bench-run", "Build and run the benchmark harness");
+    bench_run_step.dependOn(&run_bench.step);
 }

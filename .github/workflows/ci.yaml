@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+# Builds and tests across the platforms the JIT has distinct paths for, and
+# runs the benchmark on each so their numbers can be compared side by side.
+#
+# The interesting axes are the two the JIT backends split on (x86-64 versus
+# aarch64) and the two ways executable memory is obtained: mmap plus mprotect
+# on Linux, MAP_JIT plus pthread_jit_write_protect_np on Apple platforms.
+# Windows has no JIT at all and exercises the interpreter-only path, which is
+# worth keeping compiled and correct.
+#
+# The action versions below are tags; run `pinact run` to pin them to commit
+# hashes before relying on this in anger.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the others' results, which are
+      # the whole point of the matrix.
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            os: ubuntu-latest
+          - name: aarch64-linux
+            os: ubuntu-24.04-arm
+          - name: x86_64-windows
+            os: windows-latest
+          - name: aarch64-macos
+            os: macos-14
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Run benchmarks
+        shell: bash
+        # `--builtin` generates the corpus in memory from a fixed seed, so no
+        # Python is needed and every platform measures the same bytes.
+        run: |
+          zig build bench-run -- --builtin | tee bench-${{ matrix.name }}.txt
+
+      - name: Publish benchmark results
+        shell: bash
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }} (\`${{ matrix.os }}\`)"
+            echo
+            echo '| engine | benchmark | best ms | matches |'
+            echo '|---|---|---:|---:|'
+            grep -v '^#' "bench-${{ matrix.name }}.txt" |
+              awk -F'\t' '{printf "| `%s` | %s | %s | %s |\n", $1, $2, $3, $4}'
+            echo
+            echo '<details><summary>raw output</summary>'
+            echo
+            echo '```'
+            cat "bench-${{ matrix.name }}.txt"
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.name }}
+          path: bench-${{ matrix.name }}.txt
+          if-no-files-found: warn
+
+  # The x86-64 runners can still exercise the aarch64 backend through
+  # emulation, which catches encoder mistakes even if the native arm64 runner
+  # is unavailable.
+  cross:
+    name: aarch64-linux (emulated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - name: Run tests under emulation
+        run: zig build test -Dtarget=aarch64-linux-gnu -fqemu
+
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-windows
+          - aarch64-windows
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Compiling for every target catches platform code that only breaks
+      # under semantic analysis, which is how the Windows build broke once.
+      - name: Compile tests
+        run: zig test --test-no-exec -target ${{ matrix.target }} src/root.zig

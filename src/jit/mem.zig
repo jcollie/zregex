@@ -58,9 +58,8 @@ pub const supported = switch (builtin.os.tag) {
 /// cache, with barriers between. The line sizes come from CTR_EL0, which
 /// reports them as a log2 count of 4-byte words.
 fn syncInstructionCache(code: []const u8) void {
-    if (builtin.cpu.arch != .aarch64) return;
     // Apple platforms use sys_icache_invalidate instead; see `finalize`.
-    if (darwin_jit) return;
+    if (builtin.cpu.arch != .aarch64 or darwin_jit) return;
     if (code.len == 0) return;
     const ctr = asm volatile ("mrs %[out], ctr_el0"
         : [out] "=r" (-> u64),
@@ -103,76 +102,88 @@ pub const Buffer = struct {
     const Mode = enum { mprotect, map_jit };
 
     /// Reserve `size` bytes of writable memory to assemble into.
+    ///
+    /// The platform code sits inside a comptime-known branch, not behind an
+    /// early return, so that targets without these calls (Windows) never
+    /// analyze them.
     pub fn init(size: usize) Error!Buffer {
         if (!supported) return error.MemoryProtectionFailed;
-        const page = std.heap.pageSize();
-        const len = std.mem.alignForward(usize, @max(size, 1), page);
+        if (supported) {
+            const page = std.heap.pageSize();
+            const len = std.mem.alignForward(usize, @max(size, 1), page);
 
-        if (darwin_jit) {
-            // MAP_JIT regions are created executable; the thread toggle, not
-            // mprotect, is what makes them writable.
-            if (posix.mmap(
+            if (darwin_jit) {
+                // MAP_JIT regions are created executable; the thread toggle, not
+                // mprotect, is what makes them writable.
+                if (posix.mmap(
+                    null,
+                    len,
+                    .{ .READ = true, .WRITE = true, .EXEC = true },
+                    .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true },
+                    -1,
+                    0,
+                )) |mapping| {
+                    darwin.pthread_jit_write_protect_np(0);
+                    return .{ .mapping = mapping, .mode = .map_jit, .writable = true };
+                } else |_| {
+                    // No entitlement, most likely; mprotect may still be allowed.
+                }
+            }
+
+            const mapping = posix.mmap(
                 null,
                 len,
-                .{ .READ = true, .WRITE = true, .EXEC = true },
-                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true },
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
                 -1,
                 0,
-            )) |mapping| {
-                darwin.pthread_jit_write_protect_np(0);
-                return .{ .mapping = mapping, .mode = .map_jit, .writable = true };
-            } else |_| {
-                // No entitlement, most likely; mprotect may still be allowed.
-            }
+            ) catch return error.OutOfMemory;
+            return .{ .mapping = mapping, .mode = .mprotect };
         }
-
-        const mapping = posix.mmap(
-            null,
-            len,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        ) catch return error.OutOfMemory;
-        return .{ .mapping = mapping, .mode = .mprotect };
+        unreachable;
     }
 
     /// Make the first `code_len` bytes executable and no longer writable.
     pub fn finalize(self: *Buffer, code_len: usize) Error!void {
-        std.debug.assert(code_len <= self.mapping.len);
-        switch (self.mode) {
-            .map_jit => {
-                if (darwin_jit) {
-                    darwin.pthread_jit_write_protect_np(1);
-                    self.writable = false;
+        if (!supported) return error.MemoryProtectionFailed;
+        if (supported) {
+            std.debug.assert(code_len <= self.mapping.len);
+            switch (self.mode) {
+                .map_jit => {
+                    if (darwin_jit) {
+                        darwin.pthread_jit_write_protect_np(1);
+                        self.writable = false;
+                        self.code = self.mapping[0..code_len];
+                        darwin.sys_icache_invalidate(@ptrCast(self.mapping.ptr), code_len);
+                    }
+                },
+                .mprotect => {
+                    switch (posix.errno(posix.system.mprotect(
+                        self.mapping.ptr,
+                        self.mapping.len,
+                        .{ .READ = true, .EXEC = true },
+                    ))) {
+                        .SUCCESS => {},
+                        else => return error.MemoryProtectionFailed,
+                    }
                     self.code = self.mapping[0..code_len];
-                    darwin.sys_icache_invalidate(@ptrCast(self.mapping.ptr), code_len);
-                }
-            },
-            .mprotect => {
-                switch (posix.errno(posix.system.mprotect(
-                    self.mapping.ptr,
-                    self.mapping.len,
-                    .{ .READ = true, .EXEC = true },
-                ))) {
-                    .SUCCESS => {},
-                    else => return error.MemoryProtectionFailed,
-                }
-                self.code = self.mapping[0..code_len];
-                if (darwin_jit) {
-                    darwin.sys_icache_invalidate(@ptrCast(self.mapping.ptr), code_len);
-                } else {
-                    syncInstructionCache(self.code);
-                }
-            },
+                    if (darwin_jit) {
+                        darwin.sys_icache_invalidate(@ptrCast(self.mapping.ptr), code_len);
+                    } else {
+                        syncInstructionCache(self.code);
+                    }
+                },
+            }
         }
     }
 
     pub fn deinit(self: *Buffer) void {
-        // Never leave the thread holding write access to JIT memory, however
-        // this buffer is being abandoned.
-        if (darwin_jit and self.writable) darwin.pthread_jit_write_protect_np(1);
-        posix.munmap(self.mapping);
+        if (supported) {
+            // Never leave the thread holding write access to JIT memory,
+            // however this buffer is being abandoned.
+            if (darwin_jit and self.writable) darwin.pthread_jit_write_protect_np(1);
+            posix.munmap(self.mapping);
+        }
         self.* = undefined;
     }
 };

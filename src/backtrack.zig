@@ -470,13 +470,13 @@ const Bt = struct {
                             continue;
                         }
                         // A codepoint can straddle the floor when the search
-                        // started inside one, and stepping over it would put
-                        // the match end before its own start.
-                        const back = common.decodeBefore(input, top.pos).len;
-                        if (top.pos - back < top.aux) {
-                            _ = self.stack.pop();
-                            continue;
-                        }
+                        // started inside one. Decoding forward from inside a
+                        // sequence degrades to a single byte, so the run was
+                        // built a byte at a time and the retry has to walk
+                        // back the same way; stepping over the whole sequence
+                        // would land before the attempt even began.
+                        var back = common.decodeBefore(input, top.pos).len;
+                        if (top.pos - back < top.aux) back = 1;
                         top.pos -= back;
                         pc = top.pc;
                         pos = top.pos;

@@ -627,14 +627,25 @@ pub const Gen = struct {
             a.jmp(l_scan);
             a.place(l_found);
         } else {
+            const l_kept = try a.label();
             a.cmpRegReg(r_pos, .rcx);
             a.jcc(.be, l_pop_fail);
+            // Remember where the retry started; the frame's own position is
+            // rewritten below, and on the failure path the frame is dropped.
+            a.movMemReg(stored_pos, r_pos);
             try self.emitStepBack();
             // A codepoint can straddle the floor when the search started
             // inside one; the helper may have clobbered rcx, so reload it.
             a.movRegMem(.rcx, floor);
             a.cmpRegReg(r_pos, .rcx);
-            a.jcc(.b, l_pop_fail);
+            a.jcc(.ae, l_kept);
+            // Stepping over the whole sequence went back past the floor. The
+            // run was built one byte at a time through it, since decoding
+            // forward from inside a sequence degrades to a single byte, so
+            // walk back that way instead.
+            a.movRegMem(r_pos, stored_pos);
+            a.decReg(r_pos);
+            a.place(l_kept);
         }
         a.movMemReg(stored_pos, r_pos);
         a.jmp(cont);
@@ -670,6 +681,10 @@ pub const Gen = struct {
                 const l_ok = try a.label();
                 a.testRegReg(r_pos, r_pos);
                 a.jcc(.e, l_ok);
+                // Past the start it takes a newline just behind, and one that
+                // ends the input starts no line after it.
+                a.cmpRegReg(r_pos, r_len);
+                a.jcc(.e, self.l_fail);
                 a.cmpMem8Imm(inputAt(r_pos, -1), '\n');
                 a.jcc(.ne, self.l_fail);
                 a.place(l_ok);

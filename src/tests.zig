@@ -889,3 +889,152 @@ test "a backreference to the group enclosing it" {
     try expectFind("1(2|\\1*)", "1", "1");
     try expectFind("(|[a]\\1)+1", "a1", "1");
 }
+
+test "octal escapes, and telling them from backreferences" {
+    // PCRE reads `\ddd` as a backreference when the number is under ten or
+    // names a group that exists, and as an octal character otherwise. Under
+    // ten it is always a backreference, so `\8` is an error rather than a
+    // character; inside a class there are no backreferences at all.
+    try expectFind("\\101", "A", "A");
+    try expectFind("\\11", "\t", "\t");
+    try expectFind("\\012a", "\na", "\na");
+    try expectFind("[\\1]", "\x01", "\x01");
+    // Three digits at most: the fourth is a literal of its own.
+    try expectFind("\\1011", "A1", "A1");
+    // `\18` is octal 1 followed by a literal 8, since 8 is not an octal digit.
+    try expectFind("\\18", "\x018", "\x018");
+    // A group that exists still wins.
+    try expectFind("(a)\\1", "aa", "aa");
+    try std.testing.expectError(error.InvalidBackref, Regex.compile(gpa, "\\1"));
+    try std.testing.expectError(error.InvalidBackref, Regex.compile(gpa, "\\8"));
+}
+
+test "comptime and runtime compilation agree" {
+    // The comptime path builds its program with a separate code path that
+    // bakes the result into the binary, so it can drift from the runtime one
+    // without any single pattern's test noticing. Run both over a spread of
+    // constructs and require identical matches.
+    const patterns = .{
+        "(\\d{3})-(\\d{4})",
+        "(?i)h(?-i:ell)o",
+        "(a*)*",
+        "\\s(b|.??)*",
+        "(?:()|[a]\\1)+1",
+        "\\101\\x41",
+        "(\\w+)@([\\w.]+)",
+        "(?<year>\\d{4})-(?<mon>\\d{2})",
+        "a{2,4}?b",
+        "(?<=x)y+",
+        "(a)(b)?\\1",
+        "[^\\d\\s]+",
+        "\\bfoo\\b",
+        "(?:ab|a)*c",
+    };
+    const haystacks = [_][]const u8{
+        "",            "555-1234", "hello HELLO", "aaa",
+        " ba",         "a1",       "AA",          "mail jeff@x.org",
+        "2026-08-31",  "aaab",     "xyyy",        "abab",
+        "foo bar foo", "ababac",   "\t\n z",
+    };
+    inline for (patterns) |pat| {
+        const ct = comptime Regex.compileComptime(pat);
+        var rt = try Regex.compile(gpa, pat);
+        defer rt.deinit();
+        for (haystacks) |hay| {
+            const a = try ct.find(gpa, hay);
+            defer if (a) |m| {
+                var mm = m;
+                mm.deinit(gpa);
+            };
+            const b = try rt.find(gpa, hay);
+            defer if (b) |m| {
+                var mm = m;
+                mm.deinit(gpa);
+            };
+            if ((a == null) != (b == null)) {
+                std.debug.print("pattern={s} haystack={f}: comptime {} runtime {}\n", .{
+                    pat, std.zig.fmtString(hay), a != null, b != null,
+                });
+                return error.TestUnexpectedResult;
+            }
+            if (a) |ma| {
+                std.testing.expectEqualSlices(?zregex.Span, b.?.groups, ma.groups) catch |err| {
+                    std.debug.print("pattern={s} haystack={f}\n", .{ pat, std.zig.fmtString(hay) });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "multiline ^ does not start a line after a trailing newline" {
+    // PCRE starts a line after an *internal* newline only. A newline that
+    // ends the subject leaves no line after it, so `(?m:^)` has no match at
+    // the very end of "a\n" and `(?m:^(?!\n))` does not match "\n" at all.
+    try expectFind("(?m:^(?!\\n))", "\n", null);
+    try expectFind("(?m:^)x", "\nx", "x");
+    try expectFind("(?m:^b)", "a\nb", "b");
+    // Line starts in "a\nb" are 0 and 2; in "a\n" and "\n" only 0, since the
+    // newline ends the subject.
+    try expectStarts("(?m:^)", "a\nb", &.{ 0, 2 });
+    try expectStarts("(?m:^)", "a\n", &.{0});
+    try expectStarts("(?m:^)", "\n", &.{0});
+    // `$` is unaffected: before a final newline and at the end both count.
+    try expectStarts("(?m:$)", "a\n", &.{ 1, 2 });
+}
+
+/// Every match's start offset, for assertions about zero-width assertions
+/// where the matched text says nothing.
+fn expectStarts(pattern: []const u8, haystack: []const u8, expected: []const usize) !void {
+    var re = try Regex.compile(gpa, pattern);
+    defer re.deinit();
+    var starts: std.ArrayList(usize) = .empty;
+    defer starts.deinit(gpa);
+    var it = re.iterator(gpa, haystack);
+    defer it.deinit();
+    while (try it.next()) |m| {
+        var mm = m;
+        defer mm.deinit(gpa);
+        try starts.append(gpa, mm.span().start);
+    }
+    try std.testing.expectEqualSlices(usize, expected, starts.items);
+}
+
+test "retrying a repeat that started inside a codepoint" {
+    // Decoding forward from inside a multi-byte sequence degrades to a single
+    // byte, so a run built from such a position advances a byte at a time.
+    // Decoding *backwards* from its end finds the whole sequence instead, so
+    // a retry that stepped back by that much would land before the position
+    // the search started from. The JIT used to give up there and report no
+    // match where every interpreter found one.
+    const emoji = "\u{1F600}"; // four bytes, so offsets 1..3 are inside it
+    for ([_][]const u8{ ".?.", ".?([^b])", ".?(?:-|[^ab]1)", ".{0,2}." }) |pat| {
+        var re = try Regex.compile(gpa, pat);
+        defer re.deinit();
+        for ([_]bool{ false, true }) |use_jit| {
+            re.jit_mode = if (use_jit) .on else .off;
+            if (use_jit and re.jit_code == null) continue;
+            for (0..emoji.len + 1) |start| {
+                const m = try re.findAt(gpa, emoji, start);
+                if (m) |found| {
+                    var mm = found;
+                    defer mm.deinit(gpa);
+                    const sp = mm.span();
+                    try std.testing.expect(sp.start >= start);
+                    try std.testing.expect(sp.start <= sp.end);
+                }
+            }
+        }
+    }
+    // The last byte of the sequence still matches on its own, as a degraded
+    // one-byte codepoint, whichever engine runs it.
+    var re = try Regex.compile(gpa, ".?.");
+    defer re.deinit();
+    re.jit_mode = .on;
+    const m = try re.findAt(gpa, emoji, 3);
+    try std.testing.expect(m != null);
+    var mm = m.?;
+    defer mm.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), mm.span().start);
+    try std.testing.expectEqual(@as(usize, 4), mm.span().end);
+}

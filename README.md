@@ -105,6 +105,7 @@ backslashes) — or a `\\\\` multiline line (the first two introduce the line).
 | `\xHH` | codepoint from two hex digits | `\x41` matches `A` | `"\\x41"` |
 | `\x{...}`, `\u{...}` | codepoint from hex, up to `10FFFF` | `\x{1F600}+` matches `😀😀` | `"\\x{1F600}+"` |
 | `\uHHHH` | codepoint from four hex digits | `\u0041` matches `A` | `"\\u0041"` |
+| `\0`, `\ddd` | codepoint from up to three octal digits | `\101` matches `A` | `"\\101"` |
 | `\.` `\*` `\(` `\\` … | that punctuation character, literally | `3\.14` matches `3.14` | `"3\\.14"` |
 
 Escaping a letter or digit that has no defined meaning (say `\q`) is a

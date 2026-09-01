@@ -168,10 +168,130 @@ fn oneCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, v
     return if (bad) 1 else 0;
 }
 
+fn spansEqual(a: []const ?zregex.Span, b: []const ?zregex.Span) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if ((x == null) != (y == null)) return false;
+        if (x) |xs| {
+            if (xs.start != y.?.start or xs.end != y.?.end) return false;
+        }
+    }
+    return true;
+}
+
+/// Run one pattern/haystack on every engine and report where they differ,
+/// with no reference involved. PCRE2 runs in UTF mode and so cannot judge a
+/// haystack holding invalid UTF-8, which is exactly where the engines have
+/// disagreed before. Invoked as:
+///
+///     zig build oracle ... -- --engines '<pattern>' '<haystack>'
+fn engineCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, verbose: bool) !u8 {
+    const Setting = struct { name: []const u8, apply: *const fn (*zregex.Regex) void };
+    const settings = [_]Setting{
+        .{ .name = "pike", .apply = struct {
+            fn f(re: *zregex.Regex) void {
+                re.jit_mode = .off;
+                re.dfa_mode = .off;
+            }
+        }.f },
+        .{ .name = "dfa", .apply = struct {
+            fn f(re: *zregex.Regex) void {
+                re.jit_mode = .off;
+                re.dfa_mode = .on;
+            }
+        }.f },
+        .{ .name = "backtrack", .apply = struct {
+            fn f(re: *zregex.Regex) void {
+                re.jit_mode = .off;
+                re.dfa_mode = .off;
+                if (re.fallback_engine == .pike) re.fallback_engine = .backtrack;
+            }
+        }.f },
+        .{ .name = "jit", .apply = struct {
+            fn f(re: *zregex.Regex) void {
+                re.jit_mode = .on;
+            }
+        }.f },
+    };
+
+    var reference: std.ArrayList(?zregex.Span) = .empty;
+    defer reference.deinit(gpa);
+    var reference_name: []const u8 = "";
+    var spans: std.ArrayList(?zregex.Span) = .empty;
+    defer spans.deinit(gpa);
+    var differ = false;
+
+    for (settings) |setting| {
+        var re = zregex.Regex.compile(gpa, pattern) catch return 2;
+        defer re.deinit();
+        re.max_steps = 1_000_000;
+        setting.apply(&re);
+        if (std.mem.eql(u8, setting.name, "jit") and re.jit_code == null) continue;
+
+        spans.clearRetainingCapacity();
+        // Every match, then a search from every offset. Searching from an
+        // offset is its own path -- and where the fuzzer last caught these
+        // two engines apart -- so a reduction has to keep checking it.
+        var it = re.iterator(gpa, subject);
+        defer it.deinit();
+        var overran = false;
+        while (true) {
+            const step = it.next() catch |e| {
+                if (verbose) std.debug.print("  {s:<10}: {t}\n", .{ setting.name, e });
+                overran = true;
+                break;
+            };
+            var mm = step orelse break;
+            defer mm.deinit(gpa);
+            try spans.appendSlice(gpa, mm.groups);
+            if (spans.items.len > 256) break;
+        }
+        if (overran) continue;
+        for (0..subject.len + 1) |start| {
+            const m = re.findAt(gpa, subject, start) catch {
+                overran = true;
+                break;
+            };
+            if (m) |found| {
+                var mm = found;
+                defer mm.deinit(gpa);
+                try spans.append(gpa, mm.span());
+            } else try spans.append(gpa, null);
+        }
+        if (overran) continue;
+
+        if (verbose) {
+            std.debug.print("  {s:<10}:", .{setting.name});
+            for (spans.items) |g| {
+                if (g) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
+            }
+            std.debug.print("\n", .{});
+        }
+        if (reference_name.len == 0) {
+            reference.clearRetainingCapacity();
+            try reference.appendSlice(gpa, spans.items);
+            reference_name = setting.name;
+        } else if (!spansEqual(reference.items, spans.items)) {
+            differ = true;
+        }
+    }
+    return if (differ) 1 else 0;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--engines")) {
+        if (args.len < 4) {
+            std.debug.print("usage: --engines <pattern> <haystack>\n", .{});
+            std.process.exit(2);
+        }
+        const pat = try arena.dupeZ(u8, args[2]);
+        const verbose = args.len < 5 or !std.mem.eql(u8, args[4], "-q");
+        std.process.exit(try engineCase(gpa, pat, args[3], verbose));
+    }
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--case")) {
         if (args.len < 4) {
@@ -203,11 +323,19 @@ pub fn main(init: std.process.Init) !void {
     // Why cases are dropped, so that coverage can be aimed at the biggest
     // bucket rather than guessed at.
     var skip_zregex: usize = 0;
+    var rejected_but_valid: usize = 0;
     var skip_pcre2: usize = 0;
     var skip_budget: usize = 0;
 
     for (0..cases) |_| {
         var b = gen.Builder{ .src = src, .gpa = gpa, .avoid_pcre2_quirks = true };
+        // As in the in-tree fuzzer, a minority of cases are much larger, so
+        // that deep nesting and many capture groups get compared too.
+        if (src.index(8) == 0) {
+            b.depth_limit = 7;
+            b.length_limit = 400;
+            b.group_limit = 40;
+        }
         defer b.buf.deinit(gpa);
         try b.sequence(0);
         if (b.buf.items.len == 0) continue;
@@ -226,9 +354,18 @@ pub fn main(init: std.process.Init) !void {
         // An empty ArrayList's pointer is undefined; PCRE2 dereferences it.
         const subject: []const u8 = if (hay.items.len == 0) "" else hay.items;
 
-        var re = zregex.Regex.compile(gpa, pattern) catch {
+        var re = zregex.Regex.compile(gpa, pattern) catch |err| {
             skipped += 1;
             skip_zregex += 1;
+            // A pattern zregex turns down that PCRE2 compiles is a gap in
+            // this library, not a case to skip quietly. Report a few.
+            var probe: Result = .{ .matched = false };
+            if (runPcre2(pattern, subject, &probe) catch false) {
+                rejected_but_valid += 1;
+                if (rejected_but_valid <= 12) {
+                    std.debug.print("ZREGEX REJECTS (PCRE2 accepts): {t}  pattern={s}\n", .{ err, pattern });
+                }
+            }
             continue;
         };
         defer re.deinit();
@@ -323,9 +460,9 @@ pub fn main(init: std.process.Init) !void {
         if (disagreements >= 10) break;
     }
     std.debug.print(
-        "compared {d}, skipped {d} (zregex rejected {d}, pcre2 rejected {d}, " ++
-            "budget {d}), disagreements {d}\n",
-        .{ compared, skipped, skip_zregex, skip_pcre2, skip_budget, disagreements },
+        "compared {d}, skipped {d} (zregex rejected {d} — of which {d} PCRE2 " ++
+            "accepts, pcre2 rejected {d}, budget {d}), disagreements {d}\n",
+        .{ compared, skipped, skip_zregex, rejected_but_valid, skip_pcre2, skip_budget, disagreements },
     );
     if (disagreements != 0) std.process.exit(1);
 }

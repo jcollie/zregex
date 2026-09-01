@@ -75,7 +75,8 @@ const BoundaryCtx = struct {
             .begin_text => ctx.bof,
             .end_text => ctx.eof,
             .end_text_or_final_newline => ctx.eof or (ctx.next_nl and ctx.next_final),
-            .begin_line => ctx.bof or ctx.prev_nl,
+            // A newline that ends the input starts no line after it.
+            .begin_line => ctx.bof or (ctx.prev_nl and !ctx.eof),
             .end_line => ctx.eof or ctx.next_nl,
             .word_boundary => ctx.prev_word != ctx.next_word,
             .not_word_boundary => ctx.prev_word == ctx.next_word,

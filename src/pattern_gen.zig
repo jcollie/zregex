@@ -24,8 +24,16 @@ pub const pattern_chars = [_][]const u8{
     "A", "\u{e9}", "\u{20ac}", "\n",
 };
 
+/// Defaults for the per-builder limits below. Most cases want small
+/// patterns, which are quick to run and easy to read back when one fails.
 pub const max_depth = 4;
 pub const max_pattern = 96;
+pub const max_gen_groups = 8;
+
+/// Group numbers are one-based, so this holds `max_group_limit` of them.
+/// `group_limit` must stay under its bit count.
+const GroupSet = std.bit_set.IntegerBitSet(64);
+pub const max_group_limit: u8 = GroupSet.bit_length - 1;
 
 /// Where the generator's decisions come from. The fuzzer supplies bytes it
 /// can mutate under coverage feedback; the seeded PRNG supplies a
@@ -70,11 +78,17 @@ pub const Builder = struct {
     /// Capture groups opened so far, so a backreference can name a real one.
     groups: u8 = 0,
     /// Which of those were given a name, so `\k<name>` only uses real ones.
-    named: std.bit_set.IntegerBitSet(16) = .initEmpty(),
+    named: GroupSet = .initEmpty(),
     /// Groups whose closing paren has not been emitted yet: a backreference
     /// generated here would point at the group enclosing it.
-    open: std.bit_set.IntegerBitSet(16) = .initEmpty(),
+    open: GroupSet = .initEmpty(),
     allow_backrefs: bool = true,
+    /// Raised on a minority of cases to reach patterns the defaults never
+    /// build: deep nesting, long programs, and many capture groups, each of
+    /// which runs into limits the small ones never touch.
+    depth_limit: u8 = max_depth,
+    length_limit: usize = max_pattern,
+    group_limit: u8 = max_gen_groups,
     /// Steers around three constructs PCRE2 10.47 gets wrong, so that the
     /// oracle reports real differences rather than the reference's own bugs:
     /// a caseless class holding a wide non-ASCII range stops matching
@@ -89,7 +103,7 @@ pub const Builder = struct {
     const Error = std.mem.Allocator.Error;
 
     pub fn put(self: *Builder, bytes: []const u8) Error!void {
-        if (self.buf.items.len + bytes.len > max_pattern) return;
+        if (self.buf.items.len + bytes.len > self.length_limit) return;
         try self.buf.appendSlice(self.gpa, bytes);
     }
 
@@ -110,6 +124,20 @@ pub const Builder = struct {
         // everything else goes in as itself, multi-byte codepoints included.
         if (std.mem.eql(u8, c, "\n")) return self.put("\\n");
         if (std.mem.eql(u8, c, ".")) return self.put("\\.");
+        // Now and then spell an ASCII character as an escape instead. The
+        // pattern means the same thing, so this costs no generality, and it
+        // reaches the escape parser -- including the octal form, whose split
+        // from a backreference depends on the group count and on how many
+        // digits follow.
+        if (c.len == 1 and c[0] > ' ' and self.src.index(6) == 0) {
+            var buf: [10]u8 = undefined;
+            const spelled = switch (self.src.choice(enum { octal, hex, braced })) {
+                .octal => std.fmt.bufPrint(&buf, "\\{o}", .{c[0]}),
+                .hex => std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{c[0]}),
+                .braced => std.fmt.bufPrint(&buf, "\\x{{{x}}}", .{c[0]}),
+            } catch return self.put(c);
+            return self.put(spelled);
+        }
         try self.put(c);
     }
 
@@ -143,7 +171,7 @@ pub const Builder = struct {
     }
 
     pub fn atom(self: *Builder, depth: u8) Error!void {
-        if (depth >= max_depth or self.buf.items.len > max_pattern - 8) {
+        if (depth >= self.depth_limit or self.buf.items.len + 8 > self.length_limit) {
             try self.literal();
             return;
         }
@@ -162,7 +190,7 @@ pub const Builder = struct {
             .literal => try self.literal(),
             .class => try self.class(),
             .group => {
-                if (self.groups >= 8) return self.literal();
+                if (self.groups >= @min(self.group_limit, max_group_limit)) return self.literal();
                 self.groups += 1;
                 self.open.set(self.groups);
                 // Half the groups are named, so that named capture and

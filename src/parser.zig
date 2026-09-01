@@ -15,6 +15,11 @@ pub const max_codepoint: u21 = 0x10FFFF;
 pub const max_repeat: u32 = 1000;
 /// Maximum capture groups including group 0 (the whole match).
 pub const max_groups: u8 = 100;
+
+/// Where a digit escape stops being read as a group number. Past the largest
+/// possible group it cannot be a backreference anyway, and stopping keeps a
+/// long run of digits from overflowing the accumulator.
+const max_group_number: u32 = max_groups;
 /// Maximum nesting depth of groups.
 pub const max_depth: u32 = 200;
 
@@ -518,7 +523,7 @@ pub const Parser = struct {
             'v' => return .{ .literal = 0x0B },
             'a' => return .{ .literal = 0x07 },
             'e' => return .{ .literal = 0x1B },
-            '0' => return .{ .literal = 0x00 },
+            '0' => return .{ .literal = self.parseOctal(0) },
             'd' => return .{ .class = try self.shorthand(&digit_ranges, false) },
             'D' => return .{ .class = try self.shorthand(&digit_ranges, true) },
             'w' => return .{ .class = try self.shorthand(&word_ranges, false) },
@@ -554,17 +559,36 @@ pub const Parser = struct {
                 return .{ .literal = try self.parseHex(4) };
             },
             '1'...'9' => {
-                if (in_class) return error.InvalidEscape;
-                var n: u32 = c - '0';
-                if (self.peek()) |c2| {
-                    if (c2 >= '0' and c2 <= '9') {
-                        n = n * 10 + (c2 - '0');
+                // A digit escape is a backreference or an octal character,
+                // and PCRE decides between them by the number itself. Inside
+                // a class there are no backreferences, so it is always octal.
+                if (!in_class) {
+                    const after_first = self.pos;
+                    var n: u32 = c - '0';
+                    while (self.peek()) |d| {
+                        if (d < '0' or d > '9') break;
+                        // Far past any real group count; stop before this
+                        // overflows on a long run of digits.
+                        if (n > max_group_number) break;
+                        n = n * 10 + (d - '0');
                         self.pos += 1;
                     }
+                    // Under ten it is always a backreference, so naming a
+                    // group that does not exist is an error rather than a
+                    // character. At ten and above it is a backreference only
+                    // when that many groups have been opened.
+                    if (n < 10 or n < self.group_count) {
+                        if (n >= self.group_count) return error.InvalidBackref;
+                        self.has_backref = true;
+                        return .{ .backref = @intCast(n) };
+                    }
+                    // Not a backreference after all: re-read the digits as an
+                    // octal escape, which is what PCRE falls back to.
+                    self.pos = after_first;
                 }
-                if (n >= self.group_count) return error.InvalidBackref;
-                self.has_backref = true;
-                return .{ .backref = @intCast(n) };
+                // 8 and 9 are not octal, so there is nothing to fall back to.
+                if (c > '7') return error.InvalidBackref;
+                return .{ .literal = self.parseOctal(@intCast(c - '0')) };
             },
             'k' => {
                 if (in_class) return error.InvalidEscape;
@@ -604,6 +628,21 @@ pub const Parser = struct {
             .negated = false,
             .ci = self.flags.case_insensitive,
         };
+    }
+
+    /// Continue an octal escape whose first digit is already consumed and
+    /// has value `first`, taking up to two more. PCRE reads at most three
+    /// octal digits in total and leaves any further digits as literals.
+    fn parseOctal(self: *Self, first: u21) u21 {
+        var v = first;
+        var digits: usize = 1;
+        while (digits < 3) : (digits += 1) {
+            const d = self.peek() orelse break;
+            if (d < '0' or d > '7') break;
+            v = v * 8 + @as(u21, d - '0');
+            self.pos += 1;
+        }
+        return v;
     }
 
     fn parseHex(self: *Self, comptime n: usize) ParseError!u21 {

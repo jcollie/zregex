@@ -120,7 +120,10 @@ pub fn assertHolds(a: Assertion, input: []const u8, pos: usize) bool {
         },
         .begin_line => {
             if (pos == 0) return true;
-            return input[pos - 1] == '\n';
+            // After an internal newline only: PCRE does not start a line
+            // after a newline that ends the subject, so `(?m:^)` has no match
+            // at the very end of "a\n".
+            return pos < input.len and input[pos - 1] == '\n';
         },
         .end_line => {
             if (pos == input.len) return true;

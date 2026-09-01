@@ -167,6 +167,14 @@ fn oneCase(src: Source) anyerror!void {
     const gpa = std.testing.allocator;
 
     var b = Builder{ .src = src, .gpa = gpa };
+    // Every so often, build something far bigger than the default: deep
+    // nesting, a long program, and enough capture groups to run past what a
+    // small pattern ever allocates.
+    if (src.index(8) == 0) {
+        b.depth_limit = 7;
+        b.length_limit = 400;
+        b.group_limit = 40;
+    }
     defer b.buf.deinit(gpa);
     try b.sequence(0);
     if (b.buf.items.len == 0) return;

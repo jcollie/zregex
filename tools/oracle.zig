@@ -975,23 +975,54 @@ fn runCorpusMutate(
         const pattern = try gpa.dupeZ(u8, pat.items);
         defer gpa.free(pattern);
 
-        // A subject from the base case when it has one, or any other's.
+        // A subject from the base case when it has one, or any other's --
+        // and now and then edited too: the corpus authors wrote each subject
+        // for its pattern, so an edit walks the boundary between matching
+        // and not, which is where a span is easiest to get wrong by one.
         const donor = if (base.subjects.items.len != 0)
             base
         else
             cases.items[rand.uintLessThan(usize, cases.items.len)];
         if (donor.subjects.items.len == 0) continue;
-        const subject = donor.subjects.items[rand.uintLessThan(usize, donor.subjects.items.len)];
+        var subject = donor.subjects.items[rand.uintLessThan(usize, donor.subjects.items.len)];
         if (!std.unicode.utf8ValidateSlice(subject)) continue;
         if (subject.len > 4096) continue;
+        var subj_buf: std.ArrayList(u8) = .empty;
+        defer subj_buf.deinit(gpa);
+        if (rand.uintLessThan(u8, 3) == 0) {
+            try subj_buf.appendSlice(gpa, subject);
+            for (0..rand.intRangeAtMost(u8, 1, 3)) |_| {
+                if (subj_buf.items.len == 0) break;
+                switch (rand.uintLessThan(u8, 3)) {
+                    0 => subj_buf.items[rand.uintLessThan(usize, subj_buf.items.len)] =
+                        soup[rand.uintLessThan(usize, soup.len)],
+                    1 => try subj_buf.insert(gpa, rand.uintLessThan(usize, subj_buf.items.len + 1), soup[rand.uintLessThan(usize, soup.len)]),
+                    2 => _ = subj_buf.orderedRemove(rand.uintLessThan(usize, subj_buf.items.len)),
+                    else => unreachable,
+                }
+            }
+            // UTF mode will not accept an edit that broke a sequence.
+            if (std.unicode.utf8ValidateSlice(subj_buf.items)) subject = subj_buf.items;
+        }
 
-        var re = zregex.Regex.compileWithFlags(gpa, pattern, base.flags) catch {
+        // The flags are part of the case too; flip one sometimes.
+        var flags = base.flags;
+        if (rand.uintLessThan(u8, 4) == 0) {
+            switch (rand.uintLessThan(u8, 3)) {
+                0 => flags.case_insensitive = !flags.case_insensitive,
+                1 => flags.multiline = !flags.multiline,
+                2 => flags.dot_all = !flags.dot_all,
+                else => unreachable,
+            }
+        }
+
+        var re = zregex.Regex.compileWithFlags(gpa, pattern, flags) catch {
             skip_zregex += 1;
             var probe: Result = .{ .matched = false };
             var opts: u32 = 0;
-            if (base.flags.case_insensitive) opts |= c.PCRE2_CASELESS;
-            if (base.flags.multiline) opts |= c.PCRE2_MULTILINE;
-            if (base.flags.dot_all) opts |= c.PCRE2_DOTALL;
+            if (flags.case_insensitive) opts |= c.PCRE2_CASELESS;
+            if (flags.multiline) opts |= c.PCRE2_MULTILINE;
+            if (flags.dot_all) opts |= c.PCRE2_DOTALL;
             if (runPcre2(pattern, subject, 0, &probe, opts) catch false) {
                 rejected_but_valid += 1;
                 if (rejected_but_valid <= 8)
@@ -1003,9 +1034,9 @@ fn runCorpusMutate(
         re.max_steps = 200_000;
 
         var pcre2_options: u32 = 0;
-        if (base.flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
-        if (base.flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
-        if (base.flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
+        if (flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
+        if (flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
+        if (flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
 
         var expected: Result = .{ .matched = false };
         if (!(runPcre2(pattern, subject, 0, &expected, pcre2_options) catch false)) {
@@ -1039,9 +1070,9 @@ fn runCorpusMutate(
             if (disagreements <= 15) {
                 std.debug.print("DISAGREE (mutated) pattern={s} flags={s}{s}{s}\n  haystack={f}\n", .{
                     pattern,
-                    if (base.flags.case_insensitive) "i" else "",
-                    if (base.flags.multiline) "m" else "",
-                    if (base.flags.dot_all) "s" else "",
+                    if (flags.case_insensitive) "i" else "",
+                    if (flags.multiline) "m" else "",
+                    if (flags.dot_all) "s" else "",
                     std.zig.fmtString(subject),
                 });
             }

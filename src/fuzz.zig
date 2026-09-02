@@ -184,12 +184,49 @@ fn collect(
     var it = re.iterator(gpa, haystack);
     defer it.deinit();
     var count: usize = 0;
-    var prev_end: ?usize = null;
+    var prev: ?Span = null;
     while (try it.next()) |m| {
         var mm = m;
         defer mm.deinit(gpa);
-        try checkInvariants(re, haystack, mm, prev_end);
-        prev_end = mm.span().end;
+        try checkInvariants(re, haystack, mm, if (prev) |p| p.end else null);
+
+        // Every reported match must be refindable: searching from exactly
+        // its start has to reproduce it, span and captures alike. Scanning
+        // into a position and starting at it are different paths -- the
+        // prefilter skips, the JIT seeds, lookbehind reads context -- and a
+        // match only one of them can see would otherwise pass every
+        // cross-engine comparison, since the engines would agree with each
+        // other both times. The exception is a match the iterator produced
+        // by retrying after an empty one at the same position: a fresh
+        // search there finds the empty match first, by design.
+        const sp = mm.span();
+        const retry_product = if (prev) |p| p.start == p.end and p.start == sp.start else false;
+        if (!retry_product) refind: {
+            // Running out of budget says nothing about refindability.
+            const again = re.findAt(gpa, haystack, sp.start) catch |err| switch (err) {
+                error.StepLimitExceeded => break :refind,
+                else => return err,
+            };
+            if (again) |a| {
+                var aa = a;
+                defer aa.deinit(gpa);
+                std.testing.expectEqualSlices(?Span, mm.groups, aa.groups) catch |err| {
+                    std.debug.print(
+                        "refind at {d} changed the match\nhaystack={f}\n",
+                        .{ sp.start, std.zig.fmtString(haystack) },
+                    );
+                    return err;
+                };
+            } else {
+                std.debug.print(
+                    "match at {d}..{d} not refindable\nhaystack={f}\n",
+                    .{ sp.start, sp.end, std.zig.fmtString(haystack) },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+
+        prev = sp;
         try out.appendSlice(gpa, mm.groups);
         count += 1;
         // A pathological pattern should not turn one fuzz case into a hang;

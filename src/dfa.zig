@@ -36,6 +36,9 @@ pub const Result = union(enum) {
     give_up,
 };
 
+/// Default ceiling on cached states; see `Machine.init`'s `max_states` and
+/// `Regex.dfa_max_states`, which exists so a test can pin it low enough to
+/// exercise the give-up path on ordinary patterns.
 pub const default_max_states = 512;
 
 const Entry = struct {
@@ -106,6 +109,8 @@ pub const Machine = struct {
 
     const Error = error{ OutOfMemory, GiveUp };
 
+    /// Scratch and cache for searches of one compiled program; reusable
+    /// across calls so repeated searches hit warm states.
     pub fn init(
         gpa: std.mem.Allocator,
         prog: compiler.Program,

@@ -275,6 +275,9 @@ pub fn asciiRunSet(prog: compiler.Program, inst: compiler.Inst) ?AsciiSet {
 
 pub const ScanChar = struct { byte: u8, ci: bool };
 
+/// When the instruction a failed attempt would retry from is a single ASCII
+/// byte test, report that byte so the generated code can skip ahead to its
+/// next occurrence with a vector scan instead of stepping one position.
 pub fn retryScanChar(prog: compiler.Program, cont_pc: u32) ?ScanChar {
     var pc = cont_pc;
     var hops: u8 = 0;

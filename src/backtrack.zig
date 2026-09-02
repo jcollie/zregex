@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Backtracking engine: runs the same bytecode as the Pike VM but supports
-//! `backref` and `look`. Worst case is exponential, so every run carries a
-//! step budget; exceeding it returns `error.StepLimitExceeded`.
+//! `backref` and `look`, plus the fused `rep` the compiler emits only for it.
+//! Backref-aware memoization prunes states whose failure is already proven,
+//! which makes the classic exponential patterns polynomial; the shapes it
+//! cannot key are caught by a step budget covering the whole call (see
+//! `run`), and exceeding it returns `error.StepLimitExceeded`.
 //!
 //! Backtracking state lives on an explicit heap stack (frames) plus an undo
 //! log for slot writes, so deep backtracking cannot overflow the call stack.

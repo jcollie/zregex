@@ -243,6 +243,9 @@ pub const Parser = struct {
 
     const Self = @This();
 
+    /// Parse the whole pattern; the returned index is the AST's root node.
+    /// The caller checks the pattern's length against `max_pattern_len`
+    /// before sizing the buffers this writes into.
     pub fn parse(self: *Self) ParseError!NodeIndex {
         const root = try self.parseAlternation(0);
         if (self.pos < self.pattern.len) {
@@ -252,6 +255,7 @@ pub const Parser = struct {
         return root;
     }
 
+    /// Append one node to the caller-provided buffer and return its index.
     fn addNode(self: *Self, node: Node) ParseError!NodeIndex {
         if (self.nodes_len >= self.nodes.len) return error.PatternTooComplex;
         self.nodes[self.nodes_len] = node;
@@ -259,14 +263,6 @@ pub const Parser = struct {
         return self.nodes_len - 1;
     }
 
-    /// Add every codepoint case-equivalent to one the class already holds, and
-    /// report whether the class can now be matched without folding.
-    ///
-    /// Doing this here means `(?i)` is gone by the time anything runs: the
-    /// engines, the JIT and the prefilter all see an ordinary class, and no
-    /// hot loop has to fold a codepoint it reads. One pass is exact because
-    /// case-equivalence classes are disjoint -- adding the rest of one can
-    /// never bring a member of another into range.
     /// A literal, as the parser should record it. Under `(?i)` a codepoint
     /// with case variants becomes the class of them all rather than a literal
     /// carrying a flag, which is what keeps folding out of the engines.
@@ -299,6 +295,14 @@ pub const Parser = struct {
         } });
     }
 
+    /// Add every codepoint case-equivalent to one the ranges from `start`
+    /// onward already hold, so the class needs no folding when it is matched.
+    ///
+    /// Doing this here means `(?i)` is gone by the time anything runs: the
+    /// engines, the JIT and the prefilter all see an ordinary class, and no
+    /// hot loop has to fold a codepoint it reads. One pass is exact because
+    /// case-equivalence classes are disjoint -- adding the rest of one can
+    /// never bring a member of another into range.
     fn caseCloseRanges(self: *Self, start: u32) ParseError!void {
         const end = self.ranges_len;
         const original = self.ranges[start..end];
@@ -317,6 +321,7 @@ pub const Parser = struct {
         }
     }
 
+    /// Append one inclusive codepoint range to the class being built.
     fn addRange(self: *Self, lo: u21, hi: u21) ParseError!void {
         if (self.ranges_len >= self.ranges.len) return error.PatternTooComplex;
         self.ranges[self.ranges_len] = .{ .lo = lo, .hi = hi };
@@ -330,6 +335,7 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Append a predefined range set (`\d`, a POSIX class, ...) verbatim.
     fn addRanges(self: *Self, rs: []const common.ClassRange) ParseError!void {
         for (rs) |r| try self.addRange(r.lo, r.hi);
     }
@@ -447,6 +453,7 @@ pub const Parser = struct {
         };
     }
 
+    /// `a|b|...`: one branch or several, balanced via `TreeBuilder`.
     fn parseAlternation(self: *Self, depth: u32) ParseError!NodeIndex {
         if (depth > max_depth) return error.NestingTooDeep;
         var alts: TreeBuilder(.alt) = .{};
@@ -457,6 +464,8 @@ pub const Parser = struct {
         return (try alts.finish(self)).?; // at least one branch was pushed
     }
 
+    /// A run of quantified atoms up to `|`, `)`, or the end; empty is legal
+    /// (`a||b` has an empty middle branch) and becomes an `.empty` node.
     fn parseConcat(self: *Self, depth: u32) ParseError!NodeIndex {
         var seq: TreeBuilder(.concat) = .{};
         while (self.peek()) |c| {
@@ -475,8 +484,6 @@ pub const Parser = struct {
 
     const Bounds = struct { min: u32, max: ?u32, next: usize };
 
-    /// Pure lookahead at `self.pos` (which must be '{'). Returns null when the
-    /// text is not quantifier-shaped (then '{' is a literal, PCRE-style).
     /// Step over the space and horizontal tab PCRE ignores inside braces.
     fn skipBraceSpace(pat: []const u8, from: usize) usize {
         var i = from;
@@ -484,6 +491,8 @@ pub const Parser = struct {
         return i;
     }
 
+    /// Pure lookahead at `self.pos` (which must be '{'). Returns null when the
+    /// text is not quantifier-shaped (then '{' is a literal, PCRE-style).
     fn scanBounds(self: *Self) ParseError!?Bounds {
         const pat = self.pattern;
         // PCRE ignores space and horizontal tab after `{`, before `}`, and on
@@ -572,6 +581,7 @@ pub const Parser = struct {
         return self.addNode(.{ .repeat = .{ .child = atom, .min = min, .max = max, .greedy = greedy } });
     }
 
+    /// One atom: a group, class, assertion, escape, or literal codepoint.
     fn parseAtom(self: *Self, depth: u32) ParseError!NodeIndex {
         const c = self.peek().?;
         switch (c) {
@@ -620,6 +630,9 @@ pub const Parser = struct {
         }
     }
 
+    /// Everything `(` can open: captures (numbered and all three named
+    /// spellings), `(?:`, lookaround, and inline flags; `self.pos` is at the
+    /// paren.
     fn parseGroup(self: *Self, depth: u32) ParseError!NodeIndex {
         self.pos += 1; // '('
         var capture_index: ?u8 = null;
@@ -756,6 +769,7 @@ pub const Parser = struct {
         return index;
     }
 
+    /// Capture index registered for `name`, or null.
     fn lookupName(self: *Self, name: []const u8) ?u8 {
         for (self.names[0..self.names_len]) |ng| {
             if (std.mem.eql(u8, ng.name, name)) return ng.index;
@@ -885,6 +899,9 @@ pub const Parser = struct {
         }
     }
 
+    /// A shorthand set (`\d`, `\w`, `\v`, ...) as a class of its own,
+    /// complemented for the uppercase spelling, case-closed when that could
+    /// change anything.
     fn shorthand(self: *Self, rs: []const common.ClassRange, complement: bool) ParseError!Class {
         const start = self.ranges_len;
         // The complement is taken of a set that is already closed over case
@@ -918,6 +935,7 @@ pub const Parser = struct {
         return v;
     }
 
+    /// Exactly `n` hex digits, for `\xhh` and `\uhhhh`.
     fn parseHex(self: *Self, comptime n: usize) ParseError!u21 {
         if (self.pos + n > self.pattern.len) return error.InvalidEscape;
         var v: u32 = 0;
@@ -930,6 +948,8 @@ pub const Parser = struct {
         return @intCast(v);
     }
 
+    /// `{h...}` after `\x` or `\u`: one to six hex digits, capped at
+    /// U+10FFFF.
     fn parseBracedCodepoint(self: *Self) ParseError!u21 {
         std.debug.assert(self.eat('{'));
         var v: u32 = 0;
@@ -953,6 +973,7 @@ pub const Parser = struct {
         set: void,
     };
 
+    /// One class member; a shorthand appends its ranges itself.
     fn parseClassMember(self: *Self) ParseError!Member {
         if (self.peek() == '\\') {
             const esc = try self.parseEscape(true);
@@ -1006,6 +1027,9 @@ pub const Parser = struct {
         return error.InvalidClass;
     }
 
+    /// A bracketed class; `self.pos` is at the `[`. Members are case-closed
+    /// one by one as they are added -- see the note inside on why the class
+    /// is never closed as a whole.
     fn parseClass(self: *Self) ParseError!NodeIndex {
         self.pos += 1; // '['
         const negated = self.eat('^');

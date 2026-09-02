@@ -3,14 +3,19 @@
 
 //! zregex — a regular expression library for Zig.
 //!
-//! Two engines behind one API: patterns without backreferences or lookaround
-//! run on a Pike VM with guaranteed linear-time matching; patterns that need
-//! them fall back to a backtracker with a configurable step budget. Patterns
-//! can also be compiled at comptime (`Regex.compileComptime`), baking the
+//! Four engines behind one API, chosen per pattern at compile time. Patterns
+//! without backreferences or lookaround run on a lazy DFA or a Pike VM, both
+//! with guaranteed linear-time matching; patterns that need them fall back
+//! to a memoizing backtracker whose step budget covers the whole search --
+//! `error.StepLimitExceeded` rather than a hang, however the input is
+//! crafted. On x86-64 and aarch64 a JIT compiles the pattern to native code
+//! and bails to the interpreters when its own budget runs out. Patterns can
+//! also be compiled at comptime (`Regex.compileComptime`), baking the
 //! program into the binary.
 //!
-//! Semantics: UTF-8 codepoint based (`.` is one codepoint), leftmost-greedy
-//! matching, ASCII-only case folding and `\d`/`\w`/`\s`.
+//! Semantics follow PCRE: UTF-8 codepoint based (`.` is one codepoint),
+//! leftmost-greedy matching, Unicode simple case folding under `(?i)`, and
+//! ASCII-only `\d`/`\w`/`\s`/`\b`.
 const regex = @import("regex.zig");
 
 pub const Regex = regex.Regex;

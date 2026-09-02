@@ -41,6 +41,9 @@ pub const Match = struct {
         return self.groups[0].?;
     }
 
+    /// Capture group `i`'s span; group 0 is the whole match. Null when the
+    /// group did not participate in the match, and for an `i` past the
+    /// pattern's group count.
     pub fn group(self: Match, i: usize) ?Span {
         return if (i < self.groups.len) self.groups[i] else null;
     }
@@ -125,7 +128,11 @@ pub const Regex = struct {
 
     pub const default_max_steps: usize = 1_000_000;
 
-    /// Compile `pattern` at runtime. Free with `deinit`.
+    /// Compile `pattern` at runtime. Free with `deinit`. Rejects, rather
+    /// than mis-runs, anything past the library's limits: patterns over a
+    /// megabyte, programs past sixty-five thousand instructions, repeats
+    /// over a thousand, more than ninety-nine capture groups, nesting past
+    /// two hundred deep.
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) CompileError!Regex {
         return compileWithFlags(gpa, pattern, .{});
     }
@@ -558,7 +565,11 @@ pub const Regex = struct {
         return null;
     }
 
-    /// Iterate non-overlapping matches left to right.
+    /// Iterate non-overlapping matches left to right, by PCRE's rule (which
+    /// is also Python's): after an empty match, the next attempt looks for a
+    /// longer match starting in the same place before moving on one
+    /// codepoint, so `.*?` over "ab" yields five matches -- empty, `a`,
+    /// empty, `b`, empty -- not just the three empty ones.
     pub fn iterator(self: *const Regex, gpa: std.mem.Allocator, haystack: []const u8) Iterator {
         return .{ .re = self, .gpa = gpa, .haystack = haystack };
     }

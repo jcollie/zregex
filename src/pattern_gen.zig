@@ -10,6 +10,14 @@
 //! seeded PRNG.
 const std = @import("std");
 
+/// Haystacks are built from these pieces rather than single bytes, so that
+/// multi-byte codepoints stay intact while the decoder's fallback still gets
+/// exercised: a lone 0xFF is not valid UTF-8 and must be treated as a
+/// one-byte codepoint of its own value, and a stray continuation byte or a
+/// truncated lead byte reaches the same path from the other side. A NUL is
+/// an ordinary character to everything here and the byte most likely to be
+/// mishandled. Small and overlapping on purpose — that is what produces
+/// interesting backtracking.
 pub const chunks = [_][]const u8{
     "a",      "a",        "b",         "@",    "-",
     ".",      " ",        "1",         "\n",   "A",
@@ -151,11 +159,14 @@ pub const Builder = struct {
         return if (self.avoid_pcre2_quirks) 1 else 0;
     }
 
+    /// `n` in decimal, for group numbers and repeat bounds.
     pub fn putDigits(self: *Builder, n: u8) Error!void {
         var buf: [3]u8 = undefined;
         try self.put(std.fmt.bufPrint(&buf, "{d}", .{n}) catch return);
     }
 
+    /// One literal character, sometimes spelled as an escape so the escape
+    /// parser is reached too.
     pub fn literal(self: *Builder) Error!void {
         const c = pattern_chars[self.src.index(pattern_chars.len)];
         // A newline must be written as an escape and '.' would be syntax;
@@ -279,6 +290,7 @@ pub const Builder = struct {
         try self.close("]");
     }
 
+    /// One character class, from shorthands through full bracketed sets.
     pub fn class(self: *Builder) Error!void {
         switch (self.src.choice(enum {
             shorthand,
@@ -301,6 +313,8 @@ pub const Builder = struct {
         }
     }
 
+    /// One atom of any kind; past the depth or length limits it degrades to
+    /// a literal so generation always terminates.
     pub fn atom(self: *Builder, depth: u8) Error!void {
         if (depth >= self.depth_limit or self.buf.items.len + reserve > self.length_limit) {
             try self.literal();
@@ -486,6 +500,8 @@ pub const Builder = struct {
         }
     }
 
+    /// An atom with, half the time, a quantifier -- whose bounds reach past
+    /// the JIT's peeling threshold on purpose.
     pub fn quantified(self: *Builder, depth: u8) Error!void {
         self.no_quantifier = false;
         const before = self.buf.items.len;
@@ -528,6 +544,8 @@ pub const Builder = struct {
         if (self.src.boolean()) try self.close("?"); // lazy
     }
 
+    /// One to three quantified atoms: the building block every construct's
+    /// body is made of.
     pub fn sequence(self: *Builder, depth: u8) Error!void {
         const n = self.src.intRange(u8, 1, 3);
         for (0..n) |_| try self.quantified(depth);

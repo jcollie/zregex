@@ -3,9 +3,13 @@
 
 //! Pike VM: breadth-first NFA simulation with capture slots.
 //!
-//! Guaranteed O(input * program) time regardless of the pattern. Handles every
-//! instruction except `backref` and `look` — patterns using those are routed
-//! to the backtracker by `Regex.compile`.
+//! Guaranteed linear in the input regardless of the pattern: O(input * keys),
+//! where keys is the program's length times one visited mask per empty-loop
+//! guard level -- at most 2^6, and the compiler refuses any program whose
+//! keys would pass `compiler.max_visited_keys`. Handles every instruction
+//! except `backref`, `look`, and the backtracker's fused `rep` — patterns
+//! needing the first two are routed to the backtracker by `Regex.compile`,
+//! and the compiler only emits the third into backtracker programs.
 const std = @import("std");
 const common = @import("common.zig");
 const compiler = @import("compiler.zig");

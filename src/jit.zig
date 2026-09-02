@@ -12,7 +12,8 @@
 //! (Pike VM) or polynomial (memoizing backtracker) answer, having spent only a
 //! bounded amount of time trying the fast path first.
 //!
-//! Only x86-64 is implemented. Everywhere else `compile` returns null and the
+//! Two backends: x86-64 (SSE2 or AVX2, chosen at compile time per pattern)
+//! and aarch64 (NEON). Everywhere else `compile` returns null and the
 //! interpreters run as before.
 const std = @import("std");
 const builtin = @import("builtin");

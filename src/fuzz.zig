@@ -37,12 +37,6 @@ const Source = gen.Source;
 const Builder = gen.Builder;
 const chunks = gen.chunks;
 
-/// Haystacks are built from these pieces rather than single bytes, so that
-/// multi-byte codepoints stay intact while the decoder's fallback still gets
-/// exercised: a lone 0xFF is not valid UTF-8 and must be treated as a
-/// one-byte codepoint of its own value, and a stray continuation byte or a
-/// truncated lead byte reaches the same path from the other side. Small and
-/// overlapping on purpose — that is what produces interesting backtracking.
 /// One engine configuration to compare. Not every one applies to every
 /// pattern: the Pike VM and the lazy DFA cannot run backreferences or
 /// lookaround, and the JIT is only present where it could be generated.

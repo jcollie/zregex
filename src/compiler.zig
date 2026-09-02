@@ -128,6 +128,8 @@ pub const Compiler = struct {
 
     const Self = @This();
 
+    /// Append (or, in the counting pass, merely count) one instruction and
+    /// return its pc.
     fn emit(self: *Self, inst: Inst) CompileError!u32 {
         if (self.len >= max_insts) return error.ProgramTooLarge;
         // `set_pos`/`exit_if_same` pairs bracket empty-loop guards, and the
@@ -158,6 +160,8 @@ pub const Compiler = struct {
         if (!self.counting) self.insts[at] = .{ .exit_if_same = .{ .slot = slot, .target = target } };
     }
 
+    /// Emit the whole program: the unanchored `.*?`-style prefix is the
+    /// engines' job, so this is just the pattern followed by `match`.
     fn compileRoot(self: *Self, root: parser.NodeIndex) CompileError!void {
         // Group 0 is not compiled as save instructions: both engines track
         // the match span directly (seed position and position at `match`),
@@ -168,6 +172,8 @@ pub const Compiler = struct {
         _ = try self.emit(.match);
     }
 
+    /// Emit one AST node. Recursive over the tree, which the parser keeps
+    /// balanced so this stays log-deep in the pattern's length.
     fn emitNode(self: *Self, idx: parser.NodeIndex) CompileError!void {
         switch (self.nodes[idx]) {
             .empty => {},
@@ -379,6 +385,8 @@ pub fn emitInto(
 // ---------------------------------------------------------------------------
 // Tests
 
+/// Parse and compile in one step for this file's tests, sized like the real
+/// path.
 fn compileForTest(
     gpa: std.mem.Allocator,
     pattern: []const u8,
@@ -526,6 +534,9 @@ const FirstBytes = struct {
         fb.bytes[b] = true;
     }
 
+    /// A codepoint a match may start with: its byte if ASCII (both cases
+    /// under `ci`), otherwise its UTF-8 lead byte -- and, for the decoder's
+    /// invalid-byte fallback, the raw byte value too.
     fn addChar(fb: *FirstBytes, cp: u21, ci: bool) void {
         if (cp < 0x80) {
             fb.addByte(@intCast(cp));
@@ -542,6 +553,8 @@ const FirstBytes = struct {
         if (cp <= 0xFF) fb.addByte(@intCast(cp));
     }
 
+    /// Every first byte a codepoint range can produce, per UTF-8 length
+    /// class.
     fn addRange(fb: *FirstBytes, lo: u21, hi: u21, ci: bool) void {
         // ASCII portion: exact bytes (with case folding).
         var cp: u21 = lo;
@@ -570,6 +583,8 @@ const FirstBytes = struct {
         }
     }
 
+    /// Give up: mark every byte a candidate, which `finish` reports as an
+    /// unusable prefilter.
     fn bail(fb: *FirstBytes) void {
         fb.ok = false;
     }
@@ -683,6 +698,8 @@ pub const Alphabet = struct {
         return @intCast(a.starts.len);
     }
 
+    /// The equivalence class a codepoint falls in; codepoints in one class
+    /// are indistinguishable to the program.
     pub fn classOf(a: *const Alphabet, cp: u21) u16 {
         if (cp < 256) return a.low[cp];
         // Greatest starts[i] <= cp.

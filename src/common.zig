@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 
-//! Shared types and helpers used by the parser, compiler, and both engines.
+//! Shared types and helpers used by the parser, the compiler, and all four
+//! engines.
 const std = @import("std");
 const expect = std.testing.expect;
 const casefold = @import("casefold");
@@ -158,7 +159,14 @@ fn inRanges(ranges: []const ClassRange, cp: u21) bool {
     return false;
 }
 
-/// Class membership test, honoring negation and ASCII case folding.
+/// Class membership test, honoring negation.
+///
+/// The `ci` branch folds ASCII pairs only, and no compiled program reaches
+/// it any more: the parser closes a caseless class over its case-equivalent
+/// codepoints -- the whole of Unicode's simple folding, not just ASCII --
+/// while the pattern is compiled, and emits it with `ci` false. The flag
+/// stays in the instruction layout and this branch stays sound for it, but
+/// a class that folds at match time would be a bug upstream of here.
 pub fn classMatches(ranges: []const ClassRange, negated: bool, ci: bool, cp: u21) bool {
     var hit = inRanges(ranges, cp);
     if (!hit and ci) {

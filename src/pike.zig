@@ -28,9 +28,12 @@ fn slotLookup(chain: ?*const SlotNode, slot: u16) ?usize {
     return null;
 }
 
-/// How many empty-loop guards can be tracked separately in the visited key.
-/// Each one doubles the table, so this bounds it at 16 marks per instruction.
-const max_guard_bits = 4;
+/// How many *nesting levels* of empty-loop guard can be tracked separately in
+/// the visited key. Each one doubles the table, so this bounds it at 64 marks
+/// per instruction -- and only for a pattern that actually nests nullable
+/// loops that deep; one with none gets a single mark per instruction as
+/// before. See `assignGuardBits` for why levels are the right unit.
+const max_guard_bits = 6;
 
 const Thread = struct {
     pc: u32,
@@ -176,6 +179,70 @@ const Ctx = struct {
     }
 };
 
+/// Give every empty-loop guard slot a bit in the visited key's mask, and
+/// return how many bits that took. A slot with no bit gets 0.
+///
+/// Guards are bucketed by how deeply they nest, and every guard at one depth
+/// shares that depth's bit. What the bit has to answer, at an instruction
+/// inside loop L, is "did L's current iteration begin at this position" -- and
+/// a thread can only be inside L's body having run L's own `set_pos`, because
+/// that is the only way in. So one bit per level distinguishes exactly the
+/// threads that `exit_if_same` would send different ways, and two loops that
+/// merely sit side by side never need to be told apart.
+///
+/// Numbering the guards in the order they appear instead, which is what this
+/// used to do, spends a bit on each of them. `x{n}` over a nullable body emits
+/// `n` copies of the loop, so `((a*?)*){5}` alone ran the ceiling out and the
+/// extra guards fell back to a coarser key: threads that disagreed about an
+/// empty iteration were merged, the empty iteration PCRE runs was dropped, and
+/// the capture came back one position wide. Bucketing by depth costs those
+/// copies one bit between them.
+///
+/// A guard's body runs from its `set_pos` to its `exit_if_same`, and those
+/// pairs are emitted properly nested, so one pass over the instructions with a
+/// running depth is enough -- no comparing of guards against each other, which
+/// would be quadratic in a program that unrolls a nullable loop many times.
+fn assignGuardBits(
+    arena: std.mem.Allocator,
+    prog: compiler.Program,
+    guard_bit: []u8,
+) std.mem.Allocator.Error!u8 {
+    @memset(guard_bit, 0);
+
+    // Which slots are guards at all. `set_pos` is only ever emitted for one,
+    // but reading it from the `exit_if_same` side means the scan below can
+    // trust the pairing rather than assume it.
+    const is_guard = try arena.alloc(bool, prog.slot_count);
+    @memset(is_guard, false);
+    var any = false;
+    for (prog.insts) |inst| {
+        if (inst == .exit_if_same) {
+            is_guard[inst.exit_if_same.slot] = true;
+            any = true;
+        }
+    }
+    if (!any) return 0;
+
+    var depth: u8 = 0;
+    var levels: u8 = 0;
+    for (prog.insts) |inst| switch (inst) {
+        .set_pos => |slot| {
+            if (!is_guard[slot]) continue;
+            // Past the ceiling a guard shares the coarser key. Reaching it
+            // takes that many nullable loops nested inside one another, which
+            // nothing short of a deliberately built pattern does.
+            if (depth < max_guard_bits) {
+                guard_bit[slot] = depth + 1;
+                levels = @max(levels, depth + 1);
+            }
+            depth += 1;
+        },
+        .exit_if_same => depth -|= 1,
+        else => {},
+    };
+    return levels;
+}
+
 /// Unanchored search from byte offset `start`. On success fills `slots_out`
 /// (length `prog.slot_count`) and returns true. Leftmost-greedy semantics.
 pub fn run(
@@ -195,19 +262,7 @@ pub fn run(
     // `Ctx.tryEnter`. Programs without such a loop get `key_shift == 0` and
     // the same single mark per instruction as before.
     const guard_bit = try arena.alloc(u8, prog.slot_count);
-    @memset(guard_bit, 0);
-    var guard_count: u8 = 0;
-    for (prog.insts) |inst| {
-        if (inst != .exit_if_same) continue;
-        const s = inst.exit_if_same.slot;
-        // Past the ceiling the extra guards share the coarser key: the
-        // visited table would otherwise double in size for each one, and a
-        // pattern with that many nullable loops is already pathological.
-        if (guard_bit[s] == 0 and guard_count < max_guard_bits) {
-            guard_count += 1;
-            guard_bit[s] = guard_count;
-        }
-    }
+    const guard_count = try assignGuardBits(arena, prog, guard_bit);
     const key_shift: u5 = @intCast(guard_count);
     // Instructions times guard masks: how many distinct threads a single
     // position can hold. Without a guard this is just the instruction count.

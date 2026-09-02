@@ -357,7 +357,7 @@ fn compileForTest(
     pattern: []const u8,
     flags: common.Flags,
 ) !struct { insts: []Inst, slots: u16, p: u8 } {
-    const sizes = parser.bufferSizes(pattern.len);
+    const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
     const nodes = try gpa.alloc(parser.Node, sizes.nodes);
     defer gpa.free(nodes);
     const ranges = try gpa.alloc(common.ClassRange, sizes.ranges);
@@ -448,9 +448,16 @@ pub const Prefilter = struct {
     /// False when the analysis bailed (`.`, negated class, leading backref,
     /// or a pattern that can match empty): every position is a candidate.
     usable: bool,
-    /// All candidate bytes are < 0x80. ASCII bytes are always codepoint
-    /// boundaries, so a byte-at-a-time scan cannot stop mid-sequence.
-    ascii_only: bool,
+    /// No candidate byte is a UTF-8 continuation byte, so a scan may step one
+    /// byte at a time rather than decoding to find the next boundary.
+    ///
+    /// Landing inside a multi-byte sequence is harmless when this holds: the
+    /// bytes inside one are all 0x80..0xBF, none of them is a candidate, and
+    /// the scan simply steps past. Requiring every candidate to be ASCII, as
+    /// this used to, gave up the cheap loop for any class reaching past
+    /// ASCII -- which, once `(?i)s` grew to include the long s, meant an
+    /// ordinary caseless literal.
+    byte_steppable: bool,
     /// Exactly one candidate byte (ASCII): use a vectorized memchr scan.
     single: ?u8,
     /// How many bytes are candidates; a small count means byte-skipping
@@ -460,7 +467,7 @@ pub const Prefilter = struct {
     pub const unusable: Prefilter = .{
         .bytes = @splat(true),
         .usable = false,
-        .ascii_only = false,
+        .byte_steppable = false,
         .single = null,
         .count = 256,
     };
@@ -472,7 +479,7 @@ pub const Prefilter = struct {
             return std.mem.indexOfScalarPos(u8, input, start, b) orelse input.len;
         }
         var pos = start;
-        if (pf.ascii_only) {
+        if (pf.byte_steppable) {
             while (pos < input.len and !pf.bytes[input[pos]]) pos += 1;
             return pos;
         }
@@ -602,20 +609,24 @@ pub fn computeFirstBytes(
     }
     if (!fb.ok) return .unusable;
     var n: usize = 0;
-    var ascii_only = true;
+    var byte_steppable = true;
     var single: ?u8 = null;
     for (fb.bytes, 0..) |set, b| {
         if (!set) continue;
         n += 1;
         single = if (n == 1) @intCast(b) else null;
-        if (b >= 0x80) ascii_only = false;
+        // A continuation byte as a candidate is the only thing that makes
+        // stepping unsafe; a lead byte never appears inside a sequence.
+        if (b >= 0x80 and b < 0xC0) byte_steppable = false;
     }
     if (n == 0 or n == 256) return .unusable;
     return .{
         .bytes = fb.bytes,
         .usable = true,
-        .ascii_only = ascii_only,
-        .single = if (ascii_only) single else null,
+        .byte_steppable = byte_steppable,
+        // `memchr` finds a byte anywhere, so the single-byte scan needs the
+        // candidate to be one a match can actually start at.
+        .single = if (byte_steppable and single != null and single.? < 0x80) single else null,
         .count = @intCast(n),
     };
 }

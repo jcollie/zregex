@@ -372,9 +372,12 @@ test "prefilter never stops mid-codepoint" {
     // U+00A9 (©) is 0xC2 0xA9 in UTF-8; 'é' is 0xC3 0xA9. A lone invalid
     // 0xA9 byte decodes to U+00A9 via the fallback, but the 0xA9 inside a
     // valid 'é' must not: matches may only start at decode boundaries.
+    //
+    // 0xA9 is therefore a candidate byte *and* a continuation byte, which is
+    // exactly the shape that stops the scan from stepping a byte at a time.
     var re = try Regex.compile(gpa, "\u{A9}");
     defer re.deinit();
-    try std.testing.expect(!re.prefilter.ascii_only);
+    try std.testing.expect(!re.prefilter.byte_steppable);
     try std.testing.expect(!try re.isMatch(gpa, "é")); // C3 A9: no boundary at the A9
     try std.testing.expect(try re.isMatch(gpa, "x\xA9y")); // lone invalid byte: matches
     try std.testing.expect(try re.isMatch(gpa, "x\u{A9}y")); // real ©
@@ -734,6 +737,184 @@ test "prefilter skipping does not strand the Pike VM" {
     try expectGroups("(@)?\\Bb", "@ab", &.{ "b", null });
 }
 
+test "POSIX bracket classes" {
+    // `[[:name:]]` is only meaningful inside a class, and ASCII-only, which
+    // is what `\d`, `\w` and `\s` already are here and what PCRE gives these
+    // without PCRE2_UCP. Every span below was checked against PCRE2.
+    //
+    // Before these were implemented the inner brackets were read as ordinary
+    // members, so `[[:digit:]]` quietly meant "one of `[:digt]`" and matched
+    // the wrong thing rather than failing.
+    const hay = "ab12:] _-A~ ";
+    try expectFind("[[:digit:]]+", hay, "12");
+    try expectFind("[[:alpha:]]+", hay, "ab");
+    try expectFind("[[:alnum:]]+", hay, "ab12");
+    try expectFind("[[:upper:]]+", hay, "A");
+    try expectFind("[[:lower:]]+", hay, "ab");
+    try expectFind("[[:space:]]+", hay, " ");
+    try expectFind("[[:blank:]]+", hay, " ");
+    try expectFind("[[:punct:]]+", hay, ":]");
+    try expectFind("[[:xdigit:]]+", hay, "ab12");
+    try expectFind("[[:word:]]+", hay, "ab12");
+    try expectFind("[[:graph:]]+", hay, "ab12:]");
+    try expectFind("[[:print:]]+", hay, hay);
+    try expectFind("[[:ascii:]]+", hay, hay);
+    try expectFind("[[:cntrl:]]+", hay, null);
+    // Mixed with ordinary members, and both ways of negating.
+    try expectFind("[[:alpha:]0-9]+", hay, "ab12");
+    try expectFind("[[:^digit:]]+", hay, "ab");
+    try expectFind("[^[:digit:]]+", hay, "ab");
+    // A `[` that does not open one stays the literal PCRE makes it, so a
+    // class missing the `:]` terminator still reads as ordinary members.
+    try expectFind("[[]", "x[y", "[");
+    try expectFind("[[:a]+", "ab12", "a");
+    // Anything terminated by `:]` is meant as one of these, so a name nobody
+    // defines is an error -- as in PCRE, and rather than falling back to
+    // reading the characters one at a time. The names are case-sensitive.
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:bogus:]]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:^bogus:]]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:DIGIT:]]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:a-z:]]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[::]]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:^:]]"));
+}
+
+test "a caseless POSIX complement closes over case before complementing" {
+    // Found by tools/oracle.zig. `[:^lower:]` is complemented while the
+    // pattern is parsed, but `(?i)` is not applied until match time, so
+    // without closing the set over case first the two happen in the wrong
+    // order: `a` folded to `A`, found it in the complement of `a-z`, and
+    // matched. PCRE reads the class as "not a letter of either case".
+    //
+    // `lower` and `upper` are the only names this can be seen through --
+    // every other set, and `\D`, `\W` and `\S` too, already holds both cases
+    // of everything in it or neither.
+    try expectFind("(?i:[[:^lower:]])", "a", null);
+    try expectFind("(?i:[[:^lower:]])", "A", null);
+    try expectFind("(?i:[[:^upper:]])", "A", null);
+    try expectFind("(?i:[[:^upper:]])", "z", null);
+    // Characters with no case are unaffected, and so is the whole thing
+    // without the flag.
+    try expectFind("(?i:[[:^lower:]])", "0", "0");
+    try expectFind("(?i:[[:^lower:]])", "_", "_");
+    try expectFind("[[:^lower:]]", "A", "A");
+    try expectFind("[[:^lower:]]", "a", null);
+    try expectFind("(?i:[[:^alpha:]])", "Q", null);
+    try expectFind("(?i:[[:^xdigit:]])", "F", null);
+    try expectFind("(?i:[[:^digit:]])", "a", "a");
+    try expectFind("(?i:[[:^word:]])", "-", "-");
+}
+
+test "case folding is Unicode, not ASCII" {
+    // Found by running PCRE2's own test corpus through tools/oracle.zig,
+    // where caseless matching of non-ASCII was by far the largest source of
+    // difference. The tables come from CaseFolding.txt, via the uucode
+    // package, and hold simple case folding only -- the `C` and `S` entries.
+    try expectFind("(?i)\u{c1}", "\u{e1}", "\u{e1}"); // Á ~ á
+    try expectFind("(?i)\u{391}+", "\u{3b1}", "\u{3b1}"); // Α ~ α
+    try expectFind("(?i)\u{23a}", "\u{2c65}", "\u{2c65}"); // Ⱥ ~ ⱥ
+    try expectFind("(?i)\u{1e9e}", "\u{df}", "\u{df}"); // ẞ ~ ß
+
+    // Three-member classes: `s` also matches the long s, `k` the Kelvin sign.
+    try expectFind("(?i)s", "\u{17f}", "\u{17f}");
+    try expectFind("(?i)\u{17f}", "S", "S");
+    try expectFind("(?i)k", "\u{212a}", "\u{212a}");
+    try expectFind("(?i)\u{212a}", "k", "k");
+
+    // Classes are closed over case where they are built, so nothing folds
+    // while matching and every engine sees an ordinary class.
+    try expectFind("(?i)[z\u{df}]+", "\u{1e9e}", "\u{1e9e}");
+    try expectFind("(?i)[\u{105}-\u{109}]", "\u{104}", "\u{104}");
+
+    // A complement is taken of the closed set, never closed afterwards. The
+    // Kelvin sign is a non-word character, so closing `\W` after the fact
+    // would drag `k` and `K` into it.
+    try expectFind("(?i)\\W", "k", null);
+    try expectFind("(?i)[\\W]", "k", null);
+    try expectFind("(?i)[^k]", "k", null);
+    try expectFind("(?i)[^k]", "\u{212a}", null);
+    try expectFind("(?i)[[:^lower:]]", "a", null);
+    try expectFind("(?i)[[:^lower:]]", "0", "0");
+
+    // Simple case folding is the `C` and `S` entries of CaseFolding.txt and
+    // nothing else. `İ` (U+0130) has only a full mapping and a Turkic one, so
+    // it folds to itself; PCRE matches it against neither `i` nor `I`.
+    try expectFind("(?i)i", "\u{130}", null);
+    try expectFind("(?i)\u{130}", "i", null);
+    try expectFind("(?i)\u{130}", "I", null);
+    try expectFind("(?i)[i]", "\u{130}", null);
+}
+
+test "a caseless backreference may match a different number of bytes" {
+    // `Ⱥ` (U+023A) is two bytes and the `ⱥ` (U+2C65) it folds together with
+    // is three, so the text a backreference matches can be longer or shorter
+    // than the text it captured. Comparing byte by byte -- which is what this
+    // did while folding was ASCII-only, where the two cases of a character
+    // always have the same length -- got both the comparison and how far to
+    // advance wrong.
+    try expectFind(
+        "(?i)(\u{23a}\u{23a}\u{23a})\\1",
+        "\u{23a}\u{23a}\u{23a}\u{2c65}\u{2c65}\u{2c65}",
+        "\u{23a}\u{23a}\u{23a}\u{2c65}\u{2c65}\u{2c65}",
+    );
+    try expectFind(
+        "(?i)(\u{2c65}\u{2c65})\\1",
+        "\u{2c65}\u{2c65}\u{23a}\u{23a}",
+        "\u{2c65}\u{2c65}\u{23a}\u{23a}",
+    );
+    try expectFind("(?i)(\u{de})\\1", "\u{de}\u{fe}", "\u{de}\u{fe}");
+    try expectFind("(?i)(.) \\1", "A a", "A a");
+}
+
+test "relaxed brace quantifiers" {
+    // PCRE ignores space and horizontal tab after `{`, before `}`, and on
+    // either side of the comma, and reads a missing minimum as zero. A brace
+    // pair holding no number at all is not a quantifier and stays literal.
+    // Found by running PCRE2's own test corpus.
+    try expectFind("a{,3}B", "aaaB", "aaaB");
+    try expectFind("x{,2}(x|b)", "xxb", "xxb");
+    try expectFind("a{ 1,2 }", "aa", "aa");
+    try expectFind("a{ 1 , 2 }", "aa", "aa");
+    try expectFind("A{ ,3}", "AAAAAA", "AAA");
+    try expectFind("A{ 3, }", "AAAA", "AAAA");
+    // Not quantifiers: no number between the braces.
+    try expectFind("A{,}B", "A{,}B", "A{,}B");
+    try expectFind("A{ , }B", "A{ , }B", "A{ , }B");
+    try expectFind("X{}", "ZZX{}YZ", "X{}");
+    // Still not a quantifier: holding something that is not a bound.
+    try expectFind("X{12ABC}", "ZZX{12ABC}Y", "X{12ABC}");
+}
+
+test "horizontal and vertical whitespace classes" {
+    // In PCRE `\v` is the vertical whitespace class, not the vertical tab --
+    // Python and JavaScript are the ones that read it as a character, and
+    // zregex used to follow them. Both lists reach past ASCII even without
+    // PCRE2_UCP, because both are fixed sets rather than Unicode properties.
+    try expectFind("\\v", "a\nb", "\n");
+    try expectFind("\\v", "a\tb", null);
+    try expectFind("a\\vb", "a\nb", "a\nb");
+    try expectFind("\\v", "a\u{2028}", "\u{2028}");
+    try expectFind("\\h", "a\tb", "\t");
+    try expectFind("\\h", "a b", " ");
+    try expectFind("\\h", "\u{3000}x", "\u{3000}");
+    try expectFind("\\H", "\tab", "a");
+    try expectFind("\\V", "\nab", "a");
+    try expectFind("[\\v]", "a\nb", "\n");
+    try expectFind("[^\\v]+", "\nab", "ab");
+}
+
+test "a variable-length lookbehind takes the longest match" {
+    // PCRE tries the longest lookbehind text first, so the group captures all
+    // four digits rather than the last one. zregex searched from the shortest
+    // and reported the other end of the range.
+    try expectGroups("(?<=(\\d{1,4}))X", "1234X", &.{ "X", "1234" });
+    try expectGroups("(?<=(a{1,3}))X", "aaaX", &.{ "X", "aaa" });
+    try expectGroups("(?<=(ab|b))X", "abX", &.{ "X", "ab" });
+    // Unbounded lookbehind has no maximum to start from, so it begins at the
+    // start of the haystack; the answer is still the longest.
+    try expectGroups("(?<=(a+))X", "aaaX", &.{ "X", "aaa" });
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. Both were checked against Python, which
     // agrees with zregex; PCRE2 10.47 does not, and the tool steers around
@@ -750,6 +931,11 @@ test "cases where PCRE2 is the one that is wrong" {
     try expectFind("(?:(?= ){8}){0}A", "A", "A");
     try expectFind("(?:a){0,0}A", "A", "A");
     try expectFind("(?:(?=x)+){0}A", "A", "A");
+    // A body that is itself nullable reaches the same PCRE2 failure, and a
+    // group wrapped round the repeat still captures the empty span where it
+    // stood. Python reports exactly these spans.
+    try expectGroups("((|(.*)){0})b", "ab", &.{ "b", "", null, null });
+    try expectGroups("((.*){0})b", "ab", &.{ "b", "", null });
 }
 
 test "lookbehind at a position inside a multi-byte sequence" {
@@ -854,6 +1040,55 @@ test "an empty loop iteration keeps its captures, on every engine" {
             defer mm.deinit(gpa);
             std.testing.expectEqualSlices(?zregex.Span, c.want, mm.groups) catch |err| {
                 std.debug.print("pattern={s} haystack={s} engine={t}\n", .{ c.pat, c.hay, which });
+                return err;
+            };
+        }
+    }
+}
+
+test "many nullable loops still tell empty iterations apart" {
+    // The Pike VM keeps threads that disagree about whether the current loop
+    // iteration began here from being merged, by putting a bit per empty-loop
+    // guard in the visited key. Those bits used to be handed out in the order
+    // the guards appeared, and only four of them existed.
+    //
+    // `x{n}` over a nullable body emits n copies of the loop and so n guards,
+    // which ran the four out at n = 5. The guards past the ceiling shared a
+    // coarser key, the thread that had run the empty final iteration was
+    // merged away, and group 2 came back as 0..1 -- the last iteration that
+    // consumed something -- instead of the empty 1..1 that PCRE and Python
+    // both report. Bits are handed out per nesting level now, so the copies,
+    // which sit side by side rather than inside one another, share one.
+    const want = [_]?zregex.Span{
+        .{ .start = 0, .end = 2 },
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 1 },
+    };
+    for ([_]usize{ 1, 2, 4, 5, 6, 9, 17, 40 }) |n| {
+        var buf: [32]u8 = undefined;
+        const pat = try std.fmt.bufPrint(&buf, "((a{{0,}}?){{0,}}){{{d}}}b", .{n});
+        for ([_]enum { pike, dfa, backtrack, jit }{ .pike, .dfa, .backtrack, .jit }) |which| {
+            var re = try Regex.compile(gpa, pat);
+            defer re.deinit();
+            re.dfa_mode = .off;
+            re.jit_mode = .off;
+            switch (which) {
+                .jit => {
+                    re.jit_mode = .on;
+                    if (re.jit_code == null) continue;
+                },
+                .dfa => re.dfa_mode = .on,
+                .pike => re.fallback_engine = .pike,
+                .backtrack => re.fallback_engine = .backtrack,
+            }
+            const m = (try re.find(gpa, "ab")) orelse {
+                std.debug.print("pattern={s} engine={t}: no match\n", .{ pat, which });
+                return error.TestUnexpectedResult;
+            };
+            var mm = m;
+            defer mm.deinit(gpa);
+            std.testing.expectEqualSlices(?zregex.Span, &want, mm.groups) catch |err| {
+                std.debug.print("pattern={s} engine={t}\n", .{ pat, which });
                 return err;
             };
         }

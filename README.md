@@ -123,8 +123,17 @@ compile error rather than silently matching `q`.
 | `\d` / `\D` | ASCII digit / non-digit | `\d{4}` matches `2026` | `"\\d{4}"` |
 | `\w` / `\W` | ASCII word char `[A-Za-z0-9_]` / complement | `\w+` matches `hi_there2` | `"\\w+"` |
 | `\s` / `\S` | ASCII whitespace / complement | `\S+` matches `x9!` | `"\\S+"` |
+| `\h` / `\H` | horizontal whitespace / complement (not ASCII-only) | `\h+` matches a tab, space, or U+3000 | `"\\h+"` |
+| `\v` / `\V` | vertical whitespace / complement (not ASCII-only) | `\v` matches `\n`, `\r`, U+2028 | `"\\v"` |
 | `[\d\s]` | shorthands compose inside classes | `[^\d\s]+` matches `abc` | `"[^\\d\\s]+"` |
 | `[\b]` | backspace (U+0008) — only inside a class | | `"[\\b]"` |
+| `[[:alpha:]]` | POSIX class — only inside a class, ASCII like `\d`/`\w`/`\s` | `[[:alpha:]_]+` matches `hi_there` | `"[[:alpha:]_]+"` |
+| `[[:^alpha:]]` | its complement | `[[:^digit:]]+` matches `abc` | `"[[:^digit:]]+"` |
+
+The POSIX class names are `alnum`, `alpha`, `ascii`, `blank`, `cntrl`,
+`digit`, `graph`, `lower`, `print`, `punct`, `space`, `upper`, `word` and
+`xdigit`. A name outside that set is an error; a `[` that does not open one
+stays the literal it is elsewhere, so `[[]` still matches a bracket.
 
 ### Anchors and boundaries
 
@@ -152,7 +161,10 @@ Counted repeats are capped at 1000.
 | `x{2,5}` / `x{2,5}?` | n through m | `a{2,3}` matches `aaa` | `"a{2,3}"` |
 | `x{2,}` | n or more | `a{2,}` matches `aaaa` | `"a{2,}"` |
 
-A `{` that does not form a valid quantifier is a literal (PCRE behavior):
+Space and horizontal tab are ignored just inside the braces of a quantifier
+and on either side of its comma, and an omitted minimum means zero, both
+following PCRE: `a{ 1 , 2 }` is `a{1,2}` and `a{,3}` is `a{0,3}`. A `{` that
+does not form a valid quantifier is a literal (PCRE behavior):
 `a{x}` matches the four characters `a{x}`. Double quantifiers (`a**`) and
 possessive quantifiers (`a*+`) are errors.
 
@@ -191,8 +203,10 @@ different sub-match.
 | `(?<=x)` | `x` ends here | `(?<=\$)\d+` matches `42` in `$42` | `"(?<=\\$)\\d+"` |
 | `(?<!x)` | `x` does not end here | `(?<!\$)\b\d+` | `"(?<!\\$)\\b\\d+"` |
 
-Lookbehind may be variable-length (`(?<=ab+)c` works), which PCRE does not
-allow.
+Lookbehind may be variable-length. PCRE allows that too since 10.43, but only
+where each branch has a known maximum; `(?<=ab+)c` is unbounded and works here.
+Where several lengths could match, the longest wins, as in PCRE: the group in
+`(?<=(\d{1,4}))X` captures all of `1234`, not just the `4`.
 
 ### Inline flags
 
@@ -209,9 +223,10 @@ semantics). The same three flags can be set for the whole pattern via
 ### Not supported
 
 Possessive quantifiers (`a*+`), atomic groups (`(?>...)`), Unicode property
-classes (`\p{...}`), extended/whitespace mode (`(?x)`), octal escapes,
-`\Q...\E` quoting, conditionals, and recursion. All reject at compile time
-with a clear error rather than misbehaving.
+classes (`\p{...}`), extended/whitespace mode (`(?x)`), the braced octal escape
+(`\o{101}` — the bare `\101` form *is* supported), `\Q...\E` quoting,
+conditionals, and recursion. All reject at compile time with a clear error
+rather than misbehaving.
 
 ## Platform support
 
@@ -275,7 +290,12 @@ instead of `.jit`, and matches and captures are identical either way. Check
   bytes degrade to single-byte codepoints rather than erroring.
 - **Leftmost-greedy** (PCRE/Perl-style) matching; alternation prefers the left
   branch. Captures persist across repeat iterations (PCRE, not JS, semantics).
-- `\d \w \s`, case folding, and `\b` are **ASCII-only**.
+- `\d \w \s`, `[[:alpha:]]` and the other POSIX classes, and `\b` are
+  **ASCII-only** — which is what PCRE gives them without `PCRE2_UCP`. Case
+  folding is **Unicode**: `(?i)s` matches `ſ`, `(?i)k` matches `K`, and
+  `(?i)ⱥ` matches `Ⱥ`. It is *simple* folding, the `C` and `S` entries of
+  Unicode's `CaseFolding.txt`, so `ß` does not match `ss` and `İ` matches
+  neither `i` nor `I` — the same as PCRE.
 - Lookarounds are atomic. A backreference to a group that has not captured
   fails, as in PCRE; JavaScript is the odd one out in matching empty.
 - A backreference to the group that *encloses* it, as in `(a|b\1)`, reads that
@@ -300,3 +320,67 @@ instead of `.jit`, and matches and captures are identical either way. Check
 zig build test   # run the test suite
 zig build run -- '(\w+)@([\w.]+)' 'mail jeff@example.org'   # demo CLI
 ```
+
+## Differential testing
+
+The engines are independent implementations of one specification, so they can
+be checked against each other, and all of them against PCRE2. Patterns and
+haystacks come from a grammar (`src/pattern_gen.zig`) rather than from raw
+bytes, so the time goes on the engines instead of on the parser rejecting
+noise.
+
+Each generated case is run through every engine that can take it — the JIT, the
+lazy DFA, the Pike VM, and the backtracker with memoization on and off — and
+they must report the same matches and the same captures. On x86-64 the JIT is
+compiled twice, once with AVX2 forced off, because the two vector code
+generators are chosen while compiling and the host CPU would otherwise only
+ever select one of them. `isMatch` is checked against `find` as well, since it
+has a path of its own that never materialises captures.
+
+`zig build test` runs a few thousand seeded cross-engine cases every time. A
+longer soak raises the count and walks the seed, which is how patterns a single
+stream never produces get reached:
+
+```sh
+zig build test -Dfuzz-cases=50000 -Dfuzz-seed=7
+```
+
+A separate test reruns generated cases once per allocation they make, failing a
+different one each time, so that the paths taken when memory runs out partway
+are executed too — what was allocated by then still has to be released. It is
+quadratic in what one case allocates, hence its own much smaller count:
+
+```sh
+zig build test -Dfuzz-alloc-cases=500
+```
+
+The cross-engine comparison cannot find a mistake every engine makes together.
+For that, `tools/oracle.zig` runs the same generated patterns through PCRE2 and
+compares. It needs that library to link, so it is opt-in:
+
+```sh
+zig build oracle -Dpcre2-include=<dir> -Dpcre2-lib=<dir> -- [cases] [seed]
+```
+
+The dev shell exports the two directories, so from inside `nix develop` that is:
+
+```sh
+zig build oracle -Dpcre2-include=$PCRE2_INCLUDE -Dpcre2-lib=$PCRE2_LIB -- 25000 1
+```
+
+It also runs PCRE2's own test files, which are nine thousand patterns written
+by hand over decades, mostly because something once went wrong with them —
+shapes no grammar of ours would think to generate. Point it at a PCRE2 source
+tree; nothing is copied into this repository:
+
+```sh
+zig build oracle ... -- --corpus <pcre2-source>/testdata
+```
+
+It reports how many cases it compared and why any were dropped, so coverage can
+be aimed at the biggest bucket rather than guessed at. Two flags reduce a single
+case: `--case '<pattern>' '<haystack>'` shows every engine beside PCRE2, and
+`--engines '<pattern>' '<haystack>'` compares the engines with no reference
+involved — which is the only way to judge a haystack holding invalid UTF-8,
+since PCRE2 runs in UTF mode and rejects one outright. Both exit non-zero on a
+disagreement, so a shrinker can drive them.

@@ -595,16 +595,24 @@ pub fn compile(
 ) std.mem.Allocator.Error!?u32 {
     if (!Support.canCompile(prog)) return null;
 
+    // Allocated ahead of the struct rather than inside it, each with its
+    // cleanup registered before the next is attempted. A `try` inside a
+    // struct literal abandons the expression on failure, so `g` is never
+    // assigned and a `defer` written after the literal never runs -- which
+    // leaked `pc_labels` whenever the allocation right after it failed.
+    const pc_labels = try gpa.alloc(Label, prog.insts.len);
+    defer gpa.free(pc_labels);
+    const dead = try gpa.alloc(bool, prog.insts.len);
+    defer gpa.free(dead);
+
     var g = Gen{
         .a = a64.Asm.init(gpa, code_buf),
         .prog = prog,
         .gpa = gpa,
-        .pc_labels = try gpa.alloc(Label, prog.insts.len),
-        .dead = try gpa.alloc(bool, prog.insts.len),
+        .pc_labels = pc_labels,
+        .dead = dead,
         .prefilter = prefilter,
     };
-    defer gpa.free(g.pc_labels);
-    defer gpa.free(g.dead);
     defer g.blobs.deinit(gpa);
     defer g.a.deinit();
 
@@ -661,7 +669,7 @@ pub fn compile(
             a.adr(.x10, pf_table);
             a.ldrbReg(.x10, .x10, .x9);
             a.cbnz(.x10, l_ok);
-            if (prefilter.ascii_only) {
+            if (prefilter.byte_steppable) {
                 a.addImm(r_pos, r_pos, 1);
             } else {
                 const l_one = try a.label();

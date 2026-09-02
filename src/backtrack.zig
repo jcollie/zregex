@@ -41,17 +41,6 @@ const Undo = struct {
     old: ?usize,
 };
 
-/// ASCII-case-insensitive byte equality; multi-byte UTF-8 units fold to
-/// themselves, so byte-wise folding is exact for our ASCII-only `ci`.
-fn bytesEqFold(a: []const u8, b: []const u8, ci: bool) bool {
-    if (a.len != b.len) return false;
-    if (!ci) return std.mem.eql(u8, a, b);
-    for (a, b) |x, y| {
-        if (common.foldLower(x) != common.foldLower(y)) return false;
-    }
-    return true;
-}
-
 /// Does a fused rep's child instruction accept `cp`?
 inline fn repAccepts(prog: compiler.Program, child: compiler.Inst, cp: u21) bool {
     return switch (child) {
@@ -267,6 +256,37 @@ const Bt = struct {
         }
     }
 
+    /// The most bytes a lookbehind sub-program starting at `target` can
+    /// consume, or null when it can consume any amount.
+    ///
+    /// Only a rough bound is wanted: it decides where to begin looking, not
+    /// what matches. A sub-program with no backward jump runs each of its
+    /// instructions at most once, so counting the ones that consume and
+    /// allowing the longest encoding for each is enough. A backward jump is a
+    /// loop, and `(?<=ab+)c` really can reach back any distance.
+    fn lookbehindReach(self: *Bt, target: u32) ?usize {
+        var consuming: usize = 0;
+        var pc = target;
+        while (pc < self.prog.insts.len) : (pc += 1) {
+            switch (self.prog.insts[pc]) {
+                .match => return consuming * 4,
+                .char, .any, .any_not_nl, .class => consuming += 1,
+                // A fused repeat is a loop written as one instruction.
+                .rep => |r| {
+                    if (r.max == compiler.RepOp.unbounded) return null;
+                    consuming += r.max;
+                },
+                .jmp => |t| if (t <= pc) return null,
+                .split => |t| if (t[0] <= pc or t[1] <= pc) return null,
+                // A nested lookaround consumes nothing itself, and a
+                // backreference can carry any amount of text.
+                .backref => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     /// General lookaround: run the sub-program. Returns whether the
     /// lookaround (including its polarity) succeeds.
     fn lookGeneral(self: *Bt, l: compiler.LookOp, pos: usize) Error!bool {
@@ -281,13 +301,22 @@ const Bt = struct {
             },
             .behind_pos, .behind_neg => {
                 // Try every start whose sub-match ends exactly at `pos`,
-                // shortest lookbehind text first. Variable-length lookbehind
-                // is supported.
-                var s = pos;
+                // longest lookbehind text first, which is the one PCRE
+                // reports: `(?<=(\d{1,4}))X` on `1234X` captures all four
+                // digits rather than the last one. Variable-length lookbehind
+                // is supported, which is why there is a search here at all.
+                //
+                // How far back to begin is bounded by what the sub-program
+                // could consume, so a lookbehind that cannot reach the start
+                // of the haystack does not walk there to find that out.
+                var s = if (self.lookbehindReach(l.target)) |bytes|
+                    pos -| bytes
+                else
+                    0;
                 const hit = while (true) {
                     if (try self.matchFrom(l.target, s, pos, false) != null) break true;
-                    if (s == 0) break false;
-                    s -= common.decodeBefore(self.input, s).len;
+                    if (s >= pos) break false;
+                    s += common.decode(self.input, s).len;
                 };
                 if (l.kind == .behind_neg) self.rewindUndo(undo_mark);
                 return hit == (l.kind == .behind_pos);
@@ -406,10 +435,8 @@ const Bt = struct {
                         // fall through to backtracking
                     } else {
                         const text = input[a.?..b.?];
-                        if (pos + text.len <= input.len and
-                            bytesEqFold(text, input[pos..][0..text.len], br.ci))
-                        {
-                            pos += text.len;
+                        if (common.backrefLen(input, pos, text, br.ci)) |n| {
+                            pos += n;
                             pc += 1;
                             continue :step;
                         }

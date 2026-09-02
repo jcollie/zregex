@@ -9,6 +9,7 @@
 //! worst-case buffer lengths for a given pattern length.
 const std = @import("std");
 const common = @import("common.zig");
+const casefold = @import("casefold");
 
 pub const max_codepoint: u21 = 0x10FFFF;
 /// Upper bound for `{n,m}` repeat counts (mirrors RE2's limit).
@@ -111,12 +112,28 @@ pub const BufferSizes = struct {
 };
 
 /// Worst-case buffer sizes for parsing a pattern of length `pattern_len`.
-pub fn bufferSizes(pattern_len: usize) BufferSizes {
+///
+/// `caseless` must be true whenever the pattern might be matched without
+/// regard to case, whether from the flags it is compiled with or from an
+/// inline `(?i)`. Closing a class over case adds ranges that the pattern
+/// itself does not account for -- `(?i)[\u{a0}-\u{2fff}]` reaches beyond its
+/// own bounds to the `K` and `S` whose orbits it holds the far end of -- and
+/// at most one per codepoint that folds, which is what the extra room is.
+/// Over-reporting only costs a larger scratch buffer for one compile.
+pub fn bufferSizes(pattern_len: usize, caseless: bool) BufferSizes {
     return .{
         .nodes = 2 * pattern_len + 16,
-        .ranges = 4 * pattern_len + 16,
+        .ranges = 4 * pattern_len + 16 + if (caseless) casefold.folds.len else 0,
         .names = max_groups,
     };
+}
+
+/// Whether `bufferSizes` has to leave room for case closure: either the
+/// pattern is being compiled caseless, or it could turn itself caseless with
+/// an inline flag. Looking for the letter is deliberately crude -- a literal
+/// `i` costs nothing but a bigger scratch buffer.
+pub fn mayBeCaseless(pattern: []const u8, flags: common.Flags) bool {
+    return flags.case_insensitive or std.mem.indexOfScalar(u8, pattern, 'i') != null;
 }
 
 // Predefined (ASCII) shorthand classes, sorted and disjoint.
@@ -130,6 +147,73 @@ const word_ranges = [_]common.ClassRange{
 const space_ranges = [_]common.ClassRange{
     .{ .lo = 0x09, .hi = 0x0D },
     .{ .lo = 0x20, .hi = 0x20 },
+};
+
+/// `\h` and `\v`, which unlike `\d`, `\w` and `\s` are not ASCII-only even
+/// in PCRE without PCRE2_UCP: both are fixed lists of codepoints rather than
+/// Unicode properties, so following PCRE exactly costs nothing. Taken from
+/// HSPACE_LIST and VSPACE_LIST in PCRE2's pcre2_internal.h.
+const hspace_ranges = [_]common.ClassRange{
+    .{ .lo = 0x09, .hi = 0x09 }, // horizontal tab
+    .{ .lo = 0x20, .hi = 0x20 }, // space
+    .{ .lo = 0xA0, .hi = 0xA0 }, // no-break space
+    .{ .lo = 0x1680, .hi = 0x1680 }, // ogham space mark
+    .{ .lo = 0x180E, .hi = 0x180E }, // mongolian vowel separator
+    .{ .lo = 0x2000, .hi = 0x200A }, // en quad .. hair space
+    .{ .lo = 0x202F, .hi = 0x202F }, // narrow no-break space
+    .{ .lo = 0x205F, .hi = 0x205F }, // medium mathematical space
+    .{ .lo = 0x3000, .hi = 0x3000 }, // ideographic space
+};
+const vspace_ranges = [_]common.ClassRange{
+    .{ .lo = 0x0A, .hi = 0x0D }, // LF, VT, FF, CR
+    .{ .lo = 0x85, .hi = 0x85 }, // next line
+    .{ .lo = 0x2028, .hi = 0x2029 }, // line and paragraph separator
+};
+
+/// POSIX bracket classes, usable only inside a class: `[[:alpha:]x]`. ASCII
+/// like `\d`, `\w` and `\s`, which is also what PCRE gives them without
+/// `PCRE2_UCP`. Each range list is sorted, disjoint, and wholly within ASCII,
+/// all of which `addAsciiComplement` relies on for the `[:^name:]` form.
+const PosixClass = struct { name: []const u8, ranges: []const common.ClassRange };
+
+const posix_classes = [_]PosixClass{
+    .{ .name = "alnum", .ranges = &.{
+        .{ .lo = '0', .hi = '9' },
+        .{ .lo = 'A', .hi = 'Z' },
+        .{ .lo = 'a', .hi = 'z' },
+    } },
+    .{ .name = "alpha", .ranges = &.{
+        .{ .lo = 'A', .hi = 'Z' },
+        .{ .lo = 'a', .hi = 'z' },
+    } },
+    .{ .name = "ascii", .ranges = &.{.{ .lo = 0x00, .hi = 0x7F }} },
+    .{ .name = "blank", .ranges = &.{
+        .{ .lo = 0x09, .hi = 0x09 },
+        .{ .lo = 0x20, .hi = 0x20 },
+    } },
+    .{ .name = "cntrl", .ranges = &.{
+        .{ .lo = 0x00, .hi = 0x1F },
+        .{ .lo = 0x7F, .hi = 0x7F },
+    } },
+    .{ .name = "digit", .ranges = &digit_ranges },
+    // `graph` is the printable characters except space; `print` includes it.
+    .{ .name = "graph", .ranges = &.{.{ .lo = 0x21, .hi = 0x7E }} },
+    .{ .name = "lower", .ranges = &.{.{ .lo = 'a', .hi = 'z' }} },
+    .{ .name = "print", .ranges = &.{.{ .lo = 0x20, .hi = 0x7E }} },
+    .{ .name = "punct", .ranges = &.{
+        .{ .lo = 0x21, .hi = 0x2F },
+        .{ .lo = 0x3A, .hi = 0x40 },
+        .{ .lo = 0x5B, .hi = 0x60 },
+        .{ .lo = 0x7B, .hi = 0x7E },
+    } },
+    .{ .name = "space", .ranges = &space_ranges },
+    .{ .name = "upper", .ranges = &.{.{ .lo = 'A', .hi = 'Z' }} },
+    .{ .name = "word", .ranges = &word_ranges },
+    .{ .name = "xdigit", .ranges = &.{
+        .{ .lo = '0', .hi = '9' },
+        .{ .lo = 'A', .hi = 'F' },
+        .{ .lo = 'a', .hi = 'f' },
+    } },
 };
 
 pub const Parser = struct {
@@ -165,14 +249,119 @@ pub const Parser = struct {
         return self.nodes_len - 1;
     }
 
+    /// Add every codepoint case-equivalent to one the class already holds, and
+    /// report whether the class can now be matched without folding.
+    ///
+    /// Doing this here means `(?i)` is gone by the time anything runs: the
+    /// engines, the JIT and the prefilter all see an ordinary class, and no
+    /// hot loop has to fold a codepoint it reads. One pass is exact because
+    /// case-equivalence classes are disjoint -- adding the rest of one can
+    /// never bring a member of another into range.
+    /// A literal, as the parser should record it. Under `(?i)` a codepoint
+    /// with case variants becomes the class of them all rather than a literal
+    /// carrying a flag, which is what keeps folding out of the engines.
+    fn addLiteral(self: *Self, cp: u21) ParseError!NodeIndex {
+        if (!self.flags.case_insensitive) {
+            return self.addNode(.{ .literal = .{ .cp = cp, .ci = false } });
+        }
+        var one: [1]u21 = undefined;
+        const orbit = common.caseOrbit(cp, &one);
+        if (orbit.len == 1) {
+            return self.addNode(.{ .literal = .{ .cp = cp, .ci = false } });
+        }
+        // An ASCII letter whose only other case is also ASCII keeps the
+        // `ci` literal it has always been. Folding it is one instruction
+        // everywhere, including inside the JIT, where turning it into a
+        // two-member class instead cost about a third of the throughput on
+        // the caseless-literal benchmark. `k` and `s` are the exceptions --
+        // the Kelvin sign and the long s are in their classes -- and they
+        // take the general path below with everything non-ASCII.
+        if (orbit.len == 2 and orbit[0] < 0x80 and orbit[1] < 0x80) {
+            return self.addNode(.{ .literal = .{ .cp = cp, .ci = true } });
+        }
+        const start = self.ranges_len;
+        for (orbit) |m| try self.addRange(m, m);
+        return self.addNode(.{ .class = .{
+            .start = start,
+            .len = self.ranges_len - start,
+            .negated = false,
+            .ci = false,
+        } });
+    }
+
+    fn caseCloseRanges(self: *Self, start: u32) ParseError!void {
+        const end = self.ranges_len;
+        const original = self.ranges[start..end];
+        for (casefold.orbits) |orbit| {
+            var present = false;
+            for (orbit) |m| {
+                if (inRanges(original, m)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) continue;
+            for (orbit) |m| {
+                if (!inRanges(original, m)) try self.addRange(m, m);
+            }
+        }
+    }
+
     fn addRange(self: *Self, lo: u21, hi: u21) ParseError!void {
         if (self.ranges_len >= self.ranges.len) return error.PatternTooComplex;
         self.ranges[self.ranges_len] = .{ .lo = lo, .hi = hi };
         self.ranges_len += 1;
     }
 
+    fn inRanges(ranges: []const common.ClassRange, cp: u21) bool {
+        for (ranges) |r| {
+            if (cp >= r.lo and cp <= r.hi) return true;
+        }
+        return false;
+    }
+
     fn addRanges(self: *Self, rs: []const common.ClassRange) ParseError!void {
         for (rs) |r| try self.addRange(r.lo, r.hi);
+    }
+
+    /// Append the complement of a sorted, disjoint ASCII range set, closed
+    /// over ASCII case first when `ci` is set.
+    ///
+    /// `[:^lower:]` is complemented here, at parse time, while the `ci` flag
+    /// is not applied until match time -- so without the closure the two
+    /// happen in the wrong order. `a` would fold to `A`, find it in the
+    /// complement of `a-z`, and match, where PCRE reads the class as "not a
+    /// letter of either case" and does not. Closing the set before
+    /// complementing puts the two steps back in PCRE's order.
+    ///
+    /// Only reached for POSIX classes, whose sets are all ASCII, which is why
+    /// a bitmap over the low 128 codepoints can hold one. `\D`, `\W` and
+    /// `\S` complement sets that are already closed over case, so they can
+    /// and do go straight to `addComplement`.
+    fn addAsciiComplement(self: *Self, rs: []const common.ClassRange, ci: bool) ParseError!void {
+        var in: [128]bool = @splat(false);
+        for (rs) |r| {
+            std.debug.assert(r.hi < in.len);
+            for (r.lo..r.hi + 1) |c| in[c] = true;
+        }
+        if (ci) {
+            for ('a'..'z' + 1) |c| {
+                if (in[c]) in[c - 32] = true;
+                if (in[c - 32]) in[c] = true;
+            }
+        }
+        var c: u21 = 0;
+        while (c < in.len) {
+            if (in[c]) {
+                c += 1;
+                continue;
+            }
+            const lo = c;
+            while (c < in.len and !in[c]) c += 1;
+            try self.addRange(lo, c - 1);
+        }
+        // Everything past ASCII is outside any of these sets.
+        try self.addRange(in.len, max_codepoint);
     }
 
     /// Append the complement of a sorted, disjoint range set.
@@ -231,34 +420,48 @@ pub const Parser = struct {
 
     /// Pure lookahead at `self.pos` (which must be '{'). Returns null when the
     /// text is not quantifier-shaped (then '{' is a literal, PCRE-style).
+    /// Step over the space and horizontal tab PCRE ignores inside braces.
+    fn skipBraceSpace(pat: []const u8, from: usize) usize {
+        var i = from;
+        while (i < pat.len and (pat[i] == ' ' or pat[i] == '\t')) i += 1;
+        return i;
+    }
+
     fn scanBounds(self: *Self) ParseError!?Bounds {
-        var i = self.pos + 1;
         const pat = self.pattern;
+        // PCRE ignores space and horizontal tab after `{`, before `}`, and on
+        // either side of the comma, so `a{ 1 , 2 }` is `a{1,2}`. Anything else
+        // between the braces means this is not a quantifier at all and the `{`
+        // is the literal it is everywhere else.
+        var i = skipBraceSpace(pat, self.pos + 1);
+
         var min: u32 = 0;
-        var digits: usize = 0;
+        var min_digits: usize = 0;
         while (i < pat.len and pat[i] >= '0' and pat[i] <= '9') : (i += 1) {
             min = min * 10 + (pat[i] - '0');
-            digits += 1;
+            min_digits += 1;
             if (min > max_repeat) return error.RepeatTooLarge;
         }
-        if (digits == 0) return null;
+        i = skipBraceSpace(pat, i);
+
         var max: ?u32 = min;
+        var max_digits: usize = 0;
         if (i < pat.len and pat[i] == ',') {
-            i += 1;
-            if (i < pat.len and pat[i] == '}') {
-                max = null;
-            } else {
-                var m: u32 = 0;
-                digits = 0;
-                while (i < pat.len and pat[i] >= '0' and pat[i] <= '9') : (i += 1) {
-                    m = m * 10 + (pat[i] - '0');
-                    digits += 1;
-                    if (m > max_repeat) return error.RepeatTooLarge;
-                }
-                if (digits == 0) return null;
-                max = m;
+            i = skipBraceSpace(pat, i + 1);
+            var m: u32 = 0;
+            while (i < pat.len and pat[i] >= '0' and pat[i] <= '9') : (i += 1) {
+                m = m * 10 + (pat[i] - '0');
+                max_digits += 1;
+                if (m > max_repeat) return error.RepeatTooLarge;
             }
+            i = skipBraceSpace(pat, i);
+            // `{n,}` has no upper bound; `{,m}` has no lower one and means
+            // `{0,m}`, which is what PCRE and Python both read it as.
+            max = if (max_digits == 0) null else m;
         }
+        // A brace pair with no number in it at all -- `{}`, `{,}`, `{ , }` --
+        // is not a quantifier, so `A{,}B` matches the text `A{,}B`.
+        if (min_digits == 0 and max_digits == 0) return null;
         if (i >= pat.len or pat[i] != '}') return null;
         if (max) |m| {
             if (min > m) return error.InvalidRepeat;
@@ -334,10 +537,7 @@ pub const Parser = struct {
             '\\' => {
                 const esc = try self.parseEscape(false);
                 return switch (esc) {
-                    .literal => |cp| self.addNode(.{ .literal = .{
-                        .cp = cp,
-                        .ci = self.flags.case_insensitive,
-                    } }),
+                    .literal => |cp| try self.addLiteral(cp),
                     .class => |cl| self.addNode(.{ .class = cl }),
                     .assertion => |a| self.addNode(.{ .assertion = a }),
                     .backref => |n| blk: {
@@ -352,10 +552,7 @@ pub const Parser = struct {
             else => {
                 const d = common.decode(self.pattern, self.pos);
                 self.pos += d.len;
-                return self.addNode(.{ .literal = .{
-                    .cp = d.cp,
-                    .ci = self.flags.case_insensitive,
-                } });
+                return self.addLiteral(d.cp);
             },
         }
     }
@@ -520,7 +717,13 @@ pub const Parser = struct {
             'r' => return .{ .literal = 0x0D },
             't' => return .{ .literal = 0x09 },
             'f' => return .{ .literal = 0x0C },
-            'v' => return .{ .literal = 0x0B },
+            // In PCRE `\v` is the vertical whitespace class, not the vertical
+            // tab -- Python and JavaScript are the ones that read it as a
+            // character. `\h` has no other reading anywhere.
+            'h' => return .{ .class = try self.shorthand(&hspace_ranges, false) },
+            'H' => return .{ .class = try self.shorthand(&hspace_ranges, true) },
+            'v' => return .{ .class = try self.shorthand(&vspace_ranges, false) },
+            'V' => return .{ .class = try self.shorthand(&vspace_ranges, true) },
             'a' => return .{ .literal = 0x07 },
             'e' => return .{ .literal = 0x1B },
             '0' => return .{ .literal = self.parseOctal(0) },
@@ -621,12 +824,19 @@ pub const Parser = struct {
 
     fn shorthand(self: *Self, rs: []const common.ClassRange, complement: bool) ParseError!Class {
         const start = self.ranges_len;
+        // The complement is taken of a set that is already closed over case
+        // -- `\w` holds both cases of every letter, `\d` and `\s` hold no
+        // cased character at all -- and the complement of a closed set is
+        // closed, so there is nothing to do on that side. Closing it *after*
+        // complementing would be wrong: the Kelvin sign is a non-word
+        // character, and pulling in its orbit would make `(?i)\W` match `k`.
         if (complement) try self.addComplement(rs) else try self.addRanges(rs);
+        if (self.flags.case_insensitive and !complement) try self.caseCloseRanges(start);
         return .{
             .start = start,
             .len = self.ranges_len - start,
             .negated = false,
-            .ci = self.flags.case_insensitive,
+            .ci = false,
         };
     }
 
@@ -694,6 +904,45 @@ pub const Parser = struct {
         return .{ .cp = d.cp };
     }
 
+    /// A POSIX bracket class, `[:name:]` or the negated `[:^name:]`, with
+    /// `self.pos` at the opening `[`. Appends its ranges and reports whether
+    /// one was there at all; a `[` that does not begin one is left alone, so
+    /// `[[]` keeps reading it as the literal bracket PCRE makes it.
+    fn parsePosixClass(self: *Self) ParseError!bool {
+        if (self.peekAt(1) != ':') return false;
+        var i = self.pos + 2;
+        const complement = i < self.pattern.len and self.pattern[i] == '^';
+        if (complement) i += 1;
+        const name_start = i;
+        // Anything up to the terminator is the name, rather than only the
+        // letters a real one is spelled with, so that a near miss such as
+        // `[[:DIGIT:]]` is the error PCRE makes it instead of quietly
+        // becoming a set of the characters it is written with.
+        while (i < self.pattern.len and self.pattern[i] != ':' and self.pattern[i] != ']') i += 1;
+        // Needs the full `:]` terminator; without it this is not one, and
+        // `[[:a]` stays the ordinary class PCRE reads it as.
+        if (i + 1 >= self.pattern.len or self.pattern[i] != ':' or self.pattern[i + 1] != ']')
+            return false;
+        const name = self.pattern[name_start..i];
+        for (posix_classes) |pc| {
+            if (!std.mem.eql(u8, pc.name, name)) continue;
+            const at = self.ranges_len;
+            if (complement) {
+                // Closes over case before complementing, which is the order
+                // that makes `(?i)[[:^lower:]]` reject `a` and `A` alike.
+                try self.addAsciiComplement(pc.ranges, self.flags.case_insensitive);
+            } else {
+                try self.addRanges(pc.ranges);
+                if (self.flags.case_insensitive) try self.caseCloseRanges(at);
+            }
+            self.pos = i + 2;
+            return true;
+        }
+        // Well-formed but not a class anyone defines. PCRE rejects it rather
+        // than falling back to reading the characters literally.
+        return error.InvalidClass;
+    }
+
     fn parseClass(self: *Self) ParseError!NodeIndex {
         self.pos += 1; // '['
         const negated = self.eat('^');
@@ -706,8 +955,19 @@ pub const Parser = struct {
                 self.pos += 1;
                 break;
             }
+            // Checked before the member below, which would otherwise take the
+            // `[` for a literal and the rest for individual characters.
+            if (c == '[' and try self.parsePosixClass()) continue;
+            // Each member is closed over case on its own. Closing the class
+            // as a whole would also close any complement a member brought in
+            // -- `[\W]`, `[[:^lower:]]` -- and the complement of a closed set
+            // is already closed, so re-closing it can only add what belongs
+            // outside. The union of closed sets is closed, so this is enough,
+            // and the `[^...]` negation is then applied to a closed set.
+            const member_start = self.ranges_len;
             const m1 = try self.parseClassMember();
             switch (m1) {
+                // A shorthand or POSIX class closed itself as it was added.
                 .set => continue,
                 .cp => |lo| {
                     // Try to form a range: `lo-hi`, where '-' is not final.
@@ -724,6 +984,7 @@ pub const Parser = struct {
                     } else {
                         try self.addRange(lo, lo);
                     }
+                    if (self.flags.case_insensitive) try self.caseCloseRanges(member_start);
                 },
             }
         }
@@ -731,7 +992,7 @@ pub const Parser = struct {
             .start = start,
             .len = self.ranges_len - start,
             .negated = negated,
-            .ci = self.flags.case_insensitive,
+            .ci = false,
         } });
     }
 };
@@ -814,6 +1075,39 @@ test "inline flags scope to the enclosing group" {
     try std.testing.expect(!lits[1].ci); // x
     try std.testing.expect(lits[2].ci); // b
     try std.testing.expect(!lits[3].ci); // c
+}
+
+test "a caseless letter with a non-ASCII case becomes a class" {
+    // `b` matches only `B` and `b`, both ASCII, so it stays a literal that
+    // folds -- the cheap representation every engine already had. `s` also
+    // matches the long s (U+017F) and `k` the Kelvin sign (U+212A), which
+    // folding a single byte cannot express, so those become the class of
+    // their case-equivalent codepoints instead.
+    const cases = [_]struct { pat: []const u8, members: []const u21 }{
+        .{ .pat = "(?i)b", .members = &.{} },
+        .{ .pat = "(?i)s", .members = &.{ 'S', 's', 0x17F } },
+        .{ .pat = "(?i)k", .members = &.{ 'K', 'k', 0x212A } },
+    };
+    for (cases) |c| {
+        var bufs = TestBufs{};
+        var p = bufs.parser(c.pat, .{});
+        _ = try p.parse();
+        var found: ?Class = null;
+        for (p.nodes[0..p.nodes_len]) |node| {
+            if (node == .class) found = node.class;
+        }
+        if (c.members.len == 0) {
+            try std.testing.expect(found == null);
+            continue;
+        }
+        const cl = found orelse return error.TestUnexpectedResult;
+        const ranges = p.ranges[cl.start..][0..cl.len];
+        try std.testing.expectEqual(c.members.len, ranges.len);
+        for (c.members, ranges) |want, r| {
+            try std.testing.expectEqual(want, r.lo);
+            try std.testing.expectEqual(want, r.hi);
+        }
+    }
 }
 
 test "rejects invalid patterns" {

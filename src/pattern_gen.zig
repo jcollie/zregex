@@ -24,6 +24,13 @@ pub const pattern_chars = [_][]const u8{
     "A", "\u{e9}", "\u{20ac}", "\n",
 };
 
+/// POSIX bracket class names, all of which mean the same to zregex and to
+/// PCRE2 without `PCRE2_UCP`: ASCII only, as `\d`, `\w` and `\s` are.
+pub const posix_names = [_][]const u8{
+    "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph",
+    "lower", "print", "punct", "space", "upper", "word",  "xdigit",
+};
+
 /// Defaults for the per-builder limits below. Most cases want small
 /// patterns, which are quick to run and easy to read back when one fails.
 pub const max_depth = 4;
@@ -89,8 +96,15 @@ pub const Builder = struct {
     depth_limit: u8 = max_depth,
     length_limit: usize = max_pattern,
     group_limit: u8 = max_gen_groups,
-    /// Steers around three constructs PCRE2 10.47 gets wrong, so that the
-    /// oracle reports real differences rather than the reference's own bugs:
+    /// Restricts generation to what a PCRE2 comparison can actually judge.
+    ///
+    /// Part of that is syntax PCRE2 does not accept at all — a quantified
+    /// anchor such as `^*` or `\b+`, which zregex compiles and PCRE2 turns
+    /// down as a quantifier on an unrepeatable item. Left in, it was most of
+    /// what the oracle generated and threw away.
+    ///
+    /// The rest is three constructs PCRE2 10.47 gets wrong, which without
+    /// this would have the oracle reporting the reference's own bugs:
     /// a caseless class holding a wide non-ASCII range stops matching
     /// characters it matches without `(?i)`, a `{0}` repeat over some bodies
     /// makes the whole pattern fail rather than matching empty, and a
@@ -99,17 +113,44 @@ pub const Builder = struct {
     /// does not. Python agrees with zregex on the first two and rejects the
     /// third outright as a reference to an open group.
     avoid_pcre2_quirks: bool = false,
+    /// Set by `atom` when what it emitted cannot carry a quantifier — an
+    /// unscoped `(?i)` is the only such case — and cleared by `quantified`.
+    no_quantifier: bool = false,
 
     const Error = std.mem.Allocator.Error;
 
+    /// Append `bytes` unless doing so would run past `length_limit`, in which
+    /// case they are dropped. Only ever used for content whose absence still
+    /// leaves a well-formed pattern behind.
     pub fn put(self: *Builder, bytes: []const u8) Error!void {
         if (self.buf.items.len + bytes.len > self.length_limit) return;
         try self.buf.appendSlice(self.gpa, bytes);
     }
 
-    /// Lowest repeat count to generate; `{0}` is one of the shapes PCRE2
-    /// mishandles.
-    fn minRepeat(self: *Builder) u8 {
+    /// Append `bytes` whatever the length limit says. Closing delimiters go
+    /// through this: dropping one would leave a `(` or `[` unmatched and the
+    /// pattern would be rejected outright, which is how nearly every case the
+    /// limit truncated used to be spent. `atom` keeps `reserve` bytes free
+    /// before opening anything, so the overshoot is a delimiter deep.
+    fn close(self: *Builder, bytes: []const u8) Error!void {
+        try self.buf.appendSlice(self.gpa, bytes);
+    }
+
+    /// Headroom `atom` requires before it will open a construct: enough for
+    /// the longest opener the generator writes (`(?P<g40>`) and its closer.
+    const reserve = 16;
+
+    /// Smallest maximum to give a repeat. PCRE2's quirk is a repeat that can
+    /// run no iterations at all over certain bodies -- `{0}` and the `{0,0}`
+    /// that means the same thing -- where it fails the whole pattern rather
+    /// than matching empty; Python and zregex both match. It handles `{0,}`
+    /// and `{0,m}` for m of one or more exactly as zregex does, so only the
+    /// maximum is held above zero and minimums stay free.
+    ///
+    /// This used to raise every minimum instead, which meant the oracle never
+    /// generated a nullable loop with a zero minimum at all -- and that is
+    /// where the Pike VM's guard-bit ceiling was producing a wrong capture.
+    fn minRepeatMax(self: *Builder) u8 {
         return if (self.avoid_pcre2_quirks) 1 else 0;
     }
 
@@ -141,37 +182,124 @@ pub const Builder = struct {
         try self.put(c);
     }
 
+    /// A shorthand set, written the same way inside a class or out.
+    /// The negated spellings reach the complement of a range list, which is
+    /// built by a different path in the compiler than the positive one.
+    fn shorthand(self: *Builder) Error!void {
+        try self.put(switch (self.src.choice(enum { d, w, s, D, W, S })) {
+            .d => "\\d",
+            .w => "\\w",
+            .s => "\\s",
+            .D => "\\D",
+            .W => "\\W",
+            .S => "\\S",
+        });
+    }
+
+    /// One member of a bracketed class: a character, a range, a shorthand,
+    /// or one of the positions where `]` and `-` are literal.
+    fn classMember(self: *Builder, first: bool) Error!void {
+        switch (self.src.choice(enum {
+            char,
+            ascii_range,
+            high_range,
+            shorthand,
+            posix,
+            dash,
+            bracket,
+            escaped,
+        })) {
+            .char => {
+                const c = pattern_chars[self.src.index(pattern_chars.len)];
+                // A newline has to be written as an escape, and a bare `-`
+                // would start a range rather than stand for itself.
+                if (std.mem.eql(u8, c, "\n")) return self.put("\\n");
+                if (std.mem.eql(u8, c, "-")) return self.put("\\-");
+                try self.put(c);
+            },
+            .ascii_range => try self.put(switch (self.src.choice(enum { az, AZ, d09, sym })) {
+                .az => "a-c",
+                .AZ => "A-C",
+                .d09 => "0-3",
+                .sym => " -@",
+            }),
+            // A range reaching past ASCII cannot use the inlined bitmap or
+            // the vector scanner, so it takes the helper path. Under `(?i)`
+            // PCRE2 10.47 stops matching characters such a range matches
+            // without the flag, so it is left out when it is the reference.
+            .high_range => try self.put(if (self.avoid_pcre2_quirks)
+                "\u{e9}"
+            else
+                "\u{a0}-\u{2fff}"),
+            .shorthand => try self.shorthand(),
+            // A POSIX bracket class, which only means anything in here. Half
+            // are negated, which reaches the complement of a range list.
+            .posix => {
+                const name = posix_names[self.src.index(posix_names.len)];
+                // One piece: a dropped name would leave `[::]`, which is not
+                // a class either engine knows.
+                var buf: [16]u8 = undefined;
+                try self.put(std.fmt.bufPrint(&buf, "[:{s}{s}:]", .{
+                    if (self.src.boolean()) "^" else "",
+                    name,
+                }) catch unreachable);
+            },
+            // `-` is a literal first, last, or after a range; anywhere else
+            // it would start one.
+            .dash => try self.put(if (first) "-" else "\\-"),
+            // `]` is a literal only as the very first member.
+            .bracket => try self.put(if (first) "]" else "\\]"),
+            .escaped => {
+                const c = pattern_chars[self.src.index(pattern_chars.len)];
+                if (c.len != 1 or c[0] <= ' ') return self.put("\\n");
+                var buf: [10]u8 = undefined;
+                const spelled = switch (self.src.choice(enum { octal, hex, braced })) {
+                    .octal => std.fmt.bufPrint(&buf, "\\{o}", .{c[0]}),
+                    .hex => std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{c[0]}),
+                    .braced => std.fmt.bufPrint(&buf, "\\x{{{x}}}", .{c[0]}),
+                } catch return self.put(c);
+                try self.put(spelled);
+            },
+        }
+    }
+
+    /// A bracketed class of one to four members, negated half the time.
+    fn bracketed(self: *Builder) Error!void {
+        try self.close(if (self.src.boolean()) "[^" else "[");
+        const opened = self.buf.items.len;
+        const n = self.src.intRange(u8, 1, 4);
+        for (0..n) |i| try self.classMember(i == 0);
+        // Every member ran into the length limit. `[]` and `[^]` are not
+        // empty classes to either zregex or PCRE2 -- both read that `]` as a
+        // literal and then look for the real one -- so put a member back.
+        if (self.buf.items.len == opened) try self.close("a");
+        try self.close("]");
+    }
+
     pub fn class(self: *Builder) Error!void {
         switch (self.src.choice(enum {
-            digit,
-            word,
-            space,
+            shorthand,
+            dot,
+            bracketed,
             set,
             negated,
-            dot,
             high_set,
-            high_range,
             mixed,
         })) {
-            .digit => try self.put("\\d"),
-            .word => try self.put("\\w"),
-            .space => try self.put("\\s"),
+            .shorthand => try self.shorthand(),
             .dot => try self.put("."),
+            .bracketed => try self.bracketed(),
             .set => try self.put("[ab1]"),
             .negated => try self.put("[^ab]"),
             // Classes reaching past ASCII cannot use the inlined bitmap or
             // the vector scanner, so these take the helper path.
             .high_set => try self.put("[\u{e9}\u{20ac}]"),
-            .high_range => try self.put(if (self.avoid_pcre2_quirks)
-                "[\u{e9}\u{20ac}]"
-            else
-                "[\u{a0}-\u{2fff}]"),
             .mixed => try self.put("[a\u{e9}1]"),
         }
     }
 
     pub fn atom(self: *Builder, depth: u8) Error!void {
-        if (depth >= self.depth_limit or self.buf.items.len + 8 > self.length_limit) {
+        if (depth >= self.depth_limit or self.buf.items.len + reserve > self.length_limit) {
             try self.literal();
             return;
         }
@@ -194,46 +322,74 @@ pub const Builder = struct {
                 self.groups += 1;
                 self.open.set(self.groups);
                 // Half the groups are named, so that named capture and
-                // `\k<name>` are exercised alongside the numbered forms.
+                // `\k<name>` are exercised alongside the numbered forms. All
+                // three spellings of a named group mean the same thing, so
+                // rotating between them costs no generality and reaches the
+                // two the parser would otherwise never see.
                 if (self.src.boolean()) {
                     self.named.set(self.groups);
-                    try self.put("(?<g");
-                    try self.putDigits(self.groups);
-                    try self.put(">");
+                    var buf: [16]u8 = undefined;
+                    // Written in one piece: half an opener would either be a
+                    // parse error or, worse, silently name two groups alike.
+                    const opener = switch (self.src.choice(enum { angle, python, quoted })) {
+                        .angle => std.fmt.bufPrint(&buf, "(?<g{d}>", .{self.groups}),
+                        .python => std.fmt.bufPrint(&buf, "(?P<g{d}>", .{self.groups}),
+                        .quoted => std.fmt.bufPrint(&buf, "(?'g{d}'", .{self.groups}),
+                    } catch unreachable;
+                    try self.close(opener);
                 } else {
-                    try self.put("(");
+                    try self.close("(");
                 }
                 const opened = self.groups;
                 try self.sequence(depth + 1);
-                try self.put(")");
+                try self.close(")");
                 self.open.unset(opened);
             },
             .noncapturing => {
-                try self.put("(?:");
+                try self.close("(?:");
                 try self.sequence(depth + 1);
-                try self.put(")");
+                try self.close(")");
             },
             .alternation => {
-                try self.put("(?:");
-                try self.sequence(depth + 1);
-                try self.put("|");
-                try self.sequence(depth + 1);
-                try self.put(")");
+                try self.close("(?:");
+                const branches = self.src.intRange(u8, 2, 4);
+                for (0..branches) |i| {
+                    // Structural, like the parens: a dropped `|` would not
+                    // fail to parse, it would quietly concatenate two
+                    // branches into one and generate something else.
+                    if (i != 0) try self.close("|");
+                    // An empty branch makes the whole alternation able to
+                    // match nothing, which is what the empty-loop guard in
+                    // every engine has to agree about once a quantifier
+                    // follows.
+                    if (self.src.index(5) == 0) continue;
+                    try self.sequence(depth + 1);
+                }
+                try self.close(")");
             },
-            .anchor => switch (self.src.choice(enum {
-                start,
-                end,
-                word,
-                not_word,
-                text_start,
-                text_end,
-            })) {
-                .start => try self.put("^"),
-                .end => try self.put("$"),
-                .word => try self.put("\\b"),
-                .not_word => try self.put("\\B"),
-                .text_start => try self.put("\\A"),
-                .text_end => try self.put("\\z"),
+            .anchor => {
+                // PCRE2 will not compile a quantified anchor, so when it is
+                // the reference the caller is told to leave this one alone.
+                if (self.avoid_pcre2_quirks) self.no_quantifier = true;
+                switch (self.src.choice(enum {
+                    start,
+                    end,
+                    word,
+                    not_word,
+                    text_start,
+                    text_end,
+                    text_end_or_newline,
+                })) {
+                    .start => try self.put("^"),
+                    .end => try self.put("$"),
+                    .word => try self.put("\\b"),
+                    .not_word => try self.put("\\B"),
+                    .text_start => try self.put("\\A"),
+                    .text_end => try self.put("\\z"),
+                    // `\Z` differs from `\z` only when the haystack ends in a
+                    // newline, which the chunk alphabet makes happen often.
+                    .text_end_or_newline => try self.put("\\Z"),
+                }
             },
             .backref => {
                 // Only ever refers to a group that is already open or closed.
@@ -253,59 +409,119 @@ pub const Builder = struct {
                 }
             },
             .lookahead => {
-                try self.put(if (self.src.boolean()) "(?=" else "(?!");
-                try self.literal();
-                try self.put(")");
+                try self.close(if (self.src.boolean()) "(?=" else "(?!");
+                // A whole sequence, not just one character: a lookahead may
+                // hold groups, alternation and unbounded repeats, and the
+                // captures it records survive a positive assertion while a
+                // negative one has to leave them unset.
+                try self.sequence(depth + 1);
+                try self.close(")");
             },
             .lookbehind => {
-                try self.put(if (self.src.boolean()) "(?<=" else "(?<!");
-                try self.literal();
-                try self.put(")");
+                try self.close(if (self.src.boolean()) "(?<=" else "(?<!");
+                try self.lookbehindBody();
+                try self.close(")");
             },
             .flags => {
-                // Always scoped and always with a body: a bare `(?i)` is not
-                // something a quantifier may follow.
-                try self.put(switch (self.src.choice(enum { i, s, m, minus_i })) {
-                    .i => "(?i:",
-                    .s => "(?s:",
-                    .m => "(?m:",
-                    .minus_i => "(?-i:",
-                });
+                const setting = switch (self.src.choice(enum { i, s, m, minus_i, ms })) {
+                    .i => "i",
+                    .s => "s",
+                    .m => "m",
+                    .minus_i => "-i",
+                    .ms => "ms",
+                };
+                // The unscoped form runs to the end of the enclosing group
+                // and crosses `|` on the way, which is a different rule from
+                // the scoped one and the only place it is exercised. Nothing
+                // may be quantified after it, so the caller is told to stop.
+                if (self.src.boolean()) {
+                    try self.close("(?");
+                    try self.close(setting);
+                    try self.close(")");
+                    self.no_quantifier = true;
+                    return;
+                }
+                try self.close("(?");
+                try self.close(setting);
+                try self.close(":");
                 try self.sequence(depth + 1);
-                try self.put(")");
+                try self.close(")");
             },
         }
     }
 
+    /// The body of a lookbehind. zregex allows a variable-length one, which
+    /// most engines do not, so this is where that support is exercised; the
+    /// lengths stay bounded because PCRE2 — the oracle's reference — accepts
+    /// a variable-length lookbehind only when its branches have a known
+    /// maximum, and an unbounded body would just be skipped there.
+    fn lookbehindBody(self: *Builder) Error!void {
+        const n = self.src.intRange(u8, 1, 3);
+        for (0..n) |_| {
+            const before = self.buf.items.len;
+            if (self.src.boolean()) {
+                try self.literal();
+            } else {
+                try self.class();
+            }
+            // Nothing was written, so there is nothing to quantify.
+            if (self.buf.items.len == before) continue;
+            var buf: [16]u8 = undefined;
+            try self.close(switch (self.src.choice(enum { none, none2, opt, exact, range })) {
+                .none, .none2 => continue,
+                .opt => "?",
+                .exact => std.fmt.bufPrint(&buf, "{{{d}}}", .{
+                    self.src.intRange(u8, 1, 3),
+                }) catch unreachable,
+                .range => blk: {
+                    const lo = self.src.intRange(u8, 0, 2);
+                    const hi = @max(self.src.intRange(u8, lo, 4), self.minRepeatMax());
+                    break :blk std.fmt.bufPrint(&buf, "{{{d},{d}}}", .{ lo, hi }) catch unreachable;
+                },
+            });
+        }
+    }
+
     pub fn quantified(self: *Builder, depth: u8) Error!void {
+        self.no_quantifier = false;
+        const before = self.buf.items.len;
         try self.atom(depth);
+        if (self.no_quantifier) {
+            self.no_quantifier = false;
+            return;
+        }
+        // The atom hit the length limit and wrote nothing, so a quantifier
+        // here would have nothing to apply to and the pattern would not
+        // parse. That is what most of the truncated cases used to become.
+        if (self.buf.items.len == before) return;
         if (self.src.boolean()) return;
-        switch (self.src.choice(enum { star, plus, opt, exact, range, open })) {
-            .star => try self.put("*"),
-            .plus => try self.put("+"),
-            .opt => try self.put("?"),
+        var buf: [16]u8 = undefined;
+        // Written in one piece: a `{` whose `}` was dropped would be read as
+        // a literal brace rather than as the quantifier meant here.
+        const quant = switch (self.src.choice(enum { star, plus, opt, exact, range, open })) {
+            .star => "*",
+            .plus => "+",
+            .opt => "?",
             // Bounds reach past the peeling threshold on purpose: above it
             // the compiler and both JIT backends switch to a counted loop.
-            .exact => {
-                try self.put("{");
-                try self.putDigits(self.src.intRange(u8, self.minRepeat(), 12));
-                try self.put("}");
+            .exact => std.fmt.bufPrint(&buf, "{{{d}}}", .{
+                self.src.intRange(u8, self.minRepeatMax(), 12),
+            }) catch unreachable,
+            .range => blk: {
+                const lo = self.src.intRange(u8, 0, 6);
+                // Now and then the upper bound runs well past the peeling
+                // threshold, where the counted loop a repeat compiles to is
+                // the only thing keeping the program a reasonable size.
+                const hi_max: u8 = if (self.src.index(8) == 0) 60 else 12;
+                const hi = @max(self.src.intRange(u8, lo, hi_max), self.minRepeatMax());
+                break :blk std.fmt.bufPrint(&buf, "{{{d},{d}}}", .{ lo, hi }) catch unreachable;
             },
-            .range => {
-                const lo = self.src.intRange(u8, self.minRepeat(), 6);
-                try self.put("{");
-                try self.putDigits(lo);
-                try self.put(",");
-                try self.putDigits(self.src.intRange(u8, lo, 12));
-                try self.put("}");
-            },
-            .open => {
-                try self.put("{");
-                try self.putDigits(self.src.intRange(u8, self.minRepeat(), 10));
-                try self.put(",}");
-            },
-        }
-        if (self.src.boolean()) try self.put("?"); // lazy
+            .open => std.fmt.bufPrint(&buf, "{{{d},}}", .{
+                self.src.intRange(u8, 0, 10),
+            }) catch unreachable,
+        };
+        try self.close(quant);
+        if (self.src.boolean()) try self.close("?"); // lazy
     }
 
     pub fn sequence(self: *Builder, depth: u8) Error!void {

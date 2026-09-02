@@ -4,10 +4,11 @@
 //! Shared types and helpers used by the parser, compiler, and both engines.
 const std = @import("std");
 const expect = std.testing.expect;
+const casefold = @import("casefold");
 
 /// Compile-time flags affecting pattern semantics.
 pub const Flags = struct {
-    /// ASCII case-insensitive matching.
+    /// Case-insensitive matching, using Unicode simple case folding.
     case_insensitive: bool = false,
     /// `^`/`$` match at line boundaries in addition to text boundaries.
     multiline: bool = false,
@@ -77,12 +78,74 @@ pub fn isWordChar(cp: u21) bool {
     };
 }
 
-/// ASCII-only lowercase fold.
+/// Simple case folding, over the whole of Unicode.
+///
+/// Most matching never calls this: a caseless literal or class is rewritten
+/// into its case-equivalence classes while the pattern is compiled, so by the
+/// time an engine runs there is no folding left to do. What remains is the
+/// caseless backreference, whose text is only known while matching.
 pub fn foldLower(cp: u21) u21 {
-    return if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+    // ASCII is the overwhelming majority and needs no table.
+    if (cp < 0x80) return if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+    var lo: usize = 0;
+    var hi: usize = casefold.folds.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const at = casefold.folds[mid][0];
+        if (at == cp) return casefold.folds[mid][1];
+        if (at < cp) lo = mid + 1 else hi = mid;
+    }
+    return cp;
 }
 
-/// Codepoint equality, optionally ASCII case-insensitive.
+/// The codepoints that match `cp` under `(?i)`, `cp` itself included. All but
+/// about fifteen hundred codepoints are equivalent only to themselves, which
+/// is why the single-element answer is written into the caller's buffer rather
+/// than found in a table.
+pub fn caseOrbit(cp: u21, single: *[1]u21) []const u21 {
+    if (cp >= 0x80 or (cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z')) {
+        for (casefold.orbits) |orbit| {
+            // Orbits are sorted by their first member, so a codepoint below
+            // this one cannot appear in any later orbit either.
+            if (orbit[0] > cp) break;
+            for (orbit) |m| {
+                if (m == cp) return orbit;
+            }
+        }
+    }
+    single[0] = cp;
+    return single;
+}
+
+/// How many bytes of `input` at `pos` a backreference to `text` consumes, or
+/// null if it does not match there.
+///
+/// Caselessly, that length need not be `text.len`: `Ⱥ` (U+023A) is two bytes
+/// and the `ⱥ` (U+2C65) it folds together with is three, so the text a
+/// backreference matches can be longer or shorter than the text it captured.
+/// Comparing byte by byte -- which is what this did while folding was
+/// ASCII-only, where every pair of cases has the same length -- gets both the
+/// comparison and the length wrong.
+pub fn backrefLen(input: []const u8, pos: usize, text: []const u8, ci: bool) ?usize {
+    if (!ci) {
+        if (pos + text.len > input.len) return null;
+        if (!std.mem.eql(u8, text, input[pos..][0..text.len])) return null;
+        return text.len;
+    }
+    var ti: usize = 0;
+    var hi: usize = pos;
+    while (ti < text.len) {
+        if (hi >= input.len) return null;
+        const want = decode(text, ti);
+        const got = decode(input, hi);
+        if (foldLower(want.cp) != foldLower(got.cp)) return null;
+        ti += want.len;
+        hi += got.len;
+    }
+    return hi - pos;
+}
+
+/// Codepoint equality, optionally case-insensitive.
 pub fn charEq(a: u21, b: u21, ci: bool) bool {
     if (a == b) return true;
     return ci and foldLower(a) == foldLower(b);

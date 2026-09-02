@@ -14,6 +14,10 @@
             .hash = "win32-42.0.39-preview-mX5pFS564gPTezZn4v3TMxRnfJUrZNx1B_F2p2HKXOeG",
             .lazy = true,
         },
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode?ref=main#61e54266895f833b307de81a0e3038cf1f1bebd4",
+            .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",
+        },
     },
     .paths = .{
         "build.zig",

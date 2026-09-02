@@ -21,6 +21,63 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("pattern_gen", gen_mod);
 
+    // How hard the seeded differential fuzzer runs. The defaults are what
+    // every `zig build test` pays for; a soak raises the count and walks the
+    // seed, which is the only way to reach cases a single fixed seed never
+    // generates. Build options rather than environment variables because a
+    // test binary has no portable way to read the environment.
+    const fuzz_opts = b.addOptions();
+    fuzz_opts.addOption(
+        usize,
+        "cases",
+        b.option(usize, "fuzz-cases", "Seeded differential fuzz cases per run (default 3000)") orelse 3000,
+    );
+    fuzz_opts.addOption(
+        u64,
+        "seed",
+        b.option(u64, "fuzz-seed", "Seed for the seeded differential fuzzer") orelse 0x2026_08_31,
+    );
+    fuzz_opts.addOption(
+        usize,
+        "alloc_cases",
+        b.option(usize, "fuzz-alloc-cases", "Allocation-failure fuzz cases per run (default 40)") orelse 40,
+    );
+    mod.addImport("fuzz_options", fuzz_opts.createModule());
+
+    // Case-folding tables, generated from the `uucode` package rather than
+    // written out here or fetched at run time. Only the fifteen hundred
+    // codepoints that actually fold end up in the library, and because the
+    // result is an ordinary Zig source file it is available to
+    // `Regex.compileComptime` as well as at run time. `uucode` is therefore a
+    // build-time dependency only; nothing links against it.
+    const casefold_mod = blk: {
+        // The Unicode data comes from `uucode`, but as the `CaseFolding.txt`
+        // it vendors rather than through its generated tables: the fields that
+        // distinguish a simple fold from a Turkic one -- which is the
+        // distinction that decides whether `İ` matches `i` -- do not currently
+        // build (`memset: unsupported non-byte-aligned type`, uucode 0.2.0).
+        // Reading the file says exactly what is wanted, and says it in the
+        // vocabulary of the Unicode standard rather than of a library.
+        const uucode = b.dependency("uucode", .{});
+
+        const gen = b.addExecutable(.{
+            .name = "gen-casefold",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gen_casefold.zig"),
+                // Always built for the machine running the build: it is run
+                // during the build, whatever `-Dtarget` was asked for.
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const run_gen = b.addRunArtifact(gen);
+        run_gen.addFileArg(uucode.path("ucd/CaseFolding.txt"));
+        break :blk b.createModule(.{
+            .root_source_file = run_gen.addOutputFileArg("casefold.zig"),
+        });
+    };
+    mod.addImport("casefold", casefold_mod);
+
     // On Windows the JIT maps executable memory through the Win32 API.
     // Lazy, so builds for other targets never fetch the bindings.
     if (target.result.os.tag == .windows) {

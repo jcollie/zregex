@@ -124,7 +124,7 @@ pub const Regex = struct {
         pattern: []const u8,
         flags: Flags,
     ) CompileError!Regex {
-        const sizes = parser.bufferSizes(pattern.len);
+        const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
         const nodes = try gpa.alloc(parser.Node, sizes.nodes);
         defer gpa.free(nodes);
         const ranges_tmp = try gpa.alloc(common.ClassRange, sizes.ranges);
@@ -179,6 +179,10 @@ pub const Regex = struct {
         } else {
             alphabet.starts = &.{};
         }
+        // Every other buffer this function keeps has one of these. Without it
+        // an allocation failure anywhere below -- the group names, or the JIT
+        // -- returns the error with this one still held.
+        errdefer gpa.free(alphabet.starts);
 
         // Group names point into `pattern`, which the caller may free; copy
         // them into one owned buffer.
@@ -229,7 +233,7 @@ pub const Regex = struct {
     pub fn compileComptimeWithFlags(comptime pattern: []const u8, comptime flags: Flags) Regex {
         comptime {
             @setEvalBranchQuota(10_000_000);
-            const sizes = parser.bufferSizes(pattern.len);
+            const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
             var nodes: [sizes.nodes]parser.Node = undefined;
             var ranges: [sizes.ranges]common.ClassRange = undefined;
             var names: [sizes.names]parser.NamedGroup = undefined;

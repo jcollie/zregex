@@ -174,14 +174,10 @@ pub fn helperBackref(ctx: *Ctx, pc: usize, pos: usize) callconv(.c) usize {
     // the end of the previous iteration's capture.
     if (a == unset or b == unset or a > b) return 0;
     const text = input[a..b];
-    if (pos + text.len > input.len) return 0;
-    const hay = input[pos..][0..text.len];
-    if (br.ci) {
-        for (text, hay) |x, y| {
-            if (common.foldLower(x) != common.foldLower(y)) return 0;
-        }
-    } else if (!std.mem.eql(u8, text, hay)) return 0;
-    return text.len + 1;
+    // Biased by one so that zero can mean "no match": a backreference to an
+    // empty group matches and consumes nothing.
+    const n = common.backrefLen(input, pos, text, br.ci) orelse return 0;
+    return n + 1;
 }
 
 /// Slot sentinel for "did not participate"; the interpreter uses `null`.

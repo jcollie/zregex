@@ -734,16 +734,24 @@ pub fn compile(
 ) std.mem.Allocator.Error!?u32 {
     if (!Support.canCompile(prog)) return null;
 
+    // Allocated ahead of the struct rather than inside it, each with its
+    // cleanup registered before the next is attempted. A `try` inside a
+    // struct literal abandons the expression on failure, so `g` is never
+    // assigned and a `defer` written after the literal never runs -- which
+    // leaked `pc_labels` whenever the allocation right after it failed.
+    const pc_labels = try gpa.alloc(x64.Label, prog.insts.len);
+    defer gpa.free(pc_labels);
+    const dead = try gpa.alloc(bool, prog.insts.len);
+    defer gpa.free(dead);
+
     var g = Gen{
         .a = x64.Asm.init(gpa, code_buf),
         .prog = prog,
         .gpa = gpa,
-        .pc_labels = try gpa.alloc(x64.Label, prog.insts.len),
-        .dead = try gpa.alloc(bool, prog.insts.len),
+        .pc_labels = pc_labels,
+        .dead = dead,
         .prefilter = prefilter,
     };
-    defer gpa.free(g.pc_labels);
-    defer gpa.free(g.dead);
     defer g.blobs.deinit(gpa);
     defer g.bits_cache.deinit(gpa);
     defer g.a.deinit();
@@ -821,7 +829,7 @@ pub fn compile(
             a.leaLabel(.rsi, pf_table);
             a.cmpMem8Imm(.{ .base = .rsi, .index = .rax, .scale = 0 }, 0);
             a.jcc(.ne, l_ok);
-            if (prefilter.ascii_only) {
+            if (prefilter.byte_steppable) {
                 // Every candidate byte is ASCII, so stepping bytes cannot land
                 // inside a codepoint.
                 a.incReg(r_pos);

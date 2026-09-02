@@ -21,12 +21,19 @@
 //!     zregex does, and haystacks are restricted to valid UTF-8 — zregex
 //!     decodes invalid bytes as one-byte codepoints, which UTF mode rejects
 //!     outright rather than defining differently.
-//!   * Patterns PCRE2 will not compile are skipped; it rejects some that
-//!     zregex accepts, such as a quantified anchor.
+//!   * A quantified anchor -- `^*`, `\b+` -- is not generated. zregex
+//!     compiles one; PCRE2 turns it down as a quantifier on an unrepeatable
+//!     item, and left in it was most of what this tool generated and threw
+//!     away. Anything else PCRE2 will not compile is skipped when it comes up.
 //!   * Two constructs PCRE2 10.47 gets wrong are not generated — a caseless
-//!     class holding a wide non-ASCII range, and a `{0}` repeat over certain
-//!     bodies — since otherwise the tool mostly reports the reference's own
-//!     bugs. Python agrees with zregex on both; see the tests in src/tests.zig.
+//!     class holding a wide non-ASCII range, and a repeat that may run no
+//!     iterations at all (`{0}`, and the `{0,0}` that means the same) over
+//!     certain bodies — since otherwise the tool mostly reports the
+//!     reference's own bugs. Only the *maximum* is held above zero for that
+//!     second one: `{0,}` and `{0,m}` are generated, and have to be, since a
+//!     nullable loop with a zero minimum is where the Pike VM's guard-bit
+//!     ceiling was found to produce a wrong capture. Python agrees with
+//!     zregex on both; see the tests in src/tests.zig.
 //!   * A backreference to the group that encloses it is not generated.
 //!     PCRE2 is not self-consistent there — `1(\1*)` matches but
 //!     `1(2|\1*)` does not, though the only difference is which alternative
@@ -49,24 +56,46 @@ const c = @cImport({
 const pcre2_zero_terminated: usize = std.math.maxInt(usize);
 const pcre2_unset: usize = std.math.maxInt(usize);
 
+/// Capture groups zregex will compile, group 0 included; mirrors
+/// `parser.max_groups`, which is not public. A pattern with more than this
+/// many is one zregex rejects, so nothing is lost by sizing to it.
+const max_groups = 100;
+
 const Result = struct {
     matched: bool,
-    /// Start/end pairs, group 0 first; unset groups are `null`.
-    groups: [20]?zregex.Span = @splat(null),
+    /// Start/end pairs, group 0 first; unset groups are `null`. Sized to hold
+    /// every group zregex can compile, so a comparison never has to stop
+    /// short of what the pattern actually captured.
+    groups: [max_groups]?zregex.Span = @splat(null),
+    /// Pairs PCRE2 filled. May exceed `groups.len` for a pattern with more
+    /// captures than zregex would accept, so every read of `groups` is
+    /// clamped to `usable()` rather than to this.
     count: usize = 0,
+
+    /// How many of `groups` actually hold a value.
+    fn usable(self: Result) usize {
+        return @min(self.count, self.groups.len);
+    }
 };
 
-fn runPcre2(pattern: [:0]const u8, hay: []const u8, out: *Result) !bool {
+/// Set by `runPcre2` when PCRE2 turns a pattern down, so the caller can bucket
+/// the reasons rather than just counting them.
+var last_pcre2_error: c_int = 0;
+
+fn runPcre2(pattern: [:0]const u8, hay: []const u8, out: *Result, options: u32) !bool {
     var errcode: c_int = 0;
     var erroffset: usize = 0;
     const re = c.pcre2_compile_8(
         pattern.ptr,
         pcre2_zero_terminated,
-        c.PCRE2_UTF,
+        c.PCRE2_UTF | options,
         &errcode,
         &erroffset,
         null,
-    ) orelse return false; // rejected by PCRE2; nothing to compare
+    ) orelse {
+        last_pcre2_error = errcode;
+        return false; // rejected by PCRE2; nothing to compare
+    };
     defer c.pcre2_code_free_8(re);
 
     const md = c.pcre2_match_data_create_from_pattern_8(re, null);
@@ -97,16 +126,27 @@ fn runPcre2(pattern: [:0]const u8, hay: []const u8, out: *Result) !bool {
 /// disagrees, so that a shrinker can drive it. Invoked as:
 ///
 ///     zig build oracle ... -- --case '<pattern>' '<haystack>'
-fn oneCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, verbose: bool) !u8 {
+fn oneCase(
+    gpa: std.mem.Allocator,
+    pattern: [:0]const u8,
+    subject: []const u8,
+    verbose: bool,
+    flags: zregex.Flags,
+) !u8 {
+    var pcre2_options: u32 = 0;
+    if (flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
+    if (flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
+    if (flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
+
     var expected: Result = .{ .matched = false };
-    if (!try runPcre2(pattern, subject, &expected)) {
+    if (!try runPcre2(pattern, subject, &expected, pcre2_options)) {
         if (verbose) std.debug.print("pcre2 rejected the pattern\n", .{});
         return 2;
     }
     if (verbose) {
         std.debug.print("  pcre2:    ", .{});
         if (expected.matched) {
-            for (0..expected.count) |i| {
+            for (0..expected.usable()) |i| {
                 if (expected.groups[i]) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
             }
         } else std.debug.print(" no match", .{});
@@ -115,7 +155,7 @@ fn oneCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, v
 
     var bad = false;
     for ([_][]const u8{ "pike", "backtrack", "jit" }) |which| {
-        var re = zregex.Regex.compile(gpa, pattern) catch {
+        var re = zregex.Regex.compileWithFlags(gpa, pattern, flags) catch {
             if (verbose) std.debug.print("  zregex rejected the pattern\n", .{});
             return 2;
         };
@@ -157,7 +197,7 @@ fn oneCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, v
             bad = true;
         } else if (got) |m| {
             for (m.groups, 0..) |g, i| {
-                if (i >= expected.count) break;
+                if (i >= expected.usable()) break;
                 const e = expected.groups[i];
                 if ((g == null) != (e == null)) bad = true;
                 if (g != null and e != null and
@@ -185,7 +225,13 @@ fn spansEqual(a: []const ?zregex.Span, b: []const ?zregex.Span) bool {
 /// disagreed before. Invoked as:
 ///
 ///     zig build oracle ... -- --engines '<pattern>' '<haystack>'
-fn engineCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8, verbose: bool) !u8 {
+fn engineCase(
+    gpa: std.mem.Allocator,
+    pattern: [:0]const u8,
+    subject: []const u8,
+    verbose: bool,
+    flags: zregex.Flags,
+) !u8 {
     const Setting = struct { name: []const u8, apply: *const fn (*zregex.Regex) void };
     const settings = [_]Setting{
         .{ .name = "pike", .apply = struct {
@@ -222,7 +268,7 @@ fn engineCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8
     var differ = false;
 
     for (settings) |setting| {
-        var re = zregex.Regex.compile(gpa, pattern) catch return 2;
+        var re = zregex.Regex.compileWithFlags(gpa, pattern, flags) catch return 2;
         defer re.deinit();
         re.max_steps = 1_000_000;
         setting.apply(&re);
@@ -278,30 +324,421 @@ fn engineCase(gpa: std.mem.Allocator, pattern: [:0]const u8, subject: []const u8
     return if (differ) 1 else 0;
 }
 
+// ---------------------------------------------------------------------------
+// PCRE2's own test corpus
+//
+// The generator writes patterns from a grammar, which means it only ever
+// produces what that grammar describes. PCRE2's test files are the opposite
+// kind of input: nine thousand patterns written by hand, over decades, mostly
+// *because* something once went wrong with them. Running them costs nothing to
+// maintain -- they are read from a PCRE2 source tree at the path given, never
+// copied in here -- and reaches shapes no grammar of ours would think to make.
+//
+//     zig build oracle ... -- --corpus <pcre2-source>/testdata
+//
+// The files are pcre2test scripts. Only the parts that survive translation are
+// used: a pattern between `/` delimiters, and the subject lines under it. The
+// trailing modifiers are read for `i`, `m` and `s` and otherwise ignored --
+// deliberately, since anything not passed to PCRE2 either leaves both
+// libraries reading the same pattern the same way, which is all a differential
+// comparison needs. A pattern written for `/x` compared as though it were not
+// is still a valid comparison; it is simply a different pattern than its
+// author meant.
+
+/// One pattern from a test file, with the subjects that followed it.
+const CorpusCase = struct {
+    pattern: []const u8,
+    flags: zregex.Flags,
+    subjects: std.ArrayList([]const u8),
+};
+
+/// Decode the backslash escapes pcre2test understands in a subject line.
+/// Returns false if it meets one this does not know, in which case the caller
+/// keeps the line as written -- both libraries still receive the same bytes,
+/// so the comparison stays sound either way and only the subject is less
+/// interesting than its author intended.
+fn decodeSubject(gpa: std.mem.Allocator, line: []const u8, out: *std.ArrayList(u8)) !bool {
+    out.clearRetainingCapacity();
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] != '\\') {
+            try out.append(gpa, line[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= line.len) return false;
+        const esc = line[i];
+        i += 1;
+        switch (esc) {
+            '\\' => try out.append(gpa, '\\'),
+            'a' => try out.append(gpa, 0x07),
+            'e' => try out.append(gpa, 0x1B),
+            'f' => try out.append(gpa, 0x0C),
+            'n' => try out.append(gpa, 0x0A),
+            'r' => try out.append(gpa, 0x0D),
+            't' => try out.append(gpa, 0x09),
+            'x' => {
+                if (i < line.len and line[i] == '{') {
+                    i += 1;
+                    const start = i;
+                    while (i < line.len and line[i] != '}') i += 1;
+                    if (i >= line.len) return false;
+                    const cp = std.fmt.parseInt(u21, line[start..i], 16) catch return false;
+                    i += 1; // '}'
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch return false;
+                    try out.appendSlice(gpa, buf[0..n]);
+                } else {
+                    if (i + 2 > line.len) return false;
+                    const v = std.fmt.parseInt(u8, line[i..][0..2], 16) catch return false;
+                    i += 2;
+                    try out.append(gpa, v);
+                }
+            },
+            '0'...'7' => {
+                var v: u16 = esc - '0';
+                var digits: usize = 1;
+                while (digits < 3 and i < line.len and line[i] >= '0' and line[i] <= '7') {
+                    v = v * 8 + (line[i] - '0');
+                    i += 1;
+                    digits += 1;
+                }
+                if (v > 255) return false;
+                try out.append(gpa, @intCast(v));
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Read one pcre2test file into cases. `text` must outlive the result: the
+/// patterns and subjects point into it, except where an escape was decoded.
+fn parseCorpusFile(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    cases: *std.ArrayList(CorpusCase),
+    owned: *std.ArrayList([]const u8),
+) !void {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| try lines.append(gpa, l);
+
+    var i: usize = 0;
+    while (i < lines.items.len) {
+        const line = lines.items[i];
+        // Directives and blank lines carry no pattern.
+        if (line.len == 0 or line[0] == '#' or line[0] != '/') {
+            i += 1;
+            continue;
+        }
+
+        // The pattern runs to the next unescaped delimiter, which may be on a
+        // later line -- pcre2test allows one to span several.
+        var pat: std.ArrayList(u8) = .empty;
+        errdefer pat.deinit(gpa);
+        var body = line[1..];
+        var mods: []const u8 = "";
+        var closed = false;
+        while (true) {
+            var j: usize = 0;
+            var esc = false;
+            while (j < body.len) : (j += 1) {
+                if (esc) {
+                    esc = false;
+                } else if (body[j] == '\\') {
+                    esc = true;
+                } else if (body[j] == '/') {
+                    try pat.appendSlice(gpa, body[0..j]);
+                    mods = body[j + 1 ..];
+                    closed = true;
+                    break;
+                }
+            }
+            if (closed) break;
+            try pat.appendSlice(gpa, body);
+            try pat.append(gpa, '\n');
+            i += 1;
+            if (i >= lines.items.len) break;
+            body = lines.items[i];
+        }
+        i += 1;
+        if (!closed) {
+            pat.deinit(gpa);
+            continue;
+        }
+
+        // Only the three flags both libraries spell the same way are read.
+        // Everything else is left off both sides; see the note above.
+        var flags: zregex.Flags = .{};
+        var m: usize = 0;
+        while (m < mods.len) : (m += 1) switch (mods[m]) {
+            'i' => flags.case_insensitive = true,
+            'm' => flags.multiline = true,
+            's' => flags.dot_all = true,
+            // A modifier word such as `mark` or `dupnames` must not be read
+            // one letter at a time, so skip to the next comma.
+            'a'...'h', 'j'...'l', 'n'...'r', 't'...'z' => {
+                while (m < mods.len and mods[m] != ',') m += 1;
+            },
+            else => {},
+        };
+
+        var subjects: std.ArrayList([]const u8) = .empty;
+        errdefer subjects.deinit(gpa);
+        while (i < lines.items.len) {
+            const raw = lines.items[i];
+            if (raw.len == 0 or raw[0] == '#' or raw[0] == '/') break;
+            i += 1;
+            const t = std.mem.trimStart(u8, raw, " \t");
+            // `\=` introduces per-subject directives rather than content.
+            if (std.mem.startsWith(u8, t, "\\=")) continue;
+            const cut = if (std.mem.indexOf(u8, t, "\\=")) |k| t[0..k] else t;
+            if (cut.len == 0) continue;
+
+            var dec: std.ArrayList(u8) = .empty;
+            defer dec.deinit(gpa);
+            const ok = decodeSubject(gpa, cut, &dec) catch false;
+            if (ok) {
+                const copy = try gpa.dupe(u8, dec.items);
+                try owned.append(gpa, copy);
+                try subjects.append(gpa, copy);
+            } else {
+                try subjects.append(gpa, cut);
+            }
+        }
+
+        const owned_pat = try pat.toOwnedSlice(gpa);
+        try owned.append(gpa, owned_pat);
+        try cases.append(gpa, .{
+            .pattern = owned_pat,
+            .flags = flags,
+            .subjects = subjects,
+        });
+    }
+}
+
+/// Compare zregex against PCRE2 over every pattern in a PCRE2 test directory.
+fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: bool) !u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
+        std.debug.print("cannot open {s}: {t}\n", .{ dir_path, err });
+        return 2;
+    };
+    defer dir.close(io);
+
+    var files: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    var walker = dir.iterate();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "testinput")) continue;
+        try files.append(gpa, try gpa.dupe(u8, entry.name));
+    }
+    // Iteration order is whatever the filesystem gives; sort so that two runs
+    // report the same thing.
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    if (files.items.len == 0) {
+        std.debug.print("no testinput* files in {s}\n", .{dir_path});
+        return 2;
+    }
+
+    var patterns: usize = 0;
+    var compared: usize = 0;
+    var skip_zregex: usize = 0;
+    var skip_pcre2: usize = 0;
+    var skip_budget: usize = 0;
+    var disagreements: usize = 0;
+    var reject_reasons: std.StringHashMapUnmanaged(usize) = .empty;
+    defer reject_reasons.deinit(gpa);
+    // A pattern that differs usually differs on every subject under it, and
+    // the same pattern often appears in several files. Report each one once.
+    var reported: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it3 = reported.keyIterator();
+        while (it3.next()) |k| gpa.free(k.*);
+        reported.deinit(gpa);
+    }
+
+    for (files.items) |name| {
+        const text = dir.readFileAlloc(io, name, gpa, .limited(64 << 20)) catch continue;
+        defer gpa.free(text);
+
+        var cases: std.ArrayList(CorpusCase) = .empty;
+        var owned: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (cases.items) |*cse| cse.subjects.deinit(gpa);
+            cases.deinit(gpa);
+            for (owned.items) |o| gpa.free(o);
+            owned.deinit(gpa);
+        }
+        try parseCorpusFile(gpa, text, &cases, &owned);
+
+        for (cases.items) |cse| {
+            patterns += 1;
+            const pattern = gpa.dupeZ(u8, cse.pattern) catch continue;
+            defer gpa.free(pattern);
+            // A pattern holding a NUL cannot reach PCRE2 through a C string.
+            if (std.mem.indexOfScalar(u8, cse.pattern, 0) != null) continue;
+
+            var re = zregex.Regex.compileWithFlags(gpa, pattern, cse.flags) catch |err| {
+                skip_zregex += 1;
+                const slot = try reject_reasons.getOrPut(gpa, @errorName(err));
+                if (!slot.found_existing) slot.value_ptr.* = 0;
+                slot.value_ptr.* += 1;
+                continue;
+            };
+            defer re.deinit();
+            re.max_steps = 200_000;
+
+            var pcre2_options: u32 = 0;
+            if (cse.flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
+            if (cse.flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
+            if (cse.flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
+
+            for (cse.subjects.items) |subject| {
+                // UTF mode is what makes the two agree about what a character
+                // is, and it will not accept a subject that is not valid.
+                if (!std.unicode.utf8ValidateSlice(subject)) continue;
+
+                var expected: Result = .{ .matched = false };
+                if (!(runPcre2(pattern, subject, &expected, pcre2_options) catch false)) {
+                    skip_pcre2 += 1;
+                    continue;
+                }
+
+                const got = re.find(gpa, subject) catch {
+                    skip_budget += 1;
+                    continue;
+                };
+                defer if (got) |m| {
+                    var mm = m;
+                    mm.deinit(gpa);
+                };
+                compared += 1;
+
+                var bad = false;
+                if ((got != null) != expected.matched) {
+                    bad = true;
+                } else if (got) |m| {
+                    for (m.groups, 0..) |g, gi| {
+                        if (gi >= expected.usable()) break;
+                        const e = expected.groups[gi];
+                        if ((g == null) != (e == null)) bad = true;
+                        if (g != null and e != null and
+                            (g.?.start != e.?.start or g.?.end != e.?.end)) bad = true;
+                    }
+                }
+                if (!bad) continue;
+
+                disagreements += 1;
+                const seen = try reported.getOrPut(gpa, pattern);
+                if (seen.found_existing) continue;
+                seen.key_ptr.* = try gpa.dupe(u8, pattern);
+                std.debug.print("DISAGREE [{s}] pattern={s} flags={s}{s}{s}\n  haystack={f}\n", .{
+                    name,
+                    pattern,
+                    if (cse.flags.case_insensitive) "i" else "",
+                    if (cse.flags.multiline) "m" else "",
+                    if (cse.flags.dot_all) "s" else "",
+                    std.zig.fmtString(subject),
+                });
+                std.debug.print("  zregex:", .{});
+                if (got) |m| {
+                    for (m.groups) |g| {
+                        if (g) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
+                    }
+                } else std.debug.print(" no match", .{});
+                std.debug.print("\n  pcre2: ", .{});
+                if (expected.matched) {
+                    for (0..expected.usable()) |gi| {
+                        if (expected.groups[gi]) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
+                    }
+                } else std.debug.print(" no match", .{});
+                std.debug.print("\n", .{});
+            }
+        }
+        if (verbose) std.debug.print("  {s}: {d} patterns so far\n", .{ name, patterns });
+    }
+
+    std.debug.print(
+        "corpus: {d} files, {d} patterns, {d} comparisons, skipped (zregex {d}, " ++
+            "pcre2 {d}, budget {d}), disagreements {d} over {d} distinct patterns\n",
+        .{
+            files.items.len, patterns,    compared,      skip_zregex,
+            skip_pcre2,      skip_budget, disagreements, reported.count(),
+        },
+    );
+    if (reject_reasons.count() != 0) {
+        std.debug.print("zregex parse errors:", .{});
+        var it2 = reject_reasons.iterator();
+        while (it2.next()) |e| std.debug.print(" {s}={d}", .{ e.key_ptr.*, e.value_ptr.* });
+        std.debug.print("\n", .{});
+    }
+    return if (disagreements != 0) 1 else 0;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
+    // Trailing options for the two single-case modes: `-q` shrinks quietly,
+    // since only the exit status matters then, and a run of `i`/`m`/`s` sets
+    // the same top-level flags the sweep reports beside a disagreement --
+    // without which one found under flags could not be reproduced here.
+    var verbose = true;
+    var cli_flags: zregex.Flags = .{};
+    if (args.len > 4) {
+        for (args[4..]) |opt| {
+            if (std.mem.eql(u8, opt, "-q")) {
+                verbose = false;
+                continue;
+            }
+            for (opt) |ch| switch (ch) {
+                'i' => cli_flags.case_insensitive = true,
+                'm' => cli_flags.multiline = true,
+                's' => cli_flags.dot_all = true,
+                else => {
+                    std.debug.print("unknown option: {s}\n", .{opt});
+                    std.process.exit(2);
+                },
+            };
+        }
+    }
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--corpus")) {
+        if (args.len < 3) {
+            std.debug.print("usage: --corpus <pcre2-source>/testdata\n", .{});
+            std.process.exit(2);
+        }
+        std.process.exit(try runCorpus(gpa, init.io, args[2], args.len > 3 and
+            std.mem.eql(u8, args[3], "-v")));
+    }
+
     if (args.len > 1 and std.mem.eql(u8, args[1], "--engines")) {
         if (args.len < 4) {
-            std.debug.print("usage: --engines <pattern> <haystack>\n", .{});
+            std.debug.print("usage: --engines <pattern> <haystack> [ims] [-q]\n", .{});
             std.process.exit(2);
         }
         const pat = try arena.dupeZ(u8, args[2]);
-        const verbose = args.len < 5 or !std.mem.eql(u8, args[4], "-q");
-        std.process.exit(try engineCase(gpa, pat, args[3], verbose));
+        std.process.exit(try engineCase(gpa, pat, args[3], verbose, cli_flags));
     }
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--case")) {
         if (args.len < 4) {
-            std.debug.print("usage: --case <pattern> <haystack>\n", .{});
+            std.debug.print("usage: --case <pattern> <haystack> [ims] [-q]\n", .{});
             std.process.exit(2);
         }
-        const pat = try arena.dupeZ(u8, args[2]);
-        // `-q` shrinks quietly: only the exit status matters then.
-        const verbose = args.len < 5 or !std.mem.eql(u8, args[4], "-q");
-        std.process.exit(try oneCase(gpa, pat, args[3], verbose));
+        std.process.exit(try oneCase(gpa, try arena.dupeZ(u8, args[2]), args[3], verbose, cli_flags));
     }
 
     const cases: usize = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 20000;
@@ -326,6 +763,17 @@ pub fn main(init: std.process.Init) !void {
     var rejected_but_valid: usize = 0;
     var skip_pcre2: usize = 0;
     var skip_budget: usize = 0;
+    // Which parse errors the generator runs into, so that a production
+    // emitting mostly-invalid patterns shows up as a bucket rather than as a
+    // quietly reduced comparison count.
+    var reject_reasons: std.StringHashMapUnmanaged(usize) = .empty;
+    defer reject_reasons.deinit(gpa);
+    var pcre2_reasons: std.StringHashMapUnmanaged(usize) = .empty;
+    defer {
+        var it = pcre2_reasons.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        pcre2_reasons.deinit(gpa);
+    }
 
     for (0..cases) |_| {
         var b = gen.Builder{ .src = src, .gpa = gpa, .avoid_pcre2_quirks = true };
@@ -344,23 +792,61 @@ pub fn main(init: std.process.Init) !void {
 
         var hay: std.ArrayList(u8) = .empty;
         defer hay.deinit(gpa);
-        const n = src.intRange(u8, 0, 20);
-        for (0..n) |_| {
-            const piece = gen.chunks[src.index(gen.chunks.len)];
-            // UTF mode will not accept the deliberately invalid pieces.
-            if (std.unicode.utf8ValidateSlice(piece)) try hay.appendSlice(gpa, piece);
+        // Most haystacks stay short, where a difference is easiest to read
+        // back. A minority are long, with long runs of one piece: the SIMD
+        // scanners, the lead-byte run skip and the prefilter only engage past
+        // a vector block, and a mistake shared by every zregex engine there
+        // is invisible to the in-tree fuzzer, which has no reference.
+        if (src.intRange(u8, 0, 5) == 0) {
+            const runs = src.intRange(u8, 1, 6);
+            for (0..runs) |_| {
+                const piece = gen.chunks[src.index(gen.chunks.len)];
+                if (!std.unicode.utf8ValidateSlice(piece)) continue;
+                const reps = src.intRange(u16, 1, 150);
+                for (0..reps) |_| try hay.appendSlice(gpa, piece);
+                const sep = gen.chunks[src.index(gen.chunks.len)];
+                if (std.unicode.utf8ValidateSlice(sep)) try hay.appendSlice(gpa, sep);
+            }
+        } else {
+            const n = src.intRange(u8, 0, 20);
+            for (0..n) |_| {
+                const piece = gen.chunks[src.index(gen.chunks.len)];
+                // UTF mode will not accept the deliberately invalid pieces.
+                if (std.unicode.utf8ValidateSlice(piece)) try hay.appendSlice(gpa, piece);
+            }
         }
 
         // An empty ArrayList's pointer is undefined; PCRE2 dereferences it.
         const subject: []const u8 = if (hay.items.len == 0) "" else hay.items;
 
-        var re = zregex.Regex.compile(gpa, pattern) catch |err| {
+        // Usually the defaults, but now and then a flag is set for the whole
+        // pattern rather than written into it. Both libraries take the same
+        // three, so this is a real comparison rather than a skipped case --
+        // and setting them from outside starts the parser somewhere an
+        // inline `(?i:...)` never does.
+        var flags: zregex.Flags = .{};
+        var pcre2_options: u32 = 0;
+        if (src.index(4) == 0) {
+            flags = .{
+                .case_insensitive = src.boolean(),
+                .multiline = src.boolean(),
+                .dot_all = src.boolean(),
+            };
+            if (flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
+            if (flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
+            if (flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
+        }
+
+        var re = zregex.Regex.compileWithFlags(gpa, pattern, flags) catch |err| {
             skipped += 1;
             skip_zregex += 1;
+            const slot = try reject_reasons.getOrPut(gpa, @errorName(err));
+            if (!slot.found_existing) slot.value_ptr.* = 0;
+            slot.value_ptr.* += 1;
             // A pattern zregex turns down that PCRE2 compiles is a gap in
             // this library, not a case to skip quietly. Report a few.
             var probe: Result = .{ .matched = false };
-            if (runPcre2(pattern, subject, &probe) catch false) {
+            if (runPcre2(pattern, subject, &probe, pcre2_options) catch false) {
                 rejected_but_valid += 1;
                 if (rejected_but_valid <= 12) {
                     std.debug.print("ZREGEX REJECTS (PCRE2 accepts): {t}  pattern={s}\n", .{ err, pattern });
@@ -372,9 +858,19 @@ pub fn main(init: std.process.Init) !void {
         re.max_steps = 200_000;
 
         var expected: Result = .{ .matched = false };
-        if (!try runPcre2(pattern, subject, &expected)) {
+        if (!try runPcre2(pattern, subject, &expected, pcre2_options)) {
             skipped += 1;
             skip_pcre2 += 1;
+            var msg: [128]u8 = undefined;
+            const len = c.pcre2_get_error_message_8(last_pcre2_error, &msg, msg.len);
+            if (len > 0) {
+                const slot = try pcre2_reasons.getOrPut(gpa, msg[0..@intCast(len)]);
+                if (!slot.found_existing) {
+                    slot.key_ptr.* = try gpa.dupe(u8, msg[0..@intCast(len)]);
+                    slot.value_ptr.* = 0;
+                }
+                slot.value_ptr.* += 1;
+            }
             continue;
         }
 
@@ -430,7 +926,7 @@ pub fn main(init: std.process.Init) !void {
                 bad = true;
             } else if (got) |m| {
                 for (m.groups, 0..) |g, i| {
-                    if (i >= expected.count) break;
+                    if (i >= expected.usable()) break;
                     const e = expected.groups[i];
                     if ((g == null) != (e == null)) bad = true;
                     if (g != null and e != null and
@@ -439,8 +935,13 @@ pub fn main(init: std.process.Init) !void {
             }
             if (bad) {
                 disagreements += 1;
-                std.debug.print("DISAGREE pattern={s} engine={s}\n  haystack={f}\n", .{
-                    pattern, view.label, std.zig.fmtString(subject),
+                std.debug.print("DISAGREE pattern={s} engine={s} flags={s}{s}{s}\n  haystack={f}\n", .{
+                    pattern,
+                    view.label,
+                    if (flags.case_insensitive) "i" else "",
+                    if (flags.multiline) "m" else "",
+                    if (flags.dot_all) "s" else "",
+                    std.zig.fmtString(subject),
                 });
                 std.debug.print("  zregex:", .{});
                 if (got) |m| {
@@ -450,7 +951,7 @@ pub fn main(init: std.process.Init) !void {
                 } else std.debug.print(" no match", .{});
                 std.debug.print("\n  pcre2: ", .{});
                 if (expected.matched) {
-                    for (0..expected.count) |i| {
+                    for (0..expected.usable()) |i| {
                         if (expected.groups[i]) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
                     }
                 } else std.debug.print(" no match", .{});
@@ -464,5 +965,16 @@ pub fn main(init: std.process.Init) !void {
             "accepts, pcre2 rejected {d}, budget {d}), disagreements {d}\n",
         .{ compared, skipped, skip_zregex, rejected_but_valid, skip_pcre2, skip_budget, disagreements },
     );
+    if (reject_reasons.count() != 0) {
+        std.debug.print("zregex parse errors:", .{});
+        var it = reject_reasons.iterator();
+        while (it.next()) |e| std.debug.print(" {s}={d}", .{ e.key_ptr.*, e.value_ptr.* });
+        std.debug.print("\n", .{});
+    }
+    if (pcre2_reasons.count() != 0) {
+        std.debug.print("pcre2 parse errors:\n", .{});
+        var it = pcre2_reasons.iterator();
+        while (it.next()) |e| std.debug.print("  {d:>6}  {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    }
     if (disagreements != 0) std.process.exit(1);
 }

@@ -32,6 +32,7 @@ const zregex = @import("root.zig");
 const Regex = zregex.Regex;
 const Span = zregex.Span;
 const gen = @import("pattern_gen");
+const fuzz_options = @import("fuzz_options");
 const Source = gen.Source;
 const Builder = gen.Builder;
 const chunks = gen.chunks;
@@ -50,12 +51,27 @@ const Config = struct {
     apply: *const fn (*Regex) void,
     /// Whether this configuration can run a pattern needing the backtracker.
     handles_backtrack_only: bool,
+    /// Run against the copy compiled with AVX2 forced off. The x86-64 JIT has
+    /// two vector code generators and picks between them at compile time, so
+    /// the one the host CPU does not select is never reached otherwise --
+    /// on a machine with AVX2, that is the whole SSE2 path.
+    sse2: bool = false,
 };
 
 const configs = [_]Config{
     .{
         .name = "jit",
         .handles_backtrack_only = true,
+        .apply = struct {
+            fn f(re: *Regex) void {
+                re.jit_mode = .on;
+            }
+        }.f,
+    },
+    .{
+        .name = "jit-sse2",
+        .handles_backtrack_only = true,
+        .sse2 = true,
         .apply = struct {
             fn f(re: *Regex) void {
                 re.jit_mode = .on;
@@ -107,6 +123,12 @@ const configs = [_]Config{
         }.f,
     },
 };
+
+/// Whether a second compilation with AVX2 forced off would exercise anything
+/// the first does not. Only the x86-64 backend has two vector widths, and a
+/// host without AVX2 already emits the SSE2 one.
+const sse2_worth_testing = zregex.jit_available and
+    @import("builtin").cpu.arch == .x86_64;
 
 /// Properties that must hold of any result, whatever engine produced it and
 /// whether or not the engines agree with each other. Cross-checking finds
@@ -180,11 +202,38 @@ fn oneCase(src: Source) anyerror!void {
     if (b.buf.items.len == 0) return;
     const pattern = b.buf.items;
 
-    var re = Regex.compile(gpa, pattern) catch return; // invalid is fine
+    // Usually the defaults, but now and then a flag is set for the whole
+    // pattern rather than written into it. `compileWithFlags` starts the
+    // parser from a different state than `(?i:...)` mutating it partway, and
+    // a top-level flag reaches constructs an inline group never wraps -- the
+    // `^` and `$` of an unparenthesised alternation, for one.
+    const flags: zregex.Flags = if (src.index(4) == 0) .{
+        .case_insensitive = src.boolean(),
+        .multiline = src.boolean(),
+        .dot_all = src.boolean(),
+    } else .{};
+
+    var re = Regex.compileWithFlags(gpa, pattern, flags) catch return; // invalid is fine
     defer re.deinit();
     // Keep a runaway pattern from stalling the fuzzer; a configuration that
     // gives up is skipped rather than compared.
     re.max_steps = 100_000;
+
+    // The same pattern again with AVX2 forced off. Which vector code the
+    // x86-64 JIT emits is decided while compiling, so the generator the host
+    // CPU does not select cannot be reached by flipping a field afterwards --
+    // it needs its own `Regex`. Everything else about the two is identical,
+    // which is exactly what makes them comparable.
+    var re_sse2: ?Regex = null;
+    defer if (re_sse2) |*r| r.deinit();
+    if (sse2_worth_testing) {
+        zregex.overrideAvx2(false);
+        defer zregex.overrideAvx2(null);
+        if (Regex.compileWithFlags(gpa, pattern, flags)) |alt| {
+            re_sse2 = alt;
+            re_sse2.?.max_steps = re.max_steps;
+        } else |_| {}
+    }
 
     var hay: std.ArrayList(u8) = .empty;
     defer hay.deinit(gpa);
@@ -225,9 +274,10 @@ fn oneCase(src: Source) anyerror!void {
 
     configs: for (configs) |cfg| {
         if (needs_backtrack and !cfg.handles_backtrack_only) continue;
-        if (std.mem.eql(u8, cfg.name, "jit") and re.jit_code == null) continue;
+        const base = if (cfg.sse2) (re_sse2 orelse continue) else re;
+        if (std.mem.startsWith(u8, cfg.name, "jit") and base.jit_code == null) continue;
 
-        var probe = re;
+        var probe = base;
         cfg.apply(&probe);
         actual.clearRetainingCapacity();
         collect(gpa, &probe, hay.items, &actual) catch |err| switch (err) {
@@ -253,6 +303,32 @@ fn oneCase(src: Source) anyerror!void {
             } else {
                 try actual.append(gpa, null);
             }
+        }
+
+        // `isMatch` is not `find` with the captures thrown away: the lazy DFA
+        // answers it in a mode of its own that never materialises them, and
+        // the JIT has a separate entry point too. Either could disagree with
+        // `find` about whether there is a match at all.
+        if (probe.isMatch(gpa, hay.items)) |yes| {
+            if (probe.find(gpa, hay.items)) |found| {
+                if (found) |m| {
+                    var mm = m;
+                    mm.deinit(gpa);
+                }
+                std.testing.expectEqual(found != null, yes) catch |err| {
+                    std.debug.print(
+                        "pattern={s}\nhaystack={f}\n{s}: isMatch={} but find={}\n",
+                        .{ pattern, std.zig.fmtString(hay.items), cfg.name, yes, found != null },
+                    );
+                    return err;
+                };
+            } else |err| switch (err) {
+                error.StepLimitExceeded => {},
+                else => return err,
+            }
+        } else |err| switch (err) {
+            error.StepLimitExceeded => {},
+            else => return err,
         }
 
         if (reference_name.len == 0) {
@@ -317,9 +393,114 @@ test "arbitrary bytes never crash the parser or the engines" {
     }
 }
 
+/// Compile `pattern` and run the whole public surface over `hay`, letting
+/// every allocation error out. Written for `checkAllAllocationFailures`, which
+/// calls it once per allocation the successful run makes, failing that one.
+fn allocFailureCase(
+    gpa: std.mem.Allocator,
+    pattern: []const u8,
+    hay: []const u8,
+    engine: zregex.Engine,
+    memo: bool,
+) anyerror!void {
+    var re = Regex.compile(gpa, pattern) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        // A pattern this generator will not compile is not what is being
+        // tested, and the caller has already seen it compile once.
+        else => return,
+    };
+    defer re.deinit();
+    re.max_steps = 10_000;
+    re.memo = memo;
+    if (re.fallback_engine == .pike) re.fallback_engine = engine;
+
+    if (re.find(gpa, hay)) |m| {
+        if (m) |found| {
+            var mm = found;
+            mm.deinit(gpa);
+        }
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.StepLimitExceeded => {},
+    }
+
+    _ = re.isMatch(gpa, hay) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.StepLimitExceeded => {},
+    };
+
+    var it = re.iterator(gpa, hay);
+    defer it.deinit();
+    var seen: usize = 0;
+    while (seen < 8) : (seen += 1) {
+        const step = it.next() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.StepLimitExceeded => break,
+        };
+        var mm = step orelse break;
+        mm.deinit(gpa);
+    }
+}
+
+test "no allocation failure leaks or is swallowed" {
+    // Every other test runs with memory always available, so the paths taken
+    // when an allocation fails partway are otherwise never executed: what has
+    // been allocated by then still has to be released, and the error still
+    // has to reach the caller rather than being reported as a clean result.
+    //
+    // `checkAllAllocationFailures` reruns each case once per allocation,
+    // failing a different one each time, so the case count here is small on
+    // purpose -- the work is quadratic in what a single case allocates.
+    var prng = std.Random.DefaultPrng.init(0x0a11_0c_fa11);
+    const src = Source{ .random = prng.random() };
+    const gpa = std.testing.allocator;
+
+    for (0..fuzz_options.alloc_cases) |_| {
+        var b = Builder{ .src = src, .gpa = gpa };
+        defer b.buf.deinit(gpa);
+        try b.sequence(0);
+        if (b.buf.items.len == 0) continue;
+
+        var hay: std.ArrayList(u8) = .empty;
+        defer hay.deinit(gpa);
+        const hay_len = src.intRange(u8, 0, 12);
+        for (0..hay_len) |_| try hay.appendSlice(gpa, chunks[src.index(chunks.len)]);
+
+        // The two fallbacks allocate quite differently -- the backtracker has
+        // an explicit stack and a memo table the Pike VM has no equivalent of.
+        for ([_]zregex.Engine{ .pike, .backtrack }) |engine| {
+            // Without the memo, every allocation failure must come back out
+            // as one: a run that reports a clean result after an allocation
+            // was refused has lost an error somewhere.
+            try std.testing.checkAllAllocationFailures(
+                gpa,
+                allocFailureCase,
+                .{ b.buf.items, hay.items, engine, false },
+            );
+
+            // With it, that last part cannot be required. `std.HashMap`
+            // answers a `getOrPut` whose growth failed by looking the key up
+            // anyway and reporting it found when it is already there -- the
+            // memo's question is answered, so nothing is wrong, but from the
+            // outside it looks like a swallowed error. Leaks are still
+            // faults, and this is the only run that reaches the memo at all.
+            std.testing.checkAllAllocationFailures(
+                gpa,
+                allocFailureCase,
+                .{ b.buf.items, hay.items, engine, true },
+            ) catch |err| switch (err) {
+                error.SwallowedOutOfMemoryError => {},
+                else => return err,
+            };
+        }
+    }
+}
+
 test "engines agree on randomized patterns" {
-    // Fixed seed so a failure is reproducible and CI is deterministic. Raise
-    // the count when changing an engine; this is the cheap standing check.
-    var prng = std.Random.DefaultPrng.init(0x2026_08_31);
-    for (0..3000) |_| try oneCase(.{ .random = prng.random() });
+    // Fixed seed so a failure is reproducible and CI is deterministic; this
+    // is the cheap standing check that every build pays for. A longer run is
+    // `zig build test -Dfuzz-cases=200000 -Dfuzz-seed=<n>`, walking the seed
+    // to reach the patterns one stream never produces.
+    var prng = std.Random.DefaultPrng.init(fuzz_options.seed);
+    for (0..fuzz_options.cases) |_| try oneCase(.{ .random = prng.random() });
 }

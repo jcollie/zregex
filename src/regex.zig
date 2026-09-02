@@ -449,13 +449,22 @@ pub const Regex = struct {
         return self.findAt(gpa, haystack, 0);
     }
 
-    /// Leftmost match at or after byte offset `start`.
+    /// Leftmost match at or after byte offset `start`. A `start` past the
+    /// end of the haystack finds nothing; `start == haystack.len` is a real
+    /// position, where an empty match or a trailing assertion can still hold.
     pub fn findAt(
         self: *const Regex,
         gpa: std.mem.Allocator,
         haystack: []const u8,
         start: usize,
     ) RunError!?Match {
+        // Every engine takes `start` as a position to read context around --
+        // `\b` and multiline `^` look at the byte before it -- so a start
+        // beyond the end is not a search that finds nothing, it is an
+        // out-of-bounds read: in a release build, `\b` at 105 of a 5-byte
+        // haystack read garbage, called it a word character, and returned a
+        // match whose span lay outside the haystack.
+        if (start > haystack.len) return null;
         if (self.dfaEligible()) {
             var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet, self.dfa_max_states);
             defer machine.deinit();

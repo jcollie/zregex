@@ -1204,6 +1204,41 @@ test "an iteration spends one budget, not one per match" {
     try std.testing.expectEqual(@as(usize, 5000), n);
 }
 
+test "findAt past the end of the haystack finds nothing" {
+    // Every engine takes the start as a position to read context around:
+    // `\b` and multiline `^` look at the byte before it. Without the bounds
+    // check in `findAt`, a start beyond the end was an out-of-bounds read --
+    // in a release build `\b` at 105 of a 5-byte haystack read garbage,
+    // called it a word character, and returned the span 105..105, outside
+    // the haystack; in a debug build this test would have panicked. Found by
+    // probing the public API with arguments no fuzzer generates.
+    const hay = "aab\u{e9}";
+    const patterns = [_][]const u8{ "a+", "\\b", "\\B", "(?m)^a", "(?m)a$", "(?<=a)b", "(a)\\1" };
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit();
+        for ([_]usize{ hay.len + 1, hay.len + 100, std.math.maxInt(usize) }) |start| {
+            try std.testing.expectEqual(@as(?zregex.Span, null), blk: {
+                const m = try re.findAt(gpa, hay, start);
+                if (m) |found| {
+                    var mm = found;
+                    defer mm.deinit(gpa);
+                    break :blk mm.span();
+                }
+                break :blk null;
+            });
+        }
+    }
+    // The end itself is a real position: an empty match and a trailing
+    // assertion still hold there.
+    var re = try Regex.compile(gpa, "\\b");
+    defer re.deinit();
+    const m = (try re.findAt(gpa, "ab", 2)) orelse return error.TestUnexpectedResult;
+    var mm = m;
+    defer mm.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), mm.span().start);
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. Both were checked against Python, which
     // agrees with zregex; PCRE2 10.47 does not, and the tool steers around

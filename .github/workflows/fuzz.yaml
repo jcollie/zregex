@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
+# SPDX-License-Identifier: MIT
+
+# Weekly long fuzz session. The per-push ci runs keep a fixed seed so a
+# failure is reproducible and every push measures the same thing; this one
+# walks the seed with the run number instead, because the point of a long
+# session is to reach the patterns a single stream never produces. The seed
+# that ran is in the job log's command line, so a failure is still
+# reproducible with `zig build test -Dfuzz-cases=... -Dfuzz-seed=<n>`.
+#
+# Two runners: x86_64 Linux, and macOS on Apple silicon — the one place the
+# aarch64 JIT runs on real hardware with MAP_JIT rather than under qemu.
+# The x86_64 job also runs the PCRE2 oracle, comparing generated patterns
+# against the reference on the leftmost match, every match, and offset
+# searches; the corpus modes need a PCRE2 source tree and stay local.
+#
+# Actions are pinned to commit hashes, in the format pinact writes, so that
+# what runs here cannot change under a moved tag.
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            os: ubuntu-latest
+          - name: aarch64-macos
+            os: macos-14
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      # A quarter of a million cross-engine cases, plus a deeper
+      # allocation-failure pass than any push pays for.
+      - name: Fuzz the engines against each other
+        run: >
+          zig build test
+          -Dfuzz-cases=250000
+          -Dfuzz-alloc-cases=2000
+          -Dfuzz-seed=${{ github.run_number }}
+
+      - name: Install PCRE2
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcre2-dev
+
+      - name: Fuzz against PCRE2
+        if: runner.os == 'Linux'
+        run: >
+          zig build oracle
+          -Dpcre2-include=/usr/include
+          -Dpcre2-lib=/usr/lib/x86_64-linux-gnu
+          -- 150000 ${{ github.run_number }}

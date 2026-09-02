@@ -111,8 +111,12 @@ jobs:
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-user
 
-      - name: Run tests under emulation
-        run: zig build test -Dtarget=aarch64-linux-gnu -fqemu
+      # A few thousand differential cases beyond the suite's standing three
+      # thousand, so the aarch64 JIT's generated code is fuzzed on every
+      # push rather than only compiled. The seed stays the default: CI is
+      # deterministic, and the weekly fuzz workflow is the one that walks.
+      - name: Run tests and fuzz under emulation
+        run: zig build test -Dtarget=aarch64-linux-gnu -fqemu -Dfuzz-cases=5000
 
   build:
     name: build ${{ matrix.target }}

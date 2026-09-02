@@ -14,14 +14,17 @@ pub const chunks = [_][]const u8{
     "a",      "a",        "b",         "@",    "-",
     ".",      " ",        "1",         "\n",   "A",
     "\u{e9}", "\u{20ac}", "\u{1F600}", "\xff", "\x80",
-    "\xc3",   "ab",       "aa",
+    "\xc3",   "ab",       "aa",        "\x00",
 };
 
 /// Literals and class members the generator draws from, non-ASCII included so
 /// the helper paths are reached.
+/// A NUL is an ordinary character to both this library and PCRE2 -- neither
+/// takes its subject as a C string -- and it is the one byte a haystack is
+/// most likely to be mishandled at, so it is in both alphabets.
 pub const pattern_chars = [_][]const u8{
-    "a", "b",      "@",        "-",  "1", " ",
-    "A", "\u{e9}", "\u{20ac}", "\n",
+    "a", "b",      "@",        "-",  "1",    " ",
+    "A", "\u{e9}", "\u{20ac}", "\n", "\x00",
 };
 
 /// POSIX bracket class names, all of which mean the same to zregex and to
@@ -163,6 +166,10 @@ pub const Builder = struct {
         const c = pattern_chars[self.src.index(pattern_chars.len)];
         // A newline must be written as an escape and '.' would be syntax;
         // everything else goes in as itself, multi-byte codepoints included.
+        // A NUL is spelled out too: the pattern reaches PCRE2 as a C string,
+        // so a raw one would cut it short there and nowhere else, and the
+        // two libraries would be compared on different patterns.
+        if (std.mem.eql(u8, c, "\x00")) return self.put("\\x00");
         if (std.mem.eql(u8, c, "\n")) return self.put("\\n");
         if (std.mem.eql(u8, c, ".")) return self.put("\\.");
         // Now and then spell an ASCII character as an escape instead. The
@@ -212,7 +219,9 @@ pub const Builder = struct {
             .char => {
                 const c = pattern_chars[self.src.index(pattern_chars.len)];
                 // A newline has to be written as an escape, and a bare `-`
-                // would start a range rather than stand for itself.
+                // would start a range rather than stand for itself. A NUL is
+                // spelled out for the reason `literal` gives.
+                if (std.mem.eql(u8, c, "\x00")) return self.put("\\x00");
                 if (std.mem.eql(u8, c, "\n")) return self.put("\\n");
                 if (std.mem.eql(u8, c, "-")) return self.put("\\-");
                 try self.put(c);
@@ -251,7 +260,7 @@ pub const Builder = struct {
             .bracket => try self.put(if (first) "]" else "\\]"),
             .escaped => {
                 const c = pattern_chars[self.src.index(pattern_chars.len)];
-                if (c.len != 1 or c[0] <= ' ') return self.put("\\n");
+                if (c.len != 1 or c[0] <= ' ') return self.put("\\x00");
                 var buf: [10]u8 = undefined;
                 const spelled = switch (self.src.choice(enum { octal, hex, braced })) {
                     .octal => std.fmt.bufPrint(&buf, "\\{o}", .{c[0]}),

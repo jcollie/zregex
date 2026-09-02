@@ -251,6 +251,7 @@ pub fn run(
     input: []const u8,
     start: usize,
     slots_out: []?usize,
+    reject_empty_at: ?usize,
 ) std.mem.Allocator.Error!bool {
     const n = prog.insts.len;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -336,6 +337,13 @@ pub fn run(
                         try ctx.addThread(&nlist, gen + 1, th.pc + 1, pos + dd.len, th.start, th.slots);
                 },
                 .match => {
+                    // The caller is looking for a match at this position that
+                    // is not the empty one it already reported, so this thread
+                    // does not count -- but a lower-priority one may still
+                    // reach `match` further along.
+                    if (reject_empty_at) |r| {
+                        if (th.start == r and pos == r) continue;
+                    }
                     // Every thread after i is lower priority: discard them.
                     // Threads already in nlist are higher priority and may
                     // still improve (lengthen) the match on later steps.

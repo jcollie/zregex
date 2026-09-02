@@ -84,6 +84,10 @@ const Bt = struct {
     steps: usize = 0,
     max_steps: usize,
     memo: std.AutoHashMapUnmanaged(MemoKey, void) = .empty,
+    /// Position at which a zero-length match must be refused, if any; see
+    /// `Regex.Iterator`, which uses it to look for the longer match PCRE
+    /// tries for after reporting an empty one.
+    reject_empty_at: ?usize = null,
     /// Did the current attempt execute any backref? While false, the
     /// attempt's control flow is a pure function of positions, which is what
     /// makes lead-run skipping sound even in backref patterns.
@@ -459,7 +463,16 @@ const Bt = struct {
                     }
                 },
                 .match => {
-                    if (required_end == null or pos == required_end.?) {
+                    // A zero-length match where the caller has already
+                    // reported one is refused, so backtracking carries on
+                    // looking for a longer one starting in the same place.
+                    // Only whole attempts are subject to it: a lookaround
+                    // sub-run legitimately matches empty there.
+                    const empty_refused = memo_ok and
+                        self.reject_empty_at != null and
+                        pos == self.reject_empty_at.? and
+                        pos0 == self.reject_empty_at.?;
+                    if (!empty_refused and (required_end == null or pos == required_end.?)) {
                         self.stack.shrinkRetainingCapacity(stack_base);
                         return pos;
                     }
@@ -545,6 +558,7 @@ pub fn run(
     slots_out: []?usize,
     max_steps: usize,
     use_memo: bool,
+    reject_empty_at: ?usize,
 ) Error!bool {
     var bt = Bt{
         .gpa = gpa,
@@ -552,6 +566,7 @@ pub fn run(
         .input = input,
         .slots = slots_out,
         .max_steps = max_steps,
+        .reject_empty_at = reject_empty_at,
     };
     defer bt.stack.deinit(gpa);
     defer bt.undo.deinit(gpa);
@@ -603,6 +618,17 @@ pub fn run(
         if (!r.greedy or r.max != compiler.RepOp.unbounded) break :blk null;
         break :blk prog.insts[pc + 1];
     };
+    // The budget covers the whole call: `max_steps` plus an allowance per
+    // input byte, spent across every start position rather than granted anew
+    // at each one. Resetting per attempt is what PCRE does with its match
+    // limit, and it makes the limit no bound at all -- an input crafted so
+    // every attempt stays just under it multiplies the budget by the length
+    // of the haystack. `(a+)\1$` against 24K of `a` ran eleven seconds here
+    // without ever tripping a 1M-step limit, and hung `grep -P` outright.
+    // The JIT already accounts this way (see `budget_per_byte`); the
+    // per-byte term is what lets a legitimate scan of a large haystack do
+    // proportional work, with `max_steps` as headroom for one hard stretch.
+    bt.max_steps = max_steps +| 64 *| @as(usize, input.len);
     var s = start;
     while (true) {
         if (pf.usable) {
@@ -612,10 +638,6 @@ pub fn run(
             s = pf.scan(input, s);
             if (s >= input.len) return false;
         }
-        // The budget is per match attempt (like PCRE's match limit): each
-        // start position gets a fresh allowance, so scanning a large haystack
-        // is not itself budget-limited while any single attempt stays bounded.
-        bt.steps = 0;
         bt.touched_backref = false;
         if (try bt.matchFrom(0, s, null, true)) |end| {
             // Group 0 has no save instructions; fill it here.

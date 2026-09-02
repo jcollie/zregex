@@ -100,10 +100,20 @@ pub const Regex = struct {
     /// polynomially. Keys include everything the remaining program can read
     /// (referenced capture spans, loop guards), so semantics are unchanged.
     memo: bool = true,
-    /// Step budget for the backtracking engine, applied per match attempt
-    /// (per start position, like PCRE's match limit); tune per regex if
-    /// needed.
+    /// Step budget for the backtracking engine. One search -- a `find`, an
+    /// `isMatch`, one `Iterator.next` -- may spend this many steps plus 64
+    /// per input byte across all of its start positions together; running
+    /// out is `error.StepLimitExceeded`. The per-byte allowance keeps honest
+    /// scans of large haystacks inside the budget; the total being one
+    /// budget, rather than one per start position the way PCRE's match
+    /// limit works, is what makes it a bound at all -- input crafted to
+    /// stay just under a per-attempt limit multiplies it by the length of
+    /// the haystack, and takes `grep -P` from milliseconds to hours.
     max_steps: usize = default_max_steps,
+    /// How many states the lazy DFA may cache before giving up and handing
+    /// the subject to the Pike VM. Lowering it is how the fallback gets
+    /// exercised; at the default almost no pattern reaches it.
+    dfa_max_states: usize = dfa.default_max_states,
     /// Backing allocator for owned memory; null for comptime-compiled regexes.
     gpa: ?std.mem.Allocator,
     /// Owned storage for group-name strings (runtime compiles only).
@@ -331,10 +341,20 @@ pub const Regex = struct {
         haystack: []const u8,
         start: usize,
         slots: []?usize,
+        reject_empty_at: ?usize,
     ) RunError!bool {
         return switch (self.fallback_engine) {
-            .backtrack => backtrack.run(gpa, self.prog(), haystack, start, slots, self.max_steps, self.memo),
-            .pike, .jit => pike.run(gpa, self.prog(), haystack, start, slots),
+            .backtrack => backtrack.run(
+                gpa,
+                self.prog(),
+                haystack,
+                start,
+                slots,
+                self.max_steps,
+                self.memo,
+                reject_empty_at,
+            ),
+            .pike, .jit => pike.run(gpa, self.prog(), haystack, start, slots, reject_empty_at),
         };
     }
 
@@ -396,7 +416,7 @@ pub const Regex = struct {
             }
         }
         if (self.dfaEligible()) {
-            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet);
+            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet, self.dfa_max_states);
             defer machine.deinit();
             switch (try dfa.search(&machine, haystack, 0, .is_match)) {
                 .match => return true,
@@ -406,7 +426,7 @@ pub const Regex = struct {
         }
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
-        return self.runEngine(gpa, haystack, 0, slots);
+        return self.runEngine(gpa, haystack, 0, slots, null);
     }
 
     /// Leftmost match, or null. Free the result with `Match.deinit`.
@@ -422,7 +442,7 @@ pub const Regex = struct {
         start: usize,
     ) RunError!?Match {
         if (self.dfaEligible()) {
-            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet);
+            var machine = try dfa.Machine.init(gpa, self.prog(), &self.alphabet, self.dfa_max_states);
             defer machine.deinit();
             return self.findAtWith(gpa, haystack, start, &machine);
         }
@@ -438,8 +458,30 @@ pub const Regex = struct {
         start: usize,
         machine: ?*dfa.Machine,
     ) RunError!?Match {
+        return self.findAtInner(gpa, haystack, start, machine, null);
+    }
+
+    /// Leftmost match at or after `start`, except that a zero-length match
+    /// beginning at `reject_empty_at` is not one.
+    ///
+    /// Only the interpreters know how to refuse a match, so the JIT and the
+    /// lazy DFA sit this one out; it is asked for only after an empty match
+    /// has already been reported, which is rare enough for that to cost
+    /// nothing on patterns that cannot match empty at all.
+    fn findAtInner(
+        self: *const Regex,
+        gpa: std.mem.Allocator,
+        haystack: []const u8,
+        start: usize,
+        machine: ?*dfa.Machine,
+        reject_empty_at: ?usize,
+    ) RunError!?Match {
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
+        if (reject_empty_at != null) {
+            if (!try self.runEngine(gpa, haystack, start, slots, reject_empty_at)) return null;
+            return try self.buildMatch(gpa, slots);
+        }
         if (self.jitFn()) |j| {
             switch (j.run(haystack, start, slots)) {
                 .match => return try self.buildMatch(gpa, slots),
@@ -453,15 +495,15 @@ pub const Regex = struct {
             switch (try dfa.search(m, haystack, start, .find)) {
                 .no_match => return null,
                 .match => |sp| {
-                    const ok = try pike.run(gpa, self.prog(), haystack, sp.window_start, slots);
+                    const ok = try pike.run(gpa, self.prog(), haystack, sp.window_start, slots, null);
                     std.debug.assert(ok); // the DFA is a memoized Pike VM
                 },
                 .give_up => {
-                    if (!try self.runEngine(gpa, haystack, start, slots)) return null;
+                    if (!try self.runEngine(gpa, haystack, start, slots, null)) return null;
                 },
             }
         } else {
-            if (!try self.runEngine(gpa, haystack, start, slots)) return null;
+            if (!try self.runEngine(gpa, haystack, start, slots, null)) return null;
         }
 
         return try self.buildMatch(gpa, slots);
@@ -501,6 +543,9 @@ pub const Regex = struct {
         haystack: []const u8,
         pos: usize = 0,
         done: bool = false,
+        /// Set when the last match was empty: the next search must look for a
+        /// longer match beginning right there before moving on.
+        retry_nonempty_at: ?usize = null,
         /// Warm DFA cache shared across `next()` calls; created lazily.
         machine: ?dfa.Machine = null,
 
@@ -515,21 +560,44 @@ pub const Regex = struct {
         pub fn next(self: *Iterator) RunError!?Match {
             if (self.done) return null;
             if (self.machine == null and self.re.dfaEligible()) {
-                self.machine = try dfa.Machine.init(self.gpa, self.re.prog(), &self.re.alphabet);
+                self.machine = try dfa.Machine.init(self.gpa, self.re.prog(), &self.re.alphabet, self.re.dfa_max_states);
             }
             const mach: ?*dfa.Machine = if (self.machine) |*m| m else null;
-            const m = (try self.re.findAtWith(self.gpa, self.haystack, self.pos, mach)) orelse {
+            // After an empty match, the next thing to try is a longer match
+            // in the same place -- not the next position. `.*?` reports empty
+            // at 0 and then all of `ab`, where advancing straight away would
+            // report empty at 0, 1 and 2 and never the text between them.
+            // PCRE and Python both do it this way.
+            const m = (try self.re.findAtInner(
+                self.gpa,
+                self.haystack,
+                self.pos,
+                if (self.retry_nonempty_at == null) mach else null,
+                self.retry_nonempty_at,
+            )) orelse {
+                // No longer match here after all, so carry on from the next
+                // codepoint, which is where the empty one left off.
+                if (self.retry_nonempty_at) |at| {
+                    self.retry_nonempty_at = null;
+                    if (at >= self.haystack.len) {
+                        self.done = true;
+                        return null;
+                    }
+                    self.pos = at + common.decode(self.haystack, at).len;
+                    return self.next();
+                }
                 self.done = true;
                 return null;
             };
             const sp = m.span();
+            self.retry_nonempty_at = null;
             if (sp.end > sp.start) {
                 self.pos = sp.end;
             } else if (sp.end >= self.haystack.len) {
                 self.done = true;
             } else {
-                // Empty match: advance one codepoint to avoid looping forever.
-                self.pos = sp.end + common.decode(self.haystack, sp.end).len;
+                self.pos = sp.end;
+                self.retry_nonempty_at = sp.end;
             }
             return m;
         }

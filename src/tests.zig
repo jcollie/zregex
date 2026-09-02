@@ -915,6 +915,150 @@ test "a variable-length lookbehind takes the longest match" {
     try expectGroups("(?<=(a+))X", "aaaX", &.{ "X", "aaa" });
 }
 
+test "iteration retries for a longer match where it found an empty one" {
+    // After an empty match, the next thing to try is a longer match in the
+    // same place -- not the next position. `.*?` reports empty at 0 and then
+    // all of `ab`; advancing straight away reported empty at 0, 1 and 2 and
+    // never the text between them. PCRE does this (it is the loop pcre2demo.c
+    // documents) and so does Python; zregex was the odd one out, which only
+    // showed once the oracle started comparing every match rather than the
+    // leftmost one.
+    const cases = [_]struct {
+        pat: []const u8,
+        hay: []const u8,
+        want: []const zregex.Span,
+    }{
+        .{ .pat = ".*?", .hay = "ab", .want = &.{
+            .{ .start = 0, .end = 0 }, .{ .start = 0, .end = 1 },
+            .{ .start = 1, .end = 1 }, .{ .start = 1, .end = 2 },
+            .{ .start = 2, .end = 2 },
+        } },
+        // The retry fails here -- nothing longer starts at 0 -- so the search
+        // carries on from the next codepoint, as it always did.
+        .{ .pat = "a*", .hay = "bab", .want = &.{
+            .{ .start = 0, .end = 0 }, .{ .start = 1, .end = 2 },
+            .{ .start = 2, .end = 2 }, .{ .start = 3, .end = 3 },
+        } },
+        .{ .pat = "(?:)", .hay = "ab", .want = &.{
+            .{ .start = 0, .end = 0 }, .{ .start = 1, .end = 1 },
+            .{ .start = 2, .end = 2 },
+        } },
+        // Stepping past an empty match moves a whole codepoint, not a byte.
+        .{ .pat = "b*", .hay = "\u{20ac}b", .want = &.{
+            .{ .start = 0, .end = 0 }, .{ .start = 3, .end = 4 },
+            .{ .start = 4, .end = 4 },
+        } },
+    };
+    for (cases) |c| {
+        var re = try Regex.compile(gpa, c.pat);
+        defer re.deinit();
+        var got: std.ArrayList(zregex.Span) = .empty;
+        defer got.deinit(gpa);
+        var it = re.iterator(gpa, c.hay);
+        defer it.deinit();
+        while (try it.next()) |m| {
+            var mm = m;
+            defer mm.deinit(gpa);
+            try got.append(gpa, mm.span());
+        }
+        std.testing.expectEqualSlices(zregex.Span, c.want, got.items) catch |err| {
+            std.debug.print("pattern={s} haystack={s}\n", .{ c.pat, c.hay });
+            return err;
+        };
+    }
+}
+
+test "NUL is an ordinary character" {
+    // Nothing here takes a subject as a C string, so a NUL byte is a
+    // character like any other and must not end anything early. It is in both
+    // of the fuzzer's alphabets for that reason; this pins down the answers
+    // it is checked against, all of which PCRE2 agrees with.
+    try expectFind("\\x00", "a\x00b", "\x00");
+    try expectFind("a\\x00b", "a\x00b", "a\x00b");
+    try expectFind("\\x00+", "a\x00\x00b", "\x00\x00");
+    try expectFind("[\\x00-\\x08]", "a\x00b", "\x00");
+    try expectFind("[^\\x00]+", "a\x00b", "a");
+    try expectFind(".", "\x00", "\x00");
+    try expectFind("\\w\\x00", "a\x00", "a\x00");
+    // A NUL in the middle of a haystack does not stop the search reaching
+    // what is after it.
+    try expectFind("b", "a\x00b", "b");
+    try expectFind("$", "a\x00", "");
+    // Group 0 spans the NUL, and a capture may hold one.
+    try expectGroups("(a\\x00)(b)", "a\x00b", &.{ "a\x00b", "a\x00", "b" });
+}
+
+test "adversarial patterns fail cleanly instead of crashing" {
+    // Compile-time hardening. A pattern is attacker-sized input too: each of
+    // these once either crashed or would have run away, and each must now
+    // come back as an ordinary error in time proportional to its size.
+    //
+    // A long flat pattern used to build a left-leaning concat spine one node
+    // per character, and the compiler's recursive walk overran the stack on
+    // it -- a segfault from a pattern of plain letters -- before the
+    // program-size limit could reject it. The parser now builds balanced
+    // trees, so the walk is log-deep and the limit gets its say. Emission
+    // order is leaf order either way, so the program is unchanged.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    for (0..300_000) |_| try big.append(gpa, 'a');
+    try std.testing.expectError(error.ProgramTooLarge, Regex.compile(gpa, big.items));
+
+    // The same spine, made of alternation branches.
+    big.clearRetainingCapacity();
+    for (0..60_000) |_| try big.appendSlice(gpa, "a|");
+    try std.testing.expectError(error.ProgramTooLarge, Regex.compile(gpa, big.items));
+
+    // Multiplicative counted repeats: a billion-instruction expansion must
+    // be cut off by the counting pass, not walked.
+    try std.testing.expectError(error.ProgramTooLarge, Regex.compile(gpa, "((a{1000}){1000}){1000}"));
+
+    // Group nesting past the depth limit.
+    big.clearRetainingCapacity();
+    for (0..5000) |_| try big.appendSlice(gpa, "(?:");
+    try big.append(gpa, 'a');
+    for (0..5000) |_| try big.appendSlice(gpa, ")");
+    try std.testing.expectError(error.NestingTooDeep, Regex.compile(gpa, big.items));
+}
+
+test "the step budget bounds a whole scan, not each start position" {
+    // `(a+)\1$` against a run of `a` is quadratic per attempt and runs at
+    // every start position. With the budget granted anew at each start --
+    // which is what PCRE does with its match limit, and what this library
+    // used to do -- no single attempt ever tripped it, and the scan took
+    // seconds at 24K of input and grew cubically from there; the same input
+    // hangs `grep -P` outright. The budget now covers the whole call, plus
+    // an allowance per input byte so that honest scans of large haystacks
+    // still get work proportional to their size.
+    var hay: std.ArrayList(u8) = .empty;
+    defer hay.deinit(gpa);
+    for (0..2000) |_| try hay.append(gpa, 'a');
+    try hay.append(gpa, 'b');
+
+    var re = try Regex.compile(gpa, "(a+)\\1$");
+    defer re.deinit();
+    re.max_steps = 10_000;
+    re.jit_mode = .off; // the JIT bails on its own budget; hold the interpreter to it
+    try std.testing.expectError(error.StepLimitExceeded, re.find(gpa, hay.items));
+
+    // The per-byte allowance is what keeps an honest scan alive: the same
+    // pattern over the same haystack with the match present finds it, and a
+    // benign pattern crosses a large haystack without touching the limit.
+    try expectFind("(a+)\\1", "xxaaaax", "aaaa");
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    for (0..100_000) |_| try big.append(gpa, 'a');
+    try big.append(gpa, 'b');
+    var re2 = try Regex.compile(gpa, "(a?)b\\1");
+    defer re2.deinit();
+    const m = (try re2.find(gpa, big.items)) orelse return error.TestUnexpectedResult;
+    var mm = m;
+    defer mm.deinit(gpa);
+    // `a?` must match empty here: taking the `a` at 99,999 leaves the
+    // backreference wanting another one past the end of the input.
+    try std.testing.expectEqual(@as(usize, 100_000), mm.span().start);
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. Both were checked against Python, which
     // agrees with zregex; PCRE2 10.47 does not, and the tool steers around

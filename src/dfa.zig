@@ -36,7 +36,7 @@ pub const Result = union(enum) {
     give_up,
 };
 
-const max_states = 512;
+pub const default_max_states = 512;
 
 const Entry = struct {
     next: u32,
@@ -92,6 +92,8 @@ pub const Machine = struct {
     prog: compiler.Program,
     alphabet: *const compiler.Alphabet,
     n_classes: u16,
+    /// See `init`.
+    max_states: usize,
     states: std.ArrayList(State) = .empty,
     map: std.StringHashMapUnmanaged(u32) = .empty,
     // Scratch, all insts.len sized.
@@ -108,6 +110,11 @@ pub const Machine = struct {
         gpa: std.mem.Allocator,
         prog: compiler.Program,
         alphabet: *const compiler.Alphabet,
+        /// Cache ceiling; reaching it makes the search give up and hand the
+        /// subject to the Pike VM. Settable so that a test can pin it low
+        /// enough to take that path on ordinary patterns, which at the
+        /// default of five hundred states almost nothing does.
+        max_states: usize,
     ) std.mem.Allocator.Error!Machine {
         const n = prog.insts.len;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -130,6 +137,7 @@ pub const Machine = struct {
             .prog = prog,
             .alphabet = alphabet,
             .n_classes = alphabet.numClasses(),
+            .max_states = max_states,
             .seen = seen,
             .stack = stack,
             .list_buf = list_buf,
@@ -162,7 +170,7 @@ pub const Machine = struct {
         }
         const key = m.key_buf[0..key_len];
         if (m.map.get(key)) |id| return id;
-        if (m.states.items.len >= max_states) return error.GiveUp;
+        if (m.states.items.len >= m.max_states) return error.GiveUp;
         const id: u32 = @intCast(m.states.items.len);
         const arena = m.arena_state.allocator();
         const trans = try arena.alloc(?Entry, m.n_classes + 1);

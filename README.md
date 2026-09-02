@@ -28,7 +28,13 @@ Three engines behind one API:
   remaining program can read) are pruned, so classic ReDoS patterns like
   `(a+)+\1$` complete in polynomial time instead of exploding. A configurable
   step budget (`error.StepLimitExceeded` instead of hanging) remains as the
-  backstop for the rare shapes memoization cannot key.
+  backstop for the rare shapes memoization cannot key. The budget covers a
+  whole search — `max_steps` plus 64 steps per input byte, spent across every
+  start position together — so it is a real bound on one `find`; a limit
+  granted anew at each position, which is how PCRE's match limit works, can
+  be multiplied by the length of the haystack by input crafted to stay just
+  under it. That construction takes `grep -P` from milliseconds to hours;
+  here it is `error.StepLimitExceeded` after work proportional to the input.
 
 Engine selection is automatic at compile time: `regex.engine` reports what
 will run and `regex.fallback_engine` what finishes anything the JIT bails on.
@@ -290,6 +296,10 @@ instead of `.jit`, and matches and captures are identical either way. Check
   bytes degrade to single-byte codepoints rather than erroring.
 - **Leftmost-greedy** (PCRE/Perl-style) matching; alternation prefers the left
   branch. Captures persist across repeat iterations (PCRE, not JS, semantics).
+- Iterating matches follows PCRE and Python: where a match is empty, the next
+  attempt looks for a longer one starting in the same place before moving on,
+  so `.*?` over `ab` yields the empty match at 0, then `a`, then the empty
+  match at 1, then `b`, then the empty match at 2.
 - `\d \w \s`, `[[:alpha:]]` and the other POSIX classes, and `\b` are
   **ASCII-only** — which is what PCRE gives them without `PCRE2_UCP`. Case
   folding is **Unicode**: `(?i)s` matches `ſ`, `(?i)k` matches `K`, and
@@ -367,6 +377,10 @@ The dev shell exports the two directories, so from inside `nix develop` that is:
 ```sh
 zig build oracle -Dpcre2-include=$PCRE2_INCLUDE -Dpcre2-lib=$PCRE2_LIB -- 25000 1
 ```
+
+Both the generated patterns and the corpus below are compared twice: once on
+the leftmost match, and once on every match in the subject, which is what holds
+`Regex.Iterator` to PCRE's rule for getting past an empty match.
 
 It also runs PCRE2's own test files, which are nine thousand patterns written
 by hand over decades, mostly because something once went wrong with them —

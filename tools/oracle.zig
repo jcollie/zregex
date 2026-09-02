@@ -41,8 +41,12 @@
 //!     reference to an open group. zregex matches empty for the zero-width
 //!     repeat in both, which is PCRE2's own answer whenever the ordering
 //!     does not trip its quirk.
-//!   * Only the leftmost match is compared, so the two harnesses' differing
-//!     rules for advancing past an empty match never come into it.
+//!
+//! Every match is compared, not only the leftmost: `pcre2AllMatches` runs the
+//! loop `pcre2demo.c` documents and holds `Regex.Iterator` to it. This used to
+//! be left out on the grounds that the two harnesses simply advanced past an
+//! empty match differently, which turned out to be the wrong reading -- the
+//! rule is PCRE's, Python implements the same one, and zregex did not.
 const std = @import("std");
 const zregex = @import("zregex");
 const gen = @import("pattern_gen");
@@ -206,6 +210,149 @@ fn oneCase(
         }
     }
     return if (bad) 1 else 0;
+}
+
+/// Cap on matches collected from one subject, on both sides. A pathological
+/// pattern should not turn one case into a hang, and agreement over the first
+/// several dozen matches is as strong a signal as agreement over all of them.
+const max_global_matches = 64;
+
+/// Every match PCRE2 finds in `subject`, by the loop `pcre2demo.c` documents
+/// as the way to do it.
+///
+/// This is the part of matching the oracle used to leave alone: comparing only
+/// the leftmost match meant the rule for getting past an empty one -- retry at
+/// the same place refusing to match empty, and only then step forward a whole
+/// character -- was never held to PCRE at all, though it is where an
+/// off-by-one shows up as a duplicated or a missing match rather than as a
+/// wrong span.
+fn pcre2AllMatches(
+    gpa: std.mem.Allocator,
+    pattern: [:0]const u8,
+    subject: []const u8,
+    options: u32,
+    out: *std.ArrayList(Result),
+) !bool {
+    out.clearRetainingCapacity();
+
+    var errcode: c_int = 0;
+    var erroffset: usize = 0;
+    const re = c.pcre2_compile_8(
+        pattern.ptr,
+        pcre2_zero_terminated,
+        c.PCRE2_UTF | options,
+        &errcode,
+        &erroffset,
+        null,
+    ) orelse return false;
+    defer c.pcre2_code_free_8(re);
+
+    const md = c.pcre2_match_data_create_from_pattern_8(re, null);
+    defer c.pcre2_match_data_free_8(md);
+
+    // `subject.ptr` of an empty slice is not a pointer PCRE2 may read.
+    const ptr: [*]const u8 = if (subject.len == 0) "" else subject.ptr;
+
+    var start: usize = 0;
+    var match_options: u32 = 0;
+    while (out.items.len < max_global_matches) {
+        const rc = c.pcre2_match_8(re, ptr, subject.len, start, match_options, md, null);
+        if (rc == c.PCRE2_ERROR_NOMATCH) {
+            // Nothing at all here, or nothing that is not empty. In the second
+            // case the search resumes one character further on.
+            if (match_options == 0) break;
+            start += 1;
+            while (start < subject.len and (subject[start] & 0xC0) == 0x80) start += 1;
+            match_options = 0;
+            if (start > subject.len) break;
+            continue;
+        }
+        if (rc < 0) return false; // budget or UTF error: not a comparison
+
+        const ov = c.pcre2_get_ovector_pointer_8(md);
+        var found: Result = .{ .matched = true, .count = @intCast(rc) };
+        for (0..found.usable()) |i| {
+            const a = ov[2 * i];
+            const b = ov[2 * i + 1];
+            found.groups[i] = if (a == pcre2_unset or b == pcre2_unset)
+                null
+            else
+                .{ .start = a, .end = b };
+        }
+        try out.append(gpa, found);
+
+        // An empty match is retried at the same place, forbidden from being
+        // empty again; anything else simply continues from its end.
+        if (ov[0] == ov[1]) {
+            if (ov[1] >= subject.len) break;
+            start = ov[1];
+            match_options = c.PCRE2_NOTEMPTY_ATSTART | c.PCRE2_ANCHORED;
+        } else {
+            start = ov[1];
+            match_options = 0;
+        }
+    }
+    return true;
+}
+
+/// Compare every match zregex finds against every match PCRE2 finds. Returns
+/// null when the case cannot be judged, otherwise whether they agree.
+fn compareAllMatches(
+    gpa: std.mem.Allocator,
+    re: *const zregex.Regex,
+    pattern: [:0]const u8,
+    subject: []const u8,
+    options: u32,
+    expected: *std.ArrayList(Result),
+) !?bool {
+    if (!try pcre2AllMatches(gpa, pattern, subject, options, expected)) return null;
+
+    var it = re.iterator(gpa, subject);
+    defer it.deinit();
+    var n: usize = 0;
+    while (n < max_global_matches) {
+        const step = it.next() catch return null; // out of budget: not a comparison
+        var m = step orelse break;
+        defer m.deinit(gpa);
+        if (n >= expected.items.len) return false;
+        const want = expected.items[n];
+        for (m.groups, 0..) |g, gi| {
+            if (gi >= want.usable()) break;
+            const e = want.groups[gi];
+            if ((g == null) != (e == null)) return false;
+            if (g != null and e != null and
+                (g.?.start != e.?.start or g.?.end != e.?.end)) return false;
+        }
+        n += 1;
+    }
+    // Fewer than the cap on both sides means both ran out; at the cap neither
+    // side is finished and only the prefix they share can be judged.
+    if (n < max_global_matches and n != expected.items.len) return false;
+    return true;
+}
+
+/// Print both sides of an all-match disagreement.
+fn printAllMatches(
+    gpa: std.mem.Allocator,
+    re: *const zregex.Regex,
+    subject: []const u8,
+    expected: *const std.ArrayList(Result),
+) !void {
+    std.debug.print("  zregex:", .{});
+    var it = re.iterator(gpa, subject);
+    defer it.deinit();
+    var shown: usize = 0;
+    while (shown < max_global_matches) : (shown += 1) {
+        const step = it.next() catch break;
+        var m = step orelse break;
+        defer m.deinit(gpa);
+        std.debug.print(" {d}..{d}", .{ m.span().start, m.span().end });
+    }
+    std.debug.print("\n  pcre2: ", .{});
+    for (expected.items) |r| {
+        if (r.groups[0]) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end });
+    }
+    std.debug.print("\n", .{});
 }
 
 fn spansEqual(a: []const ?zregex.Span, b: []const ?zregex.Span) bool {
@@ -561,6 +708,12 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
     defer reject_reasons.deinit(gpa);
     // A pattern that differs usually differs on every subject under it, and
     // the same pattern often appears in several files. Report each one once.
+    // Comparing every match, not just the leftmost, is a separate question
+    // with a separate answer: the rule for stepping past an empty match.
+    var global_compared: usize = 0;
+    var global_bad: usize = 0;
+    var global_expected: std.ArrayList(Result) = .empty;
+    defer global_expected.deinit(gpa);
     var reported: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it3 = reported.keyIterator();
@@ -613,6 +766,21 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
                 if (!(runPcre2(pattern, subject, &expected, pcre2_options) catch false)) {
                     skip_pcre2 += 1;
                     continue;
+                }
+
+                if (try compareAllMatches(gpa, &re, pattern, subject, pcre2_options, &global_expected)) |agreed| {
+                    global_compared += 1;
+                    if (!agreed) {
+                        global_bad += 1;
+                        const seen_g = try reported.getOrPut(gpa, pattern);
+                        if (!seen_g.found_existing) {
+                            seen_g.key_ptr.* = try gpa.dupe(u8, pattern);
+                            std.debug.print("DISAGREE (all matches) [{s}] pattern={s}\n  haystack={f}\n", .{
+                                name, pattern, std.zig.fmtString(subject),
+                            });
+                            try printAllMatches(gpa, &re, subject, &global_expected);
+                        }
+                    }
                 }
 
                 const got = re.find(gpa, subject) catch {
@@ -671,10 +839,12 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
 
     std.debug.print(
         "corpus: {d} files, {d} patterns, {d} comparisons, skipped (zregex {d}, " ++
-            "pcre2 {d}, budget {d}), disagreements {d} over {d} distinct patterns\n",
+            "pcre2 {d}, budget {d}), disagreements {d} over {d} distinct patterns\n" ++
+            "corpus all-match comparisons {d}, disagreements {d}\n",
         .{
             files.items.len, patterns,    compared,      skip_zregex,
             skip_pcre2,      skip_budget, disagreements, reported.count(),
+            global_compared, global_bad,
         },
     );
     if (reject_reasons.count() != 0) {
@@ -757,6 +927,12 @@ pub fn main(init: std.process.Init) !void {
     var compared: usize = 0;
     var skipped: usize = 0;
     var disagreements: usize = 0;
+    // Comparing every match, not just the leftmost, is a separate question
+    // with a separate answer: the rule for stepping past an empty match.
+    var global_compared: usize = 0;
+    var global_bad: usize = 0;
+    var global_expected: std.ArrayList(Result) = .empty;
+    defer global_expected.deinit(gpa);
     // Why cases are dropped, so that coverage can be aimed at the biggest
     // bucket rather than guessed at.
     var skip_zregex: usize = 0;
@@ -892,6 +1068,25 @@ pub fn main(init: std.process.Init) !void {
             view_count += 1;
         }
 
+        // The iterator runs whichever engine the pattern selected, so this is
+        // asked once per case rather than once per view.
+        if (try compareAllMatches(gpa, &re, pattern, subject, pcre2_options, &global_expected)) |agreed| {
+            global_compared += 1;
+            if (!agreed) {
+                global_bad += 1;
+                if (global_bad <= 10) {
+                    std.debug.print("DISAGREE (all matches) pattern={s} flags={s}{s}{s}\n  haystack={f}\n", .{
+                        pattern,
+                        if (flags.case_insensitive) "i" else "",
+                        if (flags.multiline) "m" else "",
+                        if (flags.dot_all) "s" else "",
+                        std.zig.fmtString(subject),
+                    });
+                    try printAllMatches(gpa, &re, subject, &global_expected);
+                }
+            }
+        }
+
         var counted = false;
         for (views[0..view_count]) |view| {
             switch (view.force) {
@@ -965,6 +1160,7 @@ pub fn main(init: std.process.Init) !void {
             "accepts, pcre2 rejected {d}, budget {d}), disagreements {d}\n",
         .{ compared, skipped, skip_zregex, rejected_but_valid, skip_pcre2, skip_budget, disagreements },
     );
+    std.debug.print("all-match comparisons {d}, disagreements {d}\n", .{ global_compared, global_bad });
     if (reject_reasons.count() != 0) {
         std.debug.print("zregex parse errors:", .{});
         var it = reject_reasons.iterator();

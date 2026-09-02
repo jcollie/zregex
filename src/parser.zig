@@ -390,18 +390,65 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Builds a balanced binary tree of `concat` or `alt` nodes from leaves
+    /// pushed left to right, the way a binary counter carries: rank `i` holds
+    /// a finished subtree of 2^i leaves, and pushing a leaf merges upward
+    /// until it finds an empty rank.
+    ///
+    /// Shape is all this changes. Both node kinds are associative in every
+    /// property derived from them -- instructions are emitted in leaf order,
+    /// nullability is a fold, alternation priority is leaf order -- but the
+    /// compiler recurses through them, and folding leftward, which is what
+    /// this replaced, gave a pattern of a million plain characters a spine a
+    /// million nodes deep. Walking that overran the stack and crashed before
+    /// the program-size limit could reject the pattern; balanced, the same
+    /// walk is twenty frames and the limit gets its say.
+    fn TreeBuilder(comptime tag: std.meta.Tag(Node)) type {
+        return struct {
+            pending: [32]?NodeIndex = @splat(null),
+
+            fn push(tb: *@This(), p: *Self, leaf: NodeIndex) ParseError!void {
+                var node = leaf;
+                for (&tb.pending) |*slot| {
+                    const left = slot.* orelse {
+                        slot.* = node;
+                        return;
+                    };
+                    slot.* = null;
+                    node = try p.addNode(@unionInit(Node, @tagName(tag), .{ left, node }));
+                }
+                // 2^32 leaves; no pattern the buffers can hold gets here.
+                return error.PatternTooComplex;
+            }
+
+            /// Merge what remains, or null when nothing was pushed. Low ranks
+            /// hold the latest leaves, so they end up rightmost.
+            fn finish(tb: *@This(), p: *Self) ParseError!?NodeIndex {
+                var acc: ?NodeIndex = null;
+                for (tb.pending) |slot| {
+                    const left = slot orelse continue;
+                    acc = if (acc) |right|
+                        try p.addNode(@unionInit(Node, @tagName(tag), .{ left, right }))
+                    else
+                        left;
+                }
+                return acc;
+            }
+        };
+    }
+
     fn parseAlternation(self: *Self, depth: u32) ParseError!NodeIndex {
         if (depth > max_depth) return error.NestingTooDeep;
-        var node = try self.parseConcat(depth);
+        var alts: TreeBuilder(.alt) = .{};
+        try alts.push(self, try self.parseConcat(depth));
         while (self.eat('|')) {
-            const rhs = try self.parseConcat(depth);
-            node = try self.addNode(.{ .alt = .{ node, rhs } });
+            try alts.push(self, try self.parseConcat(depth));
         }
-        return node;
+        return (try alts.finish(self)).?; // at least one branch was pushed
     }
 
     fn parseConcat(self: *Self, depth: u32) ParseError!NodeIndex {
-        var seq: ?NodeIndex = null;
+        var seq: TreeBuilder(.concat) = .{};
         while (self.peek()) |c| {
             if (c == '|' or c == ')') break;
             switch (c) {
@@ -411,9 +458,9 @@ pub const Parser = struct {
             }
             var atom = try self.parseAtom(depth);
             atom = try self.parseQuantifier(atom);
-            seq = if (seq) |s| try self.addNode(.{ .concat = .{ s, atom } }) else atom;
+            try seq.push(self, atom);
         }
-        return seq orelse try self.addNode(.empty);
+        return (try seq.finish(self)) orelse try self.addNode(.empty);
     }
 
     const Bounds = struct { min: u32, max: ?u32, next: usize };

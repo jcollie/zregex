@@ -378,9 +378,12 @@ The dev shell exports the two directories, so from inside `nix develop` that is:
 zig build oracle -Dpcre2-include=$PCRE2_INCLUDE -Dpcre2-lib=$PCRE2_LIB -- 25000 1
 ```
 
-Both the generated patterns and the corpus below are compared twice: once on
-the leftmost match, and once on every match in the subject, which is what holds
-`Regex.Iterator` to PCRE's rule for getting past an empty match.
+Both the generated patterns and the corpus below are compared three ways: on
+the leftmost match; on every match in the subject, which is what holds
+`Regex.Iterator` to PCRE's rule for getting past an empty match; and from
+random offsets, holding `findAt` to PCRE2's `startoffset` — where the match
+may not begin before the offset but `\b`, `^` and lookbehind still see the
+text in front of it.
 
 It also runs PCRE2's own test files, which are nine thousand patterns written
 by hand over decades, mostly because something once went wrong with them —
@@ -389,6 +392,16 @@ tree; nothing is copied into this repository:
 
 ```sh
 zig build oracle ... -- --corpus <pcre2-source>/testdata
+```
+
+A second mode mutates those patterns — an edit or three, or two patterns
+spliced — and compares the results the same way. The corpus tests what its
+authors wrote; the mutations visit everything nearby that they almost wrote,
+which is where an off-by-one in the parser lives. Its first run caught the
+class `[]-b]` being read as three characters instead of the range `]`–`b`:
+
+```sh
+zig build oracle ... -- --corpus-mutate <pcre2-source>/testdata [cases] [seed]
 ```
 
 It reports how many cases it compared and why any were dropped, so coverage can

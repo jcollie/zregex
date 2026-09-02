@@ -1059,6 +1059,26 @@ test "the step budget bounds a whole scan, not each start position" {
     try std.testing.expectEqual(@as(usize, 100_000), mm.span().start);
 }
 
+test "a leading class bracket may open a range" {
+    // `]` first in a class is a literal, and an ordinary member in every
+    // other way, so it may be the low end of a range: `[]-b]` runs from `]`
+    // to `b` and takes in the letter `a`. It used to be added as a finished
+    // member, which quietly read that class as the three characters `]`,
+    // `-`, `b`. Found by mutating PCRE2's own test patterns -- the seed was
+    // `a[]-b]e` from testinput1, one deletion away.
+    try expectFind("a[]-b]", "aab", "aa");
+    try expectFind("[]-b]+", "]^_`ab.", "]^_`ab");
+    try expectFind("[^]-b]", "a", null);
+    try expectFind("[^]-b]", "x", "x");
+    try expectFind("(?i)[]-b]", "A", "A");
+    // Still a literal when no range follows: alone, or with `-` last.
+    try expectFind("[]]", "x]y", "]");
+    try expectFind("[]-]", "-", "-");
+    try expectFind("[]-]", "a", null);
+    // A backwards range is an error here as anywhere in a class.
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[]-\x20]"));
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. Both were checked against Python, which
     // agrees with zregex; PCRE2 10.47 does not, and the tool steers around

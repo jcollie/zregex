@@ -86,7 +86,13 @@ const Result = struct {
 /// the reasons rather than just counting them.
 var last_pcre2_error: c_int = 0;
 
-fn runPcre2(pattern: [:0]const u8, hay: []const u8, out: *Result, options: u32) !bool {
+fn runPcre2(
+    pattern: [:0]const u8,
+    hay: []const u8,
+    start: usize,
+    out: *Result,
+    options: u32,
+) !bool {
     var errcode: c_int = 0;
     var erroffset: usize = 0;
     const re = c.pcre2_compile_8(
@@ -105,7 +111,7 @@ fn runPcre2(pattern: [:0]const u8, hay: []const u8, out: *Result, options: u32) 
     const md = c.pcre2_match_data_create_from_pattern_8(re, null);
     defer c.pcre2_match_data_free_8(md);
 
-    const rc = c.pcre2_match_8(re, hay.ptr, hay.len, 0, 0, md, null);
+    const rc = c.pcre2_match_8(re, hay.ptr, hay.len, start, 0, md, null);
     if (rc == c.PCRE2_ERROR_NOMATCH) {
         out.* = .{ .matched = false };
         return true;
@@ -143,7 +149,7 @@ fn oneCase(
     if (flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
 
     var expected: Result = .{ .matched = false };
-    if (!try runPcre2(pattern, subject, &expected, pcre2_options)) {
+    if (!try runPcre2(pattern, subject, 0, &expected, pcre2_options)) {
         if (verbose) std.debug.print("pcre2 rejected the pattern\n", .{});
         return 2;
     }
@@ -763,7 +769,7 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
                 if (!std.unicode.utf8ValidateSlice(subject)) continue;
 
                 var expected: Result = .{ .matched = false };
-                if (!(runPcre2(pattern, subject, &expected, pcre2_options) catch false)) {
+                if (!(runPcre2(pattern, subject, 0, &expected, pcre2_options) catch false)) {
                     skip_pcre2 += 1;
                     continue;
                 }
@@ -856,10 +862,238 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
     return if (disagreements != 0) 1 else 0;
 }
 
+/// Differential testing over mutations of PCRE2's own test patterns.
+///
+/// The corpus run compares the patterns as written; the generator writes
+/// patterns from a grammar of its own. Between the two sits everything a
+/// hand-written pattern *almost* says: one quantifier lazier, one bound
+/// nudged, two branches spliced from different files. Those neighborhoods
+/// are where an off-by-one in the parser or compiler lives, and neither
+/// source visits them. This mode does: it loads every corpus pattern, applies
+/// a few seeded mutations, and holds the result to PCRE2 the same three ways
+/// as the sweep -- leftmost match, every match, and from an offset.
+///
+///     zig build oracle ... -- --corpus-mutate <pcre2>/testdata [cases] [seed]
+fn runCorpusMutate(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    cases_n: usize,
+    seed: u64,
+) !u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
+        std.debug.print("cannot open {s}: {t}\n", .{ dir_path, err });
+        return 2;
+    };
+    defer dir.close(io);
+
+    // Load every pattern and subject the corpus files hold. The file text
+    // must outlive the cases, which point into it.
+    var texts: std.ArrayList([]u8) = .empty;
+    var cases: std.ArrayList(CorpusCase) = .empty;
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (cases.items) |*cse| cse.subjects.deinit(gpa);
+        cases.deinit(gpa);
+        for (owned.items) |o| gpa.free(o);
+        owned.deinit(gpa);
+        for (texts.items) |t| gpa.free(t);
+        texts.deinit(gpa);
+    }
+    var walker = dir.iterate();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "testinput")) continue;
+        const text = dir.readFileAlloc(io, entry.name, gpa, .limited(64 << 20)) catch continue;
+        try texts.append(gpa, text);
+        try parseCorpusFile(gpa, text, &cases, &owned);
+    }
+    if (cases.items.len == 0) {
+        std.debug.print("no corpus patterns under {s}\n", .{dir_path});
+        return 2;
+    }
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    // Characters a mutation may write in. Mostly syntax, so an edit has a
+    // real chance of still parsing rather than always breaking the pattern.
+    const soup = "ab01(){}[]|*+?.^$\\-,:<>=!{}xdswbAZkhv";
+
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(gpa);
+    var compared: usize = 0;
+    var skip_zregex: usize = 0;
+    var rejected_but_valid: usize = 0;
+    var skip_pcre2: usize = 0;
+    var skip_budget: usize = 0;
+    var disagreements: usize = 0;
+    var global_compared: usize = 0;
+    var global_bad: usize = 0;
+    var global_expected: std.ArrayList(Result) = .empty;
+    defer global_expected.deinit(gpa);
+
+    for (0..cases_n) |_| {
+        const base = cases.items[rand.uintLessThan(usize, cases.items.len)];
+        // Oversized inputs cost time without adding shapes.
+        if (base.pattern.len == 0 or base.pattern.len > 200) continue;
+
+        pat.clearRetainingCapacity();
+        try pat.appendSlice(gpa, base.pattern);
+        const edits = rand.intRangeAtMost(u8, 1, 3);
+        for (0..edits) |_| {
+            if (pat.items.len == 0) break;
+            switch (rand.uintLessThan(u8, 6)) {
+                // One character becomes another.
+                0 => pat.items[rand.uintLessThan(usize, pat.items.len)] =
+                    soup[rand.uintLessThan(usize, soup.len)],
+                // One character appears...
+                1 => try pat.insert(gpa, rand.uintLessThan(usize, pat.items.len + 1), soup[rand.uintLessThan(usize, soup.len)]),
+                // ...or disappears.
+                2 => _ = pat.orderedRemove(rand.uintLessThan(usize, pat.items.len)),
+                // A quantifier turns lazy, or a literal gains one.
+                3 => try pat.insert(gpa, rand.uintLessThan(usize, pat.items.len + 1), '?'),
+                // Two adjacent characters swap.
+                4 => {
+                    if (pat.items.len < 2) continue;
+                    const i = rand.uintLessThan(usize, pat.items.len - 1);
+                    std.mem.swap(u8, &pat.items[i], &pat.items[i + 1]);
+                },
+                // Crossover: this pattern's head, another's tail.
+                5 => {
+                    const other = cases.items[rand.uintLessThan(usize, cases.items.len)].pattern;
+                    if (other.len == 0 or other.len > 200) continue;
+                    const cut = rand.uintLessThan(usize, pat.items.len);
+                    pat.shrinkRetainingCapacity(cut);
+                    try pat.appendSlice(gpa, other[rand.uintLessThan(usize, other.len)..]);
+                },
+                else => unreachable,
+            }
+        }
+        // The pattern reaches PCRE2 as a C string; a NUL would truncate it
+        // there and the two libraries would be compared on different input.
+        if (std.mem.indexOfScalar(u8, pat.items, 0) != null) continue;
+        const pattern = try gpa.dupeZ(u8, pat.items);
+        defer gpa.free(pattern);
+
+        // A subject from the base case when it has one, or any other's.
+        const donor = if (base.subjects.items.len != 0)
+            base
+        else
+            cases.items[rand.uintLessThan(usize, cases.items.len)];
+        if (donor.subjects.items.len == 0) continue;
+        const subject = donor.subjects.items[rand.uintLessThan(usize, donor.subjects.items.len)];
+        if (!std.unicode.utf8ValidateSlice(subject)) continue;
+        if (subject.len > 4096) continue;
+
+        var re = zregex.Regex.compileWithFlags(gpa, pattern, base.flags) catch {
+            skip_zregex += 1;
+            var probe: Result = .{ .matched = false };
+            var opts: u32 = 0;
+            if (base.flags.case_insensitive) opts |= c.PCRE2_CASELESS;
+            if (base.flags.multiline) opts |= c.PCRE2_MULTILINE;
+            if (base.flags.dot_all) opts |= c.PCRE2_DOTALL;
+            if (runPcre2(pattern, subject, 0, &probe, opts) catch false) {
+                rejected_but_valid += 1;
+                if (rejected_but_valid <= 8)
+                    std.debug.print("ZREGEX REJECTS (PCRE2 accepts): pattern={s}\n", .{pattern});
+            }
+            continue;
+        };
+        defer re.deinit();
+        re.max_steps = 200_000;
+
+        var pcre2_options: u32 = 0;
+        if (base.flags.case_insensitive) pcre2_options |= c.PCRE2_CASELESS;
+        if (base.flags.multiline) pcre2_options |= c.PCRE2_MULTILINE;
+        if (base.flags.dot_all) pcre2_options |= c.PCRE2_DOTALL;
+
+        var expected: Result = .{ .matched = false };
+        if (!(runPcre2(pattern, subject, 0, &expected, pcre2_options) catch false)) {
+            skip_pcre2 += 1;
+            continue;
+        }
+        const got = re.find(gpa, subject) catch {
+            skip_budget += 1;
+            continue;
+        };
+        defer if (got) |m| {
+            var mm = m;
+            mm.deinit(gpa);
+        };
+        compared += 1;
+
+        var bad = false;
+        if ((got != null) != expected.matched) {
+            bad = true;
+        } else if (got) |m| {
+            for (m.groups, 0..) |g, gi| {
+                if (gi >= expected.usable()) break;
+                const e = expected.groups[gi];
+                if ((g == null) != (e == null)) bad = true;
+                if (g != null and e != null and
+                    (g.?.start != e.?.start or g.?.end != e.?.end)) bad = true;
+            }
+        }
+        if (bad) {
+            disagreements += 1;
+            if (disagreements <= 15) {
+                std.debug.print("DISAGREE (mutated) pattern={s} flags={s}{s}{s}\n  haystack={f}\n", .{
+                    pattern,
+                    if (base.flags.case_insensitive) "i" else "",
+                    if (base.flags.multiline) "m" else "",
+                    if (base.flags.dot_all) "s" else "",
+                    std.zig.fmtString(subject),
+                });
+            }
+        }
+
+        if (try compareAllMatches(gpa, &re, pattern, subject, pcre2_options, &global_expected)) |agreed| {
+            global_compared += 1;
+            if (!agreed) {
+                global_bad += 1;
+                if (global_bad <= 15) {
+                    std.debug.print("DISAGREE (mutated, all matches) pattern={s}\n  haystack={f}\n", .{
+                        pattern, std.zig.fmtString(subject),
+                    });
+                    try printAllMatches(gpa, &re, subject, &global_expected);
+                }
+            }
+        }
+    }
+    std.debug.print(
+        "mutated: {d} compared, skipped (zregex {d} — of which {d} PCRE2 accepts, " ++
+            "pcre2 {d}, budget {d}), disagreements {d}; all-match {d}, disagreements {d}\n",
+        .{
+            compared,    skip_zregex,   rejected_but_valid, skip_pcre2,
+            skip_budget, disagreements, global_compared,    global_bad,
+        },
+    );
+    return if (disagreements != 0 or global_bad != 0) 1 else 0;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--corpus-mutate")) {
+        if (args.len < 3) {
+            std.debug.print("usage: --corpus-mutate <pcre2-source>/testdata [cases] [seed]\n", .{});
+            std.process.exit(2);
+        }
+        const n: usize = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 20000;
+        const sd: u64 = if (args.len > 4) try std.fmt.parseInt(u64, args[4], 10) else 0x5eed;
+        std.process.exit(try runCorpusMutate(gpa, init.io, args[2], n, sd));
+    }
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--corpus")) {
+        if (args.len < 3) {
+            std.debug.print("usage: --corpus <pcre2-source>/testdata\n", .{});
+            std.process.exit(2);
+        }
+        std.process.exit(try runCorpus(gpa, init.io, args[2], args.len > 3 and
+            std.mem.eql(u8, args[3], "-v")));
+    }
 
     // Trailing options for the two single-case modes: `-q` shrinks quietly,
     // since only the exit status matters then, and a run of `i`/`m`/`s` sets
@@ -883,15 +1117,6 @@ pub fn main(init: std.process.Init) !void {
                 },
             };
         }
-    }
-
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--corpus")) {
-        if (args.len < 3) {
-            std.debug.print("usage: --corpus <pcre2-source>/testdata\n", .{});
-            std.process.exit(2);
-        }
-        std.process.exit(try runCorpus(gpa, init.io, args[2], args.len > 3 and
-            std.mem.eql(u8, args[3], "-v")));
     }
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--engines")) {
@@ -931,6 +1156,8 @@ pub fn main(init: std.process.Init) !void {
     // with a separate answer: the rule for stepping past an empty match.
     var global_compared: usize = 0;
     var global_bad: usize = 0;
+    var offset_compared: usize = 0;
+    var offset_bad: usize = 0;
     var global_expected: std.ArrayList(Result) = .empty;
     defer global_expected.deinit(gpa);
     // Why cases are dropped, so that coverage can be aimed at the biggest
@@ -1022,7 +1249,7 @@ pub fn main(init: std.process.Init) !void {
             // A pattern zregex turns down that PCRE2 compiles is a gap in
             // this library, not a case to skip quietly. Report a few.
             var probe: Result = .{ .matched = false };
-            if (runPcre2(pattern, subject, &probe, pcre2_options) catch false) {
+            if (runPcre2(pattern, subject, 0, &probe, pcre2_options) catch false) {
                 rejected_but_valid += 1;
                 if (rejected_but_valid <= 12) {
                     std.debug.print("ZREGEX REJECTS (PCRE2 accepts): {t}  pattern={s}\n", .{ err, pattern });
@@ -1034,7 +1261,7 @@ pub fn main(init: std.process.Init) !void {
         re.max_steps = 200_000;
 
         var expected: Result = .{ .matched = false };
-        if (!try runPcre2(pattern, subject, &expected, pcre2_options)) {
+        if (!try runPcre2(pattern, subject, 0, &expected, pcre2_options)) {
             skipped += 1;
             skip_pcre2 += 1;
             var msg: [128]u8 = undefined;
@@ -1066,6 +1293,67 @@ pub fn main(init: std.process.Init) !void {
         if (re.jit_code != null) {
             views[view_count] = .{ .label = "jit", .force = .jit };
             view_count += 1;
+        }
+
+        // Searching from an offset against PCRE2's startoffset. Both define
+        // the same thing: the match may not begin before `start`, but `\b`,
+        // `^` and lookbehind still see the text in front of it -- searching
+        // a slice would be a different question with different answers. The
+        // engines were long compared against each other here; this is the
+        // reference finally judging them too.
+        offsets: for (0..2) |_| {
+            if (subject.len == 0) break;
+            var off = src.index(subject.len + 1);
+            // PCRE2 refuses an offset inside a UTF-8 sequence outright
+            // rather than defining it; step back to the boundary.
+            while (off > 0 and off < subject.len and subject[off] & 0xC0 == 0x80) off -= 1;
+
+            var at_expected: Result = .{ .matched = false };
+            if (!(runPcre2(pattern, subject, off, &at_expected, pcre2_options) catch false)) continue;
+            const got_at = re.findAt(gpa, subject, off) catch continue;
+            defer if (got_at) |m| {
+                var mm = m;
+                mm.deinit(gpa);
+            };
+            offset_compared += 1;
+
+            var bad_at = false;
+            if ((got_at != null) != at_expected.matched) {
+                bad_at = true;
+            } else if (got_at) |m| {
+                for (m.groups, 0..) |g, gi| {
+                    if (gi >= at_expected.usable()) break;
+                    const e = at_expected.groups[gi];
+                    if ((g == null) != (e == null)) bad_at = true;
+                    if (g != null and e != null and
+                        (g.?.start != e.?.start or g.?.end != e.?.end)) bad_at = true;
+                }
+            }
+            if (!bad_at) continue :offsets;
+            offset_bad += 1;
+            if (offset_bad <= 10) {
+                std.debug.print("DISAGREE (findAt {d}) pattern={s} flags={s}{s}{s}\n  haystack={f}\n", .{
+                    off,
+                    pattern,
+                    if (flags.case_insensitive) "i" else "",
+                    if (flags.multiline) "m" else "",
+                    if (flags.dot_all) "s" else "",
+                    std.zig.fmtString(subject),
+                });
+                std.debug.print("  zregex:", .{});
+                if (got_at) |m| {
+                    for (m.groups) |g| {
+                        if (g) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
+                    }
+                } else std.debug.print(" no match", .{});
+                std.debug.print("\n  pcre2: ", .{});
+                if (at_expected.matched) {
+                    for (0..at_expected.usable()) |gi| {
+                        if (at_expected.groups[gi]) |sp| std.debug.print(" {d}..{d}", .{ sp.start, sp.end }) else std.debug.print(" -", .{});
+                    }
+                } else std.debug.print(" no match", .{});
+                std.debug.print("\n", .{});
+            }
         }
 
         // The iterator runs whichever engine the pattern selected, so this is
@@ -1161,6 +1449,7 @@ pub fn main(init: std.process.Init) !void {
         .{ compared, skipped, skip_zregex, rejected_but_valid, skip_pcre2, skip_budget, disagreements },
     );
     std.debug.print("all-match comparisons {d}, disagreements {d}\n", .{ global_compared, global_bad });
+    std.debug.print("findAt comparisons {d}, disagreements {d}\n", .{ offset_compared, offset_bad });
     if (reject_reasons.count() != 0) {
         std.debug.print("zregex parse errors:", .{});
         var it = reject_reasons.iterator();

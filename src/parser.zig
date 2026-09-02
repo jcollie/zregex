@@ -994,8 +994,26 @@ pub const Parser = struct {
         self.pos += 1; // '['
         const negated = self.eat('^');
         const start = self.ranges_len;
-        // ']' as the very first member is a literal (PCRE behavior).
-        if (self.eat(']')) try self.addRange(']', ']');
+        // ']' as the very first member is a literal (PCRE behavior) -- and
+        // an ordinary member in every other way, so it may open a range:
+        // `[]-b]` runs from ']' to 'b', which takes in the letter 'a'.
+        // Adding it as a finished member instead read that class as the
+        // three characters ']', '-', 'b'.
+        if (self.eat(']')) {
+            if (self.peek() == '-' and self.peekAt(1) != null and self.peekAt(1) != ']') {
+                self.pos += 1; // '-'
+                switch (try self.parseClassMember()) {
+                    .set => return error.InvalidClass,
+                    .cp => |hi| {
+                        if (']' > hi) return error.InvalidClass;
+                        try self.addRange(']', hi);
+                    },
+                }
+            } else {
+                try self.addRange(']', ']');
+            }
+            if (self.flags.case_insensitive) try self.caseCloseRanges(start);
+        }
         while (true) {
             const c = self.peek() orelse return error.InvalidClass;
             if (c == ']') {

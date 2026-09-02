@@ -36,6 +36,15 @@ Three engines behind one API:
   under it. That construction takes `grep -P` from milliseconds to hours;
   here it is `error.StepLimitExceeded` after work proportional to the input.
 
+Memory is bounded the same way time is: adversarial patterns get a clean
+error, not an allocation. Patterns longer than a megabyte are refused before
+the parse buffers — which are sized for the worst case — are allocated for
+them, and a program whose empty-loop guards would blow up the Pike VM's
+visited table (near the instruction ceiling *and* five-plus levels deep in
+nullable loops at once) is refused as too large. Both limits sit far past
+anything not built to hit them; one 381-byte pattern used to allocate half a
+gigabyte through the second.
+
 Engine selection is automatic at compile time: `regex.engine` reports what
 will run and `regex.fallback_engine` what finishes anything the JIT bails on.
 A pattern whose loops cannot all be fused — `(?:ab|cd)+`, and above all an

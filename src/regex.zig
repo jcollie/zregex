@@ -134,6 +134,8 @@ pub const Regex = struct {
         pattern: []const u8,
         flags: Flags,
     ) CompileError!Regex {
+        // Before the buffers: they are sized from the pattern's length.
+        if (pattern.len > parser.max_pattern_len) return error.PatternTooLong;
         const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
         const nodes = try gpa.alloc(parser.Node, sizes.nodes);
         defer gpa.free(nodes);
@@ -243,6 +245,7 @@ pub const Regex = struct {
     pub fn compileComptimeWithFlags(comptime pattern: []const u8, comptime flags: Flags) Regex {
         comptime {
             @setEvalBranchQuota(10_000_000);
+            if (pattern.len > parser.max_pattern_len) @compileError("pattern too long");
             const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
             var nodes: [sizes.nodes]parser.Node = undefined;
             var ranges: [sizes.ranges]common.ClassRange = undefined;

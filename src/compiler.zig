@@ -14,6 +14,8 @@ const parser = @import("parser.zig");
 
 /// Hard cap on program length; counted repeats can expand a lot.
 pub const max_insts: u32 = 1 << 16;
+/// Ceiling on instructions times empty-loop-guard masks; see `count`.
+pub const max_visited_keys: usize = 1 << 20;
 
 pub const CharOp = struct {
     cp: u21,
@@ -120,11 +122,25 @@ pub const Compiler = struct {
     insts: []Inst,
     len: u32 = 0,
     next_slot: u16,
+    /// Empty-loop guards currently open, and the deepest that got.
+    guard_depth: u8 = 0,
+    max_guard_depth: u8 = 0,
 
     const Self = @This();
 
     fn emit(self: *Self, inst: Inst) CompileError!u32 {
         if (self.len >= max_insts) return error.ProgramTooLarge;
+        // `set_pos`/`exit_if_same` pairs bracket empty-loop guards, and the
+        // pairs nest, so emission order tracks their depth. The Pike VM's
+        // visited table doubles for each level; see `count`.
+        switch (inst) {
+            .set_pos => {
+                self.guard_depth += 1;
+                self.max_guard_depth = @max(self.max_guard_depth, self.guard_depth);
+            },
+            .exit_if_same => self.guard_depth -|= 1,
+            else => {},
+        }
         if (!self.counting) self.insts[self.len] = inst;
         self.len += 1;
         return self.len - 1;
@@ -327,6 +343,17 @@ pub fn count(
         .next_slot = 2 * @as(u16, group_count),
     };
     try c.compileRoot(root);
+    // The Pike VM's visited table is one entry per instruction per guard
+    // mask -- it doubles for each level of empty-loop guard nesting, up to
+    // six -- and its thread lists are sized alongside it at roughly eighty
+    // bytes a key. Accepting a program that is at once near the instruction
+    // ceiling and six levels deep in nullable loops means accepting a
+    // half-gigabyte allocation from a 381-byte pattern, so such a program is
+    // turned away here with the same error as any other that is too big to
+    // run. Every pattern up to sixteen thousand instructions keeps all six
+    // levels, which is far past anything not built to hit this.
+    const guard_bits: u5 = @intCast(@min(c.max_guard_depth, 6));
+    if ((@as(usize, c.len) << guard_bits) > max_visited_keys) return error.ProgramTooLarge;
     return .{ .insts = c.len, .slots = c.next_slot };
 }
 
@@ -357,6 +384,7 @@ fn compileForTest(
     pattern: []const u8,
     flags: common.Flags,
 ) !struct { insts: []Inst, slots: u16, p: u8 } {
+    if (pattern.len > parser.max_pattern_len) return error.PatternTooLong;
     const sizes = parser.bufferSizes(pattern.len, parser.mayBeCaseless(pattern, flags));
     const nodes = try gpa.alloc(parser.Node, sizes.nodes);
     defer gpa.free(nodes);

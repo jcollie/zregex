@@ -24,6 +24,15 @@ const max_group_number: u32 = max_groups;
 /// Maximum nesting depth of groups.
 pub const max_depth: u32 = 200;
 
+/// Longest pattern accepted, checked before anything is allocated for it.
+/// The parse buffers are sized for the worst case at dozens of bytes per
+/// pattern byte, so without a ceiling an eight-megabyte pattern of no-ops --
+/// `(?:)` over and over, which compiles to nearly nothing -- allocated six
+/// hundred megabytes on the way in. A megabyte is far past any pattern that
+/// can still compile: the program ceiling cuts real content off two orders
+/// of magnitude sooner, so only no-op spam ever reaches this limit.
+pub const max_pattern_len: usize = 1 << 20;
+
 pub const NodeIndex = u32;
 
 pub const Node = union(enum) {
@@ -88,6 +97,7 @@ pub const NamedGroup = struct {
 };
 
 pub const ParseError = error{
+    PatternTooLong,
     UnexpectedEnd,
     UnbalancedParen,
     InvalidEscape,

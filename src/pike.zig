@@ -263,7 +263,16 @@ pub fn run(
     // `Ctx.tryEnter`. Programs without such a loop get `key_shift == 0` and
     // the same single mark per instruction as before.
     const guard_bit = try arena.alloc(u8, prog.slot_count);
-    const guard_count = try assignGuardBits(arena, prog, guard_bit);
+    var guard_count = try assignGuardBits(arena, prog, guard_bit);
+    // The compiler refuses any program whose keys would exceed the ceiling
+    // (see `compiler.count`), so this shedding is a safety net for a program
+    // that arrived some other way; every compiled pattern keeps every bit.
+    while (guard_count > 0 and (n << @as(u5, @intCast(guard_count))) > compiler.max_visited_keys) {
+        guard_count -= 1;
+    }
+    for (guard_bit) |*b| {
+        if (b.* > guard_count) b.* = 0;
+    }
     const key_shift: u5 = @intCast(guard_count);
     // Instructions times guard masks: how many distinct threads a single
     // position can hold. Without a guard this is just the instruction count.

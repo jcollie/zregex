@@ -988,6 +988,40 @@ test "NUL is an ordinary character" {
     try expectGroups("(a\\x00)(b)", "a\x00b", &.{ "a\x00b", "a\x00", "b" });
 }
 
+test "adversarial patterns cannot demand absurd memory" {
+    // Two memory bombs, measured with a byte-counting allocator before the
+    // limits below existed.
+    //
+    // Six nested nullable loops wrapped around a program near the
+    // instruction ceiling made the Pike VM's visited table four million
+    // keys -- instructions times two per guard level -- and one 381-byte
+    // pattern allocated half a gigabyte. The compiler now refuses a program
+    // whose table would pass a million keys; every pattern up to sixteen
+    // thousand instructions keeps all six guard levels, so nothing short of
+    // a deliberately built monster notices.
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(gpa);
+    try pat.appendSlice(gpa, "((((((a?)*)*)*)*)*)*");
+    for (0..60) |_| try pat.appendSlice(gpa, "b{900}");
+    try std.testing.expectError(error.ProgramTooLarge, Regex.compile(gpa, pat.items));
+
+    // The nesting alone is fine: it is the combination with a huge program
+    // that is refused.
+    var re = try Regex.compile(gpa, "((((((a?)*)*)*)*)*)*b");
+    defer re.deinit();
+    try expectFind("((((((a?)*)*)*)*)*)*b", "aab", "aab");
+
+    // The parse buffers are sized for the worst case at dozens of bytes per
+    // pattern byte, and a pattern of no-ops compiles to almost nothing while
+    // costing all of it: eight megabytes of `(?:)` allocated six hundred.
+    // Patterns are refused past a megabyte, before anything is allocated;
+    // real content runs into the program ceiling two orders of magnitude
+    // sooner, so only no-op spam can ever reach this.
+    pat.clearRetainingCapacity();
+    for (0..(1 << 18) + 1) |_| try pat.appendSlice(gpa, "(?:)");
+    try std.testing.expectError(error.PatternTooLong, Regex.compile(gpa, pat.items));
+}
+
 test "adversarial patterns fail cleanly instead of crashing" {
     // Compile-time hardening. A pattern is attacker-sized input too: each of
     // these once either crashed or would have run away, and each must now

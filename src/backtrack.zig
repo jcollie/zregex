@@ -556,7 +556,10 @@ pub fn run(
     input: []const u8,
     start: usize,
     slots_out: []?usize,
-    max_steps: usize,
+    /// Steps this call may spend, decremented by what it does spend, so a
+    /// caller making several calls -- the iterator above all -- can hold
+    /// them to one pool rather than granting each a fresh allowance.
+    budget: *usize,
     use_memo: bool,
     reject_empty_at: ?usize,
 ) Error!bool {
@@ -565,9 +568,10 @@ pub fn run(
         .prog = prog,
         .input = input,
         .slots = slots_out,
-        .max_steps = max_steps,
+        .max_steps = budget.*,
         .reject_empty_at = reject_empty_at,
     };
+    defer budget.* -|= bt.steps;
     defer bt.stack.deinit(gpa);
     defer bt.undo.deinit(gpa);
     defer bt.memo.deinit(gpa);
@@ -618,17 +622,16 @@ pub fn run(
         if (!r.greedy or r.max != compiler.RepOp.unbounded) break :blk null;
         break :blk prog.insts[pc + 1];
     };
-    // The budget covers the whole call: `max_steps` plus an allowance per
-    // input byte, spent across every start position rather than granted anew
-    // at each one. Resetting per attempt is what PCRE does with its match
-    // limit, and it makes the limit no bound at all -- an input crafted so
-    // every attempt stays just under it multiplies the budget by the length
-    // of the haystack. `(a+)\1$` against 24K of `a` ran eleven seconds here
-    // without ever tripping a 1M-step limit, and hung `grep -P` outright.
-    // The JIT already accounts this way (see `budget_per_byte`); the
-    // per-byte term is what lets a legitimate scan of a large haystack do
-    // proportional work, with `max_steps` as headroom for one hard stretch.
-    bt.max_steps = max_steps +| 64 *| @as(usize, input.len);
+    // The budget covers the whole call -- and, through the pool, a whole
+    // iteration: it is spent across every start position rather than granted
+    // anew at each one. Resetting per attempt is what PCRE does with its
+    // match limit, and it makes the limit no bound at all -- an input
+    // crafted so every attempt stays just under it multiplies the budget by
+    // the length of the haystack. `(a+)\1$` against 24K of `a` ran eleven
+    // seconds here without ever tripping a 1M-step limit, and hung `grep -P`
+    // outright. The per-byte allowance in `Regex.stepBudget` is what lets a
+    // legitimate scan of a large haystack do proportional work, with
+    // `max_steps` as headroom for one hard stretch.
     var s = start;
     while (true) {
         if (pf.usable) {

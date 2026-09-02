@@ -1113,6 +1113,97 @@ test "a leading class bracket may open a range" {
     try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[]-\x20]"));
 }
 
+test "a bare assertion cannot be quantified" {
+    // `^*`, `\b+` and the rest are errors in PCRE -- a quantifier must
+    // follow a repeatable item -- and repeating something zero-width never
+    // meant more than writing it once. zregex used to compile them, which
+    // was most of what the oracle generated and threw away before the
+    // generator stopped emitting them; now both libraries turn them down.
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "^*"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "$+"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "\\b?"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "\\B*"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "\\A+"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "\\z?"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "\\Z{1,2}"));
+    try std.testing.expectError(error.NothingToRepeat, Regex.compile(gpa, "a^{2}"));
+    // Wrapped in a group it is a repeatable item again, as in PCRE, and so
+    // are lookarounds.
+    try expectFind("(?m:^)*a", "a", "a");
+    try expectFind("(?:\\b)+a", "a", "a");
+    try expectFind("(?=a)+a", "aa", "a");
+}
+
+test "a shorthand set cannot open a class range" {
+    // `[\d-z]` is an error in PCRE, not a class holding a literal dash; the
+    // dash is literal only where no range could start -- last, or first.
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[\\d-z]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[[:digit:]-z]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[\\s-x]"));
+    try std.testing.expectError(error.InvalidClass, Regex.compile(gpa, "[\\w-\\d]"));
+    try expectFind("[\\d-]", "-", "-");
+    try expectFind("[[:digit:]-]", "-", "-");
+    try expectFind("[-\\d]", "-", "-");
+    try expectFind("[\\h-]", "\t", "\t");
+}
+
+test "an iteration spends one budget, not one per match" {
+    // Each `next` scans a region disjoint from the last, so the per-byte
+    // allowance is naturally spent once across an iteration -- but the
+    // `max_steps` headroom used to be granted anew at every call, and a
+    // haystack alternating cheap matches with expensive stretches could
+    // claim it once per match. The iterator now holds every `next` to one
+    // pool. Interleave sixty `x` matches with runs of `a` that `(a+)\1$`
+    // grinds against: under the old accounting each run fit its own fresh
+    // budget and the iteration completed; under one pool it must run dry
+    // partway, after real matches have been returned.
+    var hay: std.ArrayList(u8) = .empty;
+    defer hay.deinit(gpa);
+    for (0..60) |_| {
+        try hay.append(gpa, 'x');
+        for (0..200) |_| try hay.append(gpa, 'a');
+    }
+    var re = try Regex.compile(gpa, "x|(a+)\\1$");
+    defer re.deinit();
+    re.max_steps = 5000;
+    re.jit_mode = .off;
+
+    var it = re.iterator(gpa, hay.items);
+    defer it.deinit();
+    var matches: usize = 0;
+    var ran_dry = false;
+    while (true) {
+        const step = it.next() catch |e| {
+            try std.testing.expectEqual(error.StepLimitExceeded, e);
+            ran_dry = true;
+            break;
+        };
+        var m = step orelse break;
+        m.deinit(gpa);
+        matches += 1;
+    }
+    try std.testing.expect(ran_dry);
+    try std.testing.expect(matches > 0);
+    try std.testing.expect(matches < 60);
+
+    // A haystack dense with matches and nothing expensive between them
+    // iterates to the end on the same pool.
+    var re2 = try Regex.compile(gpa, "(a)\\1?");
+    defer re2.deinit();
+    re2.jit_mode = .off;
+    hay.clearRetainingCapacity();
+    for (0..10_000) |_| try hay.append(gpa, 'a');
+    var it2 = re2.iterator(gpa, hay.items);
+    defer it2.deinit();
+    var n: usize = 0;
+    while (try it2.next()) |m| {
+        var mm = m;
+        mm.deinit(gpa);
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5000), n);
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. Both were checked against Python, which
     // agrees with zregex; PCRE2 10.47 does not, and the tool steers around

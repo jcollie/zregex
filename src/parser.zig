@@ -555,6 +555,12 @@ pub const Parser = struct {
             },
             else => return atom,
         }
+        // A bare assertion is not a repeatable item -- `^*`, `\b+` and the
+        // rest are errors in PCRE, and repeating something zero-width was
+        // never more than an expensive way to write it once. A *group*
+        // holding one stays repeatable, as do lookarounds; PCRE quantifies
+        // `(?m:^)*` and `(?=a)+` and so does this.
+        if (self.nodes[atom] == .assertion) return error.NothingToRepeat;
         var greedy = true;
         if (self.eat('?')) greedy = false;
         // Reject a second quantifier (`a**`, `a*+` possessive, ...).
@@ -1032,7 +1038,15 @@ pub const Parser = struct {
             }
             // Checked before the member below, which would otherwise take the
             // `[` for a literal and the rest for individual characters.
-            if (c == '[' and try self.parsePosixClass()) continue;
+            if (c == '[' and try self.parsePosixClass()) {
+                // Like a shorthand set, a POSIX class cannot open a range;
+                // the dash after one is literal only where no range could
+                // start. `[[:digit:]-z]` is an error in PCRE, `[[:digit:]-]`
+                // is not.
+                if (self.peek() == '-' and self.peekAt(1) != null and self.peekAt(1) != ']')
+                    return error.InvalidClass;
+                continue;
+            }
             // Each member is closed over case on its own. Closing the class
             // as a whole would also close any complement a member brought in
             // -- `[\W]`, `[[:^lower:]]` -- and the complement of a closed set
@@ -1043,7 +1057,14 @@ pub const Parser = struct {
             const m1 = try self.parseClassMember();
             switch (m1) {
                 // A shorthand or POSIX class closed itself as it was added.
-                .set => continue,
+                // It cannot open a range: `[\d-z]` is an error in PCRE, not
+                // a class holding a literal dash. The dash stays literal
+                // when nothing could follow it -- `[\d-]` is fine.
+                .set => {
+                    if (self.peek() == '-' and self.peekAt(1) != null and self.peekAt(1) != ']')
+                        return error.InvalidClass;
+                    continue;
+                },
                 .cp => |lo| {
                     // Try to form a range: `lo-hi`, where '-' is not final.
                     if (self.peek() == '-' and self.peekAt(1) != null and self.peekAt(1) != ']') {

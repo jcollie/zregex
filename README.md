@@ -162,6 +162,10 @@ All of these are zero-width: they match a position, not text.
 | `\Z` | end of text, or just before a newline ending it — what `$` means outside `m` | `bc\Z` | `"bc\\Z"` |
 | `\b` / `\B` | word boundary / non-boundary | `\bcat\b` matches `cat` in `the cat.` but not in `concat` | `"\\bcat\\b"` |
 
+A bare assertion cannot carry a quantifier — `^*` and `\b+` are compile
+errors, as in PCRE. Wrapped in a group it is a repeatable item again:
+`(?m:^)*` and quantified lookarounds work in both.
+
 ### Quantifiers
 
 Greedy by default; append `?` for the lazy (shortest-first) variant.

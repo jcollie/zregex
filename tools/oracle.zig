@@ -21,10 +21,10 @@
 //!     zregex does, and haystacks are restricted to valid UTF-8 — zregex
 //!     decodes invalid bytes as one-byte codepoints, which UTF mode rejects
 //!     outright rather than defining differently.
-//!   * A quantified anchor -- `^*`, `\b+` -- is not generated. zregex
-//!     compiles one; PCRE2 turns it down as a quantifier on an unrepeatable
-//!     item, and left in it was most of what this tool generated and threw
-//!     away. Anything else PCRE2 will not compile is skipped when it comes up.
+//!   * Patterns PCRE2 will not compile are skipped when they come up. This
+//!     used to lose most of the run to quantified anchors -- `^*`, `\b+` --
+//!     which zregex once compiled and PCRE2 does not; both reject them now,
+//!     and the generator does not emit them.
 //!   * Two constructs PCRE2 10.47 gets wrong are not generated — a caseless
 //!     class holding a wide non-ASCII range, and a repeat that may run no
 //!     iterations at all (`{0}`, and the `{0,0}` that means the same) over

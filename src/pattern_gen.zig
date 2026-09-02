@@ -99,15 +99,9 @@ pub const Builder = struct {
     depth_limit: u8 = max_depth,
     length_limit: usize = max_pattern,
     group_limit: u8 = max_gen_groups,
-    /// Restricts generation to what a PCRE2 comparison can actually judge.
-    ///
-    /// Part of that is syntax PCRE2 does not accept at all — a quantified
-    /// anchor such as `^*` or `\b+`, which zregex compiles and PCRE2 turns
-    /// down as a quantifier on an unrepeatable item. Left in, it was most of
-    /// what the oracle generated and threw away.
-    ///
-    /// The rest is three constructs PCRE2 10.47 gets wrong, which without
-    /// this would have the oracle reporting the reference's own bugs:
+    /// Restricts generation to three constructs PCRE2 10.47 gets wrong,
+    /// which without this would have the oracle reporting the reference's
+    /// own bugs:
     /// a caseless class holding a wide non-ASCII range stops matching
     /// characters it matches without `(?i)`, a `{0}` repeat over some bodies
     /// makes the whole pattern fail rather than matching empty, and a
@@ -377,9 +371,10 @@ pub const Builder = struct {
                 try self.close(")");
             },
             .anchor => {
-                // PCRE2 will not compile a quantified anchor, so when it is
-                // the reference the caller is told to leave this one alone.
-                if (self.avoid_pcre2_quirks) self.no_quantifier = true;
+                // A quantified bare anchor is a parse error -- in PCRE and,
+                // following it, here -- so the caller always leaves this one
+                // alone rather than generating a pattern that cannot compile.
+                self.no_quantifier = true;
                 switch (self.src.choice(enum {
                     start,
                     end,

@@ -101,9 +101,10 @@ pub const Regex = struct {
     /// (referenced capture spans, loop guards), so semantics are unchanged.
     memo: bool = true,
     /// Step budget for the backtracking engine. One search -- a `find`, an
-    /// `isMatch`, one `Iterator.next` -- may spend this many steps plus 64
-    /// per input byte across all of its start positions together; running
-    /// out is `error.StepLimitExceeded`. The per-byte allowance keeps honest
+    /// `isMatch`, or a whole `Iterator` run, all of its `next` calls
+    /// together -- may spend this many steps plus 64 per input byte across
+    /// all of its start positions; running out is
+    /// `error.StepLimitExceeded`. The per-byte allowance keeps honest
     /// scans of large haystacks inside the budget; the total being one
     /// budget, rather than one per start position the way PCRE's match
     /// limit works, is what makes it a bound at all -- input crafted to
@@ -338,12 +339,22 @@ pub const Regex = struct {
         };
     }
 
+    /// What one search may spend in backtracker steps: `max_steps` plus an
+    /// allowance per input byte, so honest scans of large haystacks stay
+    /// inside it. One pool covers a whole `find` -- and, held by the
+    /// iterator, a whole iteration, so a haystack full of matches cannot
+    /// multiply the allowance by claiming one per match found.
+    fn stepBudget(self: *const Regex, len: usize) usize {
+        return self.max_steps +| 64 *| len;
+    }
+
     fn runEngine(
         self: *const Regex,
         gpa: std.mem.Allocator,
         haystack: []const u8,
         start: usize,
         slots: []?usize,
+        budget: *usize,
         reject_empty_at: ?usize,
     ) RunError!bool {
         return switch (self.fallback_engine) {
@@ -353,7 +364,7 @@ pub const Regex = struct {
                 haystack,
                 start,
                 slots,
-                self.max_steps,
+                budget,
                 self.memo,
                 reject_empty_at,
             ),
@@ -429,7 +440,8 @@ pub const Regex = struct {
         }
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
-        return self.runEngine(gpa, haystack, 0, slots, null);
+        var budget = self.stepBudget(haystack.len);
+        return self.runEngine(gpa, haystack, 0, slots, &budget, null);
     }
 
     /// Leftmost match, or null. Free the result with `Match.deinit`.
@@ -461,7 +473,8 @@ pub const Regex = struct {
         start: usize,
         machine: ?*dfa.Machine,
     ) RunError!?Match {
-        return self.findAtInner(gpa, haystack, start, machine, null);
+        var budget = self.stepBudget(haystack.len);
+        return self.findAtInner(gpa, haystack, start, machine, null, &budget);
     }
 
     /// Leftmost match at or after `start`, except that a zero-length match
@@ -478,11 +491,12 @@ pub const Regex = struct {
         start: usize,
         machine: ?*dfa.Machine,
         reject_empty_at: ?usize,
+        budget: *usize,
     ) RunError!?Match {
         const slots = try gpa.alloc(?usize, self.slot_count);
         defer gpa.free(slots);
         if (reject_empty_at != null) {
-            if (!try self.runEngine(gpa, haystack, start, slots, reject_empty_at)) return null;
+            if (!try self.runEngine(gpa, haystack, start, slots, budget, reject_empty_at)) return null;
             return try self.buildMatch(gpa, slots);
         }
         if (self.jitFn()) |j| {
@@ -502,11 +516,11 @@ pub const Regex = struct {
                     std.debug.assert(ok); // the DFA is a memoized Pike VM
                 },
                 .give_up => {
-                    if (!try self.runEngine(gpa, haystack, start, slots, null)) return null;
+                    if (!try self.runEngine(gpa, haystack, start, slots, budget, null)) return null;
                 },
             }
         } else {
-            if (!try self.runEngine(gpa, haystack, start, slots, null)) return null;
+            if (!try self.runEngine(gpa, haystack, start, slots, budget, null)) return null;
         }
 
         return try self.buildMatch(gpa, slots);
@@ -549,6 +563,12 @@ pub const Regex = struct {
         /// Set when the last match was empty: the next search must look for a
         /// longer match beginning right there before moving on.
         retry_nonempty_at: ?usize = null,
+        /// Backtracker steps left for the whole iteration, initialized on the
+        /// first `next`. One pool, not one per match found: the calls scan
+        /// disjoint regions, so the per-byte allowance is spent once, and a
+        /// haystack full of cheap matches cannot claim a fresh `max_steps`
+        /// headroom for each of them.
+        budget: ?usize = null,
         /// Warm DFA cache shared across `next()` calls; created lazily.
         machine: ?dfa.Machine = null,
 
@@ -571,12 +591,14 @@ pub const Regex = struct {
             // at 0 and then all of `ab`, where advancing straight away would
             // report empty at 0, 1 and 2 and never the text between them.
             // PCRE and Python both do it this way.
+            if (self.budget == null) self.budget = self.re.stepBudget(self.haystack.len);
             const m = (try self.re.findAtInner(
                 self.gpa,
                 self.haystack,
                 self.pos,
                 if (self.retry_nonempty_at == null) mach else null,
                 self.retry_nonempty_at,
+                &self.budget.?,
             )) orelse {
                 // No longer match here after all, so carry on from the next
                 // codepoint, which is where the empty one left off.

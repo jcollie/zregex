@@ -4,3 +4,8 @@ version = 1
 path = "flake.lock"
 SPDX-FileCopyrightText = "© 2026 Jeffrey C. Ollie <jeff@ocjtech.us>"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "CLAUDE.md"
+SPDX-FileCopyrightText = "© 2026 Jeffrey C. Ollie <jeff@ocjtech.us>"
+SPDX-License-Identifier = "MIT"

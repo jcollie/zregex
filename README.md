@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 
 A regular expression library for Zig 0.16.
 
-Three engines behind one API:
+Four engines behind one API:
 
 - **JIT** — on x86-64 and aarch64, patterns are compiled to native machine
   code: literals become byte compares, classes become bit-test tables, and
@@ -45,17 +45,18 @@ nullable loops at once) is refused as too large. Both limits sit far past
 anything not built to hit them; one 381-byte pattern used to allocate half a
 gigabyte through the second.
 
-Engine selection is automatic at compile time: `regex.engine` reports what
-will run and `regex.fallback_engine` what finishes anything the JIT bails on.
+Engine selection is automatic at compile time: `re.engine` reports what
+will run and `re.fallback_engine` what finishes anything the JIT bails on.
 A pattern whose loops cannot all be fused — `(?:ab|cd)+`, and above all an
 ambiguous one like `(\w+|\d+)+x` — goes to the DFA instead, where the answer
 is linear by construction rather than exponential.
-Set `regex.jit_mode` to `.off` to keep searches on the interpreters, or `.on`
-to force native code. Every engine skips ahead using a first-byte prefilter
-computed from the pattern (see `bench/` for numbers against PCRE2, Python,
-Perl, and POSIX).
+Set `re.jit_mode` to `.off` to keep searches on the interpreters, or `.on`
+to force native code; `re.dfa_mode` is the same knob for the lazy DFA, which
+`.auto` uses only when the byte prefilter is weak. Every engine skips ahead
+using a first-byte prefilter computed from the pattern (see `bench/` for
+numbers against PCRE2, Python, Perl, and POSIX).
 
-All three produce identical matches and captures; which one runs is a
+All four produce identical matches and captures; which one runs is a
 performance decision only, and the test suite checks them against each other
 pattern by pattern.
 
@@ -342,7 +343,6 @@ instead of `.jit`, and matches and captures are identical either way. Check
   one, while `e+` stops at it. Every engine agrees; patterns with an
   empty-bodied loop are simply kept off the lazy DFA, whose states cannot
   carry the position an iteration began at.
-- Backreferences to a group require the group to appear earlier in the pattern.
 
 ## Building
 

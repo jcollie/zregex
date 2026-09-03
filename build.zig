@@ -52,12 +52,15 @@ pub fn build(b: *std.Build) void {
     // build-time dependency only; nothing links against it.
     const casefold_mod = blk: {
         // The Unicode data comes from `uucode`, but as the `CaseFolding.txt`
-        // it vendors rather than through its generated tables: the fields that
-        // distinguish a simple fold from a Turkic one -- which is the
-        // distinction that decides whether `İ` matches `i` -- do not currently
-        // build (`memset: unsupported non-byte-aligned type`, uucode 0.2.0).
-        // Reading the file says exactly what is wanted, and says it in the
-        // vocabulary of the Unicode standard rather than of a library.
+        // it vendors rather than through its generated tables. Reading the file
+        // says exactly what is wanted -- the `C` and `S` lines, which are
+        // simple folding, and not the `T` line that would fold `İ` to `i` --
+        // and says it in the vocabulary of the Unicode standard rather than of
+        // a library. The generator also groups the folds into the
+        // case-equivalence orbits matching needs, which no `uucode` field
+        // provides. (`uucode`'s own `case_folding_simple` no longer includes
+        // the Turkic mapping and its `_only` fields build again as of the
+        // pinned commit, but neither change is why the file is read.)
         const uucode = b.dependency("uucode", .{});
 
         const gen = b.addExecutable(.{

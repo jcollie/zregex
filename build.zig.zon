@@ -15,8 +15,8 @@
             .lazy = true,
         },
         .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode?ref=main#61e54266895f833b307de81a0e3038cf1f1bebd4",
-            .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",
+            .url = "git+https://github.com/jacobsandlund/uucode?ref=main#f67fa5dbef5c9de57773dbe2f7a02bebc7e20301",
+            .hash = "uucode-0.2.0-ZZjBPvDKVAC0ZmoJJ37dlUn11y68rIKVeeovTLY9zxoQ",
         },
         // The oracle's reference, built from source by PCRE2's own upstream
         // build.zig (10.48 is the first release to ship one). Pinning it here

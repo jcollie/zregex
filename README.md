@@ -318,7 +318,14 @@ instead of `.jit`, and matches and captures are identical either way. Check
   folding is **Unicode**: `(?i)s` matches `ſ`, `(?i)k` matches `K`, and
   `(?i)ⱥ` matches `Ⱥ`. It is *simple* folding, the `C` and `S` entries of
   Unicode's `CaseFolding.txt`, so `ß` does not match `ss` and `İ` matches
-  neither `i` nor `I` — the same as PCRE.
+  neither `i` nor `I` — the same as PCRE. The folding data is **Unicode
+  17.0.0**, compiled into the library from the `CaseFolding.txt` that the
+  `uucode` dependency vendors, so it is fixed at build time and does not vary
+  with the host. A system PCRE2 reports whatever Unicode version it was itself
+  built against (`pcre2_config(PCRE2_CONFIG_UNICODE_VERSION)`), which may be
+  older; the vendored PCRE2 the oracle builds against is 10.48, also Unicode
+  17.0.0, so the two agree on every case-equivalence the differential test
+  covers.
 - Lookarounds are atomic. A backreference to a group that has not captured
   fails, as in PCRE; JavaScript is the odd one out in matching empty.
 - A backreference to the group that *encloses* it, as in `(a|b\1)`, reads that

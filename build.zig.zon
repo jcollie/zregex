@@ -18,6 +18,17 @@
             .url = "git+https://github.com/jacobsandlund/uucode?ref=main#61e54266895f833b307de81a0e3038cf1f1bebd4",
             .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",
         },
+        // The oracle's reference, built from source by PCRE2's own upstream
+        // build.zig (10.48 is the first release to ship one). Pinning it here
+        // is what pins the reference semantics: the weekly CI's first run
+        // failed on nothing but apt shipping an older PCRE2 whose POSIX
+        // class behavior differs. Lazy, so builds that never wire the oracle
+        // never fetch it.
+        .pcre2 = .{
+            .url = "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz",
+            .hash = "pcre2-10.48.0-IZ6r69wnegD6fc08FgRTKVcmyp4Ux2aVefaVvsRndgEl",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

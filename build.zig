@@ -131,11 +131,21 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&exe.step);
 
-    // Differential testing against PCRE2. Needs that library to link, so it
-    // is opt-in rather than part of `zig build test`.
-    const pcre2_include = b.option([]const u8, "pcre2-include", "Directory holding pcre2.h");
-    const pcre2_lib = b.option([]const u8, "pcre2-lib", "Directory holding libpcre2-8");
-    if (pcre2_include) |inc| {
+    // Differential testing against PCRE2.
+    //
+    // The reference is built from source by PCRE2's own build.zig -- 10.48 is
+    // the first release to ship one -- pinned in build.zig.zon, so
+    // `zig build oracle` works the same on any machine with no system
+    // library involved. That pin is what pins the reference *semantics*: the
+    // weekly CI's first run reported a dozen disagreements that were all apt
+    // shipping 10.42, whose POSIX class behavior differs from the version
+    // the oracle is written against. The dependency is lazy and only fetched
+    // when this wiring runs, which is every build; the two options below
+    // override it with an external build, which is how version-drift
+    // experiments like that diagnosis are run.
+    const pcre2_include = b.option([]const u8, "pcre2-include", "Override: directory holding pcre2.h");
+    const pcre2_lib = b.option([]const u8, "pcre2-lib", "Override: directory holding libpcre2-8");
+    oracle: {
         const oracle = b.addExecutable(.{
             .name = "oracle",
             .root_module = b.createModule(.{
@@ -148,10 +158,24 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        oracle.root_module.addIncludePath(.{ .cwd_relative = inc });
-        if (pcre2_lib) |lib| oracle.root_module.addLibraryPath(.{ .cwd_relative = lib });
-        oracle.root_module.linkSystemLibrary("pcre2-8", .{});
         oracle.root_module.link_libc = true;
+        if (pcre2_include) |inc| {
+            oracle.root_module.addIncludePath(.{ .cwd_relative = inc });
+            if (pcre2_lib) |lib| oracle.root_module.addLibraryPath(.{ .cwd_relative = lib });
+            oracle.root_module.linkSystemLibrary("pcre2-8", .{});
+        } else if (b.lazyDependency("pcre2", .{
+            .target = target,
+            .optimize = std.builtin.OptimizeMode.ReleaseFast,
+            .linkage = std.builtin.LinkMode.static,
+        })) |pcre2| {
+            // Upstream defaults: 8-bit code units, Unicode on, JIT off (so
+            // its sljit dependency stays unfetched). Static, because the
+            // oracle is a test tool that should carry its reference with it.
+            oracle.root_module.linkLibrary(pcre2.artifact("pcre2-8"));
+        } else {
+            // Fetch pending; the build runner fetches and configures again.
+            break :oracle;
+        }
 
         const run_oracle = b.addRunArtifact(oracle);
         run_oracle.stdio = .inherit;

@@ -1240,18 +1240,20 @@ test "findAt past the end of the haystack finds nothing" {
 }
 
 test "cases where PCRE2 is the one that is wrong" {
-    // Found by tools/oracle.zig. Both were checked against Python, which
-    // agrees with zregex; PCRE2 10.47 does not, and the tool steers around
-    // them so that it reports real differences.
+    // Found by tools/oracle.zig. All were checked against Python, which
+    // agrees with zregex; the reference is pinned in build.zig.zon, and the
+    // generator steers around what that version still gets wrong so the
+    // tool reports real differences.
 
-    // Adding `(?i)` can only ever add matches. PCRE2 loses the match when a
-    // caseless class holds a wide non-ASCII range, though it finds it both
-    // without `(?i)` and with the same character written as a literal.
+    // Adding `(?i)` can only ever add matches. PCRE2 10.47 lost the match
+    // when a caseless class held a wide non-ASCII range; 10.48 fixed it and
+    // agrees with these, which stay as plain behavior tests.
     try expectFind("(?i)[\u{a0}-\u{2fff}]+", "Aa\u{20ac}-x", "\u{20ac}");
     try expectFind("[\u{a0}-\u{2fff}]+", "Aa\u{20ac}-x", "\u{20ac}");
 
     // `X{0}` matches empty, so what follows decides the match. PCRE2 fails
-    // the whole pattern for some bodies.
+    // the whole pattern for some nullable bodies -- still, as of 10.48, for
+    // the last two below; 10.48 fixed the lookaround-bodied ones.
     try expectFind("(?:(?= ){8}){0}A", "A", "A");
     try expectFind("(?:a){0,0}A", "A", "A");
     try expectFind("(?:(?=x)+){0}A", "A", "A");

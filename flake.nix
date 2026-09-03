@@ -48,9 +48,10 @@
               pkgs.reuse
               pkgs.zig_0_16
             ];
-            # The differential oracle in tools/ links against PCRE2. Zig's
-            # build takes the two directories explicitly rather than through
-            # pkg-config, so they are exported here; see the README.
+            # The oracle builds its own PCRE2 (pinned in build.zig.zon);
+            # these exports exist for -Dpcre2-include/-Dpcre2-lib override
+            # experiments against nixpkgs' build, such as diagnosing
+            # reference version drift.
             PCRE2_INCLUDE = "${pkgs.pcre2.dev}/include";
             PCRE2_LIB = "${pkgs.pcre2.out}/lib";
           };

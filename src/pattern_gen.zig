@@ -107,16 +107,17 @@ pub const Builder = struct {
     depth_limit: u8 = max_depth,
     length_limit: usize = max_pattern,
     group_limit: u8 = max_gen_groups,
-    /// Restricts generation to three constructs PCRE2 10.47 gets wrong,
-    /// which without this would have the oracle reporting the reference's
-    /// own bugs:
-    /// a caseless class holding a wide non-ASCII range stops matching
-    /// characters it matches without `(?i)`, a `{0}` repeat over some bodies
-    /// makes the whole pattern fail rather than matching empty, and a
-    /// backreference to the group enclosing it is honoured or not depending
-    /// on which alternative it sits in — `1(\1*)` matches while `1(2|\1*)`
-    /// does not. Python agrees with zregex on the first two and rejects the
-    /// third outright as a reference to an open group.
+    /// Restricts generation to two constructs PCRE2 gets wrong (checked
+    /// against 10.48, the pinned reference), which without this would have
+    /// the oracle reporting the reference's own bugs: a repeat whose maximum
+    /// is zero over some nullable bodies makes the whole pattern fail rather
+    /// than matching empty, and a backreference to the group enclosing it is
+    /// honoured or not depending on which alternative it sits in — `1(\1*)`
+    /// matches while `1(2|\1*)` does not. Python agrees with zregex on the
+    /// first and rejects the second outright as a reference to an open
+    /// group. A third quirk — a caseless class holding a wide non-ASCII
+    /// range losing matches — was real in 10.47 and is fixed in 10.48, so
+    /// wide ranges are generated for the oracle again.
     avoid_pcre2_quirks: bool = false,
     /// Set by `atom` when what it emitted cannot carry a quantifier — an
     /// unscoped `(?i)` is the only such case — and cleared by `quantified`.
@@ -238,13 +239,10 @@ pub const Builder = struct {
                 .sym => " -@",
             }),
             // A range reaching past ASCII cannot use the inlined bitmap or
-            // the vector scanner, so it takes the helper path. Under `(?i)`
-            // PCRE2 10.47 stops matching characters such a range matches
-            // without the flag, so it is left out when it is the reference.
-            .high_range => try self.put(if (self.avoid_pcre2_quirks)
-                "\u{e9}"
-            else
-                "\u{a0}-\u{2fff}"),
+            // the vector scanner, so it takes the helper path. (PCRE2 10.47
+            // mishandled these under `(?i)`; 10.48, the pinned reference,
+            // does not, so nothing is held back here any more.)
+            .high_range => try self.put("\u{a0}-\u{2fff}"),
             .shorthand => try self.shorthand(),
             // A POSIX bracket class, which only means anything in here. Half
             // are negated, which reaches the complement of a range list.

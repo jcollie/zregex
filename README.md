@@ -379,17 +379,19 @@ zig build test -Dfuzz-alloc-cases=500
 
 The cross-engine comparison cannot find a mistake every engine makes together.
 For that, `tools/oracle.zig` runs the same generated patterns through PCRE2 and
-compares. It needs that library to link, so it is opt-in:
+compares. The reference is built from source by PCRE2's own `build.zig` —
+pinned in `build.zig.zon`, currently 10.48 — so this works the same on any
+machine, with nothing installed:
 
 ```sh
-zig build oracle -Dpcre2-include=<dir> -Dpcre2-lib=<dir> -- [cases] [seed]
+zig build oracle -- [cases] [seed]
 ```
 
-The dev shell exports the two directories, so from inside `nix develop` that is:
-
-```sh
-zig build oracle -Dpcre2-include=$PCRE2_INCLUDE -Dpcre2-lib=$PCRE2_LIB -- 25000 1
-```
+Pinning the reference pins its *semantics*: PCRE2's own POSIX-class behavior
+changed between the 10.42 that Ubuntu ships and 10.47, which once had a CI
+run reporting the reference's drift as disagreements. To compare against a
+different build — that diagnosis, for instance — override with
+`-Dpcre2-include=<dir> -Dpcre2-lib=<dir>`.
 
 Both the generated patterns and the corpus below are compared three ways: on
 the leftmost match; on every match in the subject, which is what holds

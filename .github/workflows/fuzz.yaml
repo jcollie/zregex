@@ -72,26 +72,12 @@ jobs:
             fi
           done
 
-      # Built from the release tarball, not taken from apt: the oracle's
-      # comparisons are written against PCRE2 10.47 and steer around that
-      # version's known quirks, and POSIX class semantics genuinely changed
-      # between the 10.42 Ubuntu ships and 10.47 -- the first run of this
-      # workflow reported a dozen "disagreements" that were the reference
-      # disagreeing with itself across versions.
-      - name: Build PCRE2 10.47
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSLO https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.bz2
-          tar xf pcre2-10.47.tar.bz2
-          cd pcre2-10.47
-          ./configure --prefix="$GITHUB_WORKSPACE/pcre2-prefix" --disable-shared --quiet
-          make -j"$(nproc)" --quiet
-          make install --quiet
-
+      # The oracle builds its own PCRE2 from source, via the reference's
+      # upstream build.zig, pinned in build.zig.zon -- no system library, so
+      # the reference semantics are identical on every runner. (This job's
+      # first flight failed on nothing but apt shipping an older PCRE2 whose
+      # POSIX class behavior differs.) That also makes it portable enough to
+      # run on the macOS leg, where the aarch64 JIT faces the reference on
+      # real hardware.
       - name: Fuzz against PCRE2
-        if: runner.os == 'Linux'
-        run: >
-          zig build oracle
-          -Dpcre2-include=pcre2-prefix/include
-          -Dpcre2-lib=pcre2-prefix/lib
-          -- 150000 ${{ github.run_number }}
+        run: zig build oracle -- 150000 ${{ github.run_number }}

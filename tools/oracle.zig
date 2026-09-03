@@ -25,15 +25,17 @@
 //!     used to lose most of the run to quantified anchors -- `^*`, `\b+` --
 //!     which zregex once compiled and PCRE2 does not; both reject them now,
 //!     and the generator does not emit them.
-//!   * Two constructs PCRE2 10.47 gets wrong are not generated — a caseless
-//!     class holding a wide non-ASCII range, and a repeat that may run no
-//!     iterations at all (`{0}`, and the `{0,0}` that means the same) over
-//!     certain bodies — since otherwise the tool mostly reports the
-//!     reference's own bugs. Only the *maximum* is held above zero for that
-//!     second one: `{0,}` and `{0,m}` are generated, and have to be, since a
+//!   * One construct PCRE2 gets wrong is not generated — a repeat that may
+//!     run no iterations at all (`{0}`, and the `{0,0}` that means the same)
+//!     over certain nullable bodies, which makes the reference fail the
+//!     whole pattern rather than match empty — since otherwise the tool
+//!     reports the reference's own bug. Only the *maximum* is held above
+//!     zero: `{0,}` and `{0,m}` are generated, and have to be, since a
 //!     nullable loop with a zero minimum is where the Pike VM's guard-bit
 //!     ceiling was found to produce a wrong capture. Python agrees with
-//!     zregex on both; see the tests in src/tests.zig.
+//!     zregex; see the tests in src/tests.zig. (10.47 also mishandled a
+//!     caseless class holding a wide non-ASCII range; 10.48, the reference
+//!     pinned in build.zig.zon, fixes that, and those are generated again.)
 //!   * A backreference to the group that encloses it is not generated.
 //!     PCRE2 is not self-consistent there — `1(\1*)` matches but
 //!     `1(2|\1*)` does not, though the only difference is which alternative

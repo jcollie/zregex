@@ -116,7 +116,7 @@ backslashes) — or a `\\\\` multiline line (the first two introduce the line).
 | Syntax | Matches | Example | As a Zig `"..."` literal |
 |---|---|---|---|
 | `a`, `é`, `😀` | that codepoint (patterns are UTF-8) | `héllo` matches `héllo` | `"héllo"` |
-| `\n` `\r` `\t` `\f` `\v` `\a` `\e` `\0` | newline, CR, tab, FF, VT, bell, ESC, NUL | `foo\tbar` | `"foo\\tbar"` |
+| `\n` `\r` `\t` `\f` `\a` `\e` `\0` | newline, CR, tab, FF, bell, ESC, NUL | `foo\tbar` | `"foo\\tbar"` |
 | `\xHH` | codepoint from two hex digits | `\x41` matches `A` | `"\\x41"` |
 | `\x{...}`, `\u{...}` | codepoint from hex, up to `10FFFF` | `\x{1F600}+` matches `😀😀` | `"\\x{1F600}+"` |
 | `\uHHHH` | codepoint from four hex digits | `\u0041` matches `A` | `"\\u0041"` |

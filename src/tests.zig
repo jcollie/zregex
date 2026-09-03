@@ -1315,6 +1315,39 @@ test "the backtracker's scratch is bounded like its time" {
     try std.testing.expect(m == null);
 }
 
+test "deep lookaround nesting is bounded, not a stack overflow" {
+    // Matching recurses on the native stack once per lookaround: the
+    // backtracker's lookaround handling calls back into `matchFrom`, and a
+    // lookaround body can hold another. Nesting is capped at compile time
+    // (the same `max_depth` that bounds the parser and the compiler's own
+    // recursion), so that recursion is bounded too -- this is the same crash
+    // class as the concat spine that once segfaulted, checked at the cap
+    // rather than left to luck. Two hundred deep compiles and matches; one
+    // past it is a clean error, never a crash.
+    inline for (.{ "(?=", "(?<=", "(?:" }) |open| {
+        const close = ")";
+        var at_cap: std.ArrayList(u8) = .empty;
+        defer at_cap.deinit(gpa);
+        for (0..200) |_| try at_cap.appendSlice(gpa, open);
+        try at_cap.append(gpa, 'a');
+        for (0..200) |_| try at_cap.appendSlice(gpa, close);
+        var re = try Regex.compile(gpa, at_cap.items);
+        defer re.deinit();
+        const m = try re.find(gpa, "aaaa");
+        if (m) |found| {
+            var mm = found;
+            mm.deinit(gpa);
+        }
+
+        var past: std.ArrayList(u8) = .empty;
+        defer past.deinit(gpa);
+        for (0..201) |_| try past.appendSlice(gpa, open);
+        try past.append(gpa, 'a');
+        for (0..201) |_| try past.appendSlice(gpa, close);
+        try std.testing.expectError(error.NestingTooDeep, Regex.compile(gpa, past.items));
+    }
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. All were checked against Python, which
     // agrees with zregex; the reference is pinned in build.zig.zon, and the

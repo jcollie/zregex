@@ -45,7 +45,8 @@ const Entry = struct {
     next: u32,
     /// Closure at the boundary before consuming contained Match.
     matched_here: bool,
-    /// No pre-seed thread survived the step: threads all died.
+    /// No thread survived the step — every thread died, this position's
+    /// freshly-seeded one included.
     stepped_empty: bool,
 };
 
@@ -118,7 +119,7 @@ pub const Machine = struct {
         /// Cache ceiling; reaching it makes the search give up and hand the
         /// subject to the Pike VM. Settable so that a test can pin it low
         /// enough to take that path on ordinary patterns, which at the
-        /// default of five hundred states almost nothing does.
+        /// default of 512 states almost nothing does.
         max_states: usize,
     ) std.mem.Allocator.Error!Machine {
         const n = prog.insts.len;
@@ -132,7 +133,7 @@ pub const Machine = struct {
         // literal copies arena_state, so it must already know these buffers.
         // Each cached state's key is up to four bytes per instruction, so a
         // program near the instruction ceiling would put the default cap of
-        // five hundred states at over a hundred megabytes of keys. Scale the
+        // 512 states at over a hundred megabytes of keys. Scale the
         // cap down so the key store stays within a few megabytes; giving up
         // earlier just hands the subject to the Pike VM sooner.
         const scaled_max = @min(max_states, @max(8, (4 << 20) / (4 * n + 1)));

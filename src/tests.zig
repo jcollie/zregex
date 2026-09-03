@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 
-//! Behavior tests exercising the full pipeline through both engines.
+//! Behavior tests exercising the full pipeline through all four engines.
 const std = @import("std");
 const zregex = @import("root.zig");
 const Regex = zregex.Regex;
@@ -918,8 +918,8 @@ test "a variable-length lookbehind takes the longest match" {
 test "iteration retries for a longer match where it found an empty one" {
     // After an empty match, the next thing to try is a longer match in the
     // same place -- not the next position. `.*?` reports empty at 0 and then
-    // all of `ab`; advancing straight away reported empty at 0, 1 and 2 and
-    // never the text between them. PCRE does this (it is the loop pcre2demo.c
+    // `a` and `b` in turn; advancing straight away reported empty at 0, 1 and 2
+    // and never the text between them. PCRE does this (it is the loop pcre2demo.c
     // documents) and so does Python; zregex was the odd one out, which only
     // showed once the oracle started comparing every match rather than the
     // leftmost one.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Jeffrey C. Ollie <jeff@ocjtech.us>
 // SPDX-License-Identifier: MIT
 
-//! Compiles the parser's AST into bytecode shared by both engines.
+//! Compiles the parser's AST into bytecode shared by all four engines.
 //!
 //! The compiler runs in two modes over identical code paths: a counting pass
 //! that only measures (`counting = true`), and an emitting pass that writes
@@ -35,12 +35,6 @@ pub const BackrefOp = struct {
     ci: bool,
 };
 
-/// Fused single-element repeat, emitted only into backtracker programs
-/// (`for_backtrack`). The repeated element is the NEXT instruction (a char,
-/// class, or any), keeping `Inst` small; execution continues at pc + 2. The
-/// interpreter consumes greedily in one tight loop and backtracking retries
-/// are a single range frame instead of one frame per iteration. The Pike VM
-/// and DFA never see this instruction.
 /// An iteration that consumed nothing ends the loop — it does not fail. The
 /// distinction is observable: `(a*)*` against "aa" must report the final
 /// empty iteration's capture, and `(a*?)*` must match empty rather than be
@@ -51,6 +45,12 @@ pub const ExitIfSame = struct {
     target: u32,
 };
 
+/// Fused single-element repeat, emitted only into backtracker programs
+/// (`for_backtrack`). The repeated element is the NEXT instruction (a char,
+/// class, or any), keeping `Inst` small; execution continues at pc + 2. The
+/// interpreter consumes greedily in one tight loop and backtracking retries
+/// are a single range frame instead of one frame per iteration. The Pike VM
+/// and DFA never see this instruction.
 pub const RepOp = struct {
     min: u32,
     /// `unbounded` (maxInt) means no upper bound.

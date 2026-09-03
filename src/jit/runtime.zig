@@ -232,8 +232,6 @@ pub const AsciiSet = struct {
     len: usize,
 };
 
-/// Identical classes appear once per emit site (a repeat emits its child
-/// several times); one table each is enough.
 /// The ASCII acceptance set of a repeat's child, as ranges, when it is
 /// narrow enough to drive the vector scanner. Null when the instruction
 /// can match a non-ASCII codepoint (the scanner would have to stop and

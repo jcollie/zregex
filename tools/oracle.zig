@@ -10,9 +10,13 @@
 //! generated patterns through PCRE2 and compares.
 //!
 //! Needs PCRE2 to link, so it is a separate tool rather than part of
-//! `zig build test`:
+//! `zig build test`; it builds PCRE2 from source itself, so nothing need be
+//! installed:
 //!
-//!     zig build oracle -Dpcre2-include=<dir> -Dpcre2-lib=<dir> -- [cases] [seed]
+//!     zig build oracle -- [cases] [seed]
+//!
+//! To link a different PCRE2 build instead, override with
+//! `-Dpcre2-include=<dir> -Dpcre2-lib=<dir>`.
 //!
 //! Comparisons are deliberately narrowed to where both engines claim the same
 //! semantics:
@@ -872,8 +876,8 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
 /// nudged, two branches spliced from different files. Those neighborhoods
 /// are where an off-by-one in the parser or compiler lives, and neither
 /// source visits them. This mode does: it loads every corpus pattern, applies
-/// a few seeded mutations, and holds the result to PCRE2 the same three ways
-/// as the sweep -- leftmost match, every match, and from an offset.
+/// a few seeded mutations, and holds the result to PCRE2 the same two ways the
+/// corpus run does -- leftmost match and every match.
 ///
 ///     zig build oracle ... -- --corpus-mutate <pcre2>/testdata [cases] [seed]
 fn runCorpusMutate(

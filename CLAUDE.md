@@ -31,8 +31,9 @@ shell provides `zig_0_16`, `qemu` (for the aarch64 tests), `reuse`, and
   `-- N seed` (generated sweep), `--corpus <pcre2-src>/testdata` (PCRE2's own
   test patterns), `--corpus-mutate <dir> N seed` (seeded edits of those),
   `--case '<pat>' '<hay>' [ims]` and `--engines '<pat>' '<hay>'` (single-case
-  reducers for shrinking). Each compares three ways: leftmost match, every
-  match, and searches from an offset.
+  reducers for shrinking). The generated sweep compares three ways: leftmost
+  match, every match, and searches from an offset; the corpus and
+  corpus-mutate modes compare the first two.
 - `zig build bench-run -- --builtin` — benchmark against an in-memory corpus.
   `./bench/run.sh` runs the full comparative suite (PCRE2, Python, Perl, POSIX).
 - `zig fmt --check build.zig src bench tools` and `reuse lint` — CI gates.

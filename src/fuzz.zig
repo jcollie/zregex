@@ -85,7 +85,7 @@ const configs = [_]Config{
     .{
         // The lazy DFA gives up when its state cache fills and hands the
         // subject to the Pike VM, which must reach the same answer. At the
-        // real ceiling of five hundred states almost no pattern gets there,
+        // real ceiling of 512 states almost no pattern gets there,
         // so this pins it low enough that most of them do.
         .name = "dfa-tiny-cache",
         .handles_backtrack_only = false,

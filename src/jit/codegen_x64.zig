@@ -124,8 +124,9 @@ const Blob = struct {
     len: u8,
 };
 
-/// Widest run scanner: two SSE registers hold each range's bounds, leaving
-/// four for the data, the accumulator, and two temporaries.
+/// Deduplicates emitted bit-table blobs by content, so a class whose table
+/// was already emitted reuses that label instead of emitting it again (see
+/// `emitBlob`).
 const BitsCache = struct {
     bytes: [32]u8,
     len: u8,
@@ -166,7 +167,8 @@ pub const Gen = struct {
         return l;
     }
 
-    /// Consume a run of accepted ASCII bytes sixteen at a time.
+    /// Consume a run of accepted ASCII bytes sixteen at a time (thirty-two
+    /// under AVX2).
     ///
     /// For each range the vector `(lo > v) | (v > hi)` marks the bytes
     /// outside it; ANDing those across ranges marks bytes outside the whole
@@ -174,7 +176,7 @@ pub const Gen = struct {
     /// so any byte >= 0x80 reads as negative, falls outside every ASCII
     /// range, and correctly stops the scan — the scalar loop that follows
     /// then handles it. Exact for ASCII-only children, so the scalar loop
-    /// only ever finishes the sub-16-byte tail.
+    /// only ever finishes the sub-block tail.
     fn emitSimdRun(self: *Gen, set: AsciiSet) Error!void {
         // AVX2 doubles the block and, being three-operand, drops the register
         // copies the SSE2 form needs before each compare.
@@ -731,9 +733,6 @@ pub const Gen = struct {
     }
 };
 
-/// A literal the continuation of a greedy repeat must match next, letting
-/// retries jump between its occurrences (the JIT's form of the interpreter's
-/// required-literal scanning).
 /// The widest run scanner this program will emit, in ranges: that decides how
 /// many vector registers the code touches, and so how many Windows expects it
 /// to hand back unchanged.

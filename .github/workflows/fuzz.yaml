@@ -50,23 +50,48 @@ jobs:
         with:
           version: 0.16.0
 
-      # A quarter of a million cross-engine cases, plus a deeper
-      # allocation-failure pass than any push pays for.
+      # A quarter of a million cases as five fresh processes rather than one
+      # long one. The first run's macOS job was killed by the operating
+      # system at eighty-six minutes -- memory, on a seven-gigabyte runner,
+      # somewhere the leak-checking allocator cannot see: the same workload
+      # holds flat at seven megabytes of resident memory on Linux. Until the
+      # Darwin side is understood, fresh processes bound whatever
+      # accumulates, `/usr/bin/time -l` records each chunk's peak footprint
+      # in the log so the next run carries data instead of another silent
+      # kill, and the chunks walk five seeds a week instead of one.
       - name: Fuzz the engines against each other
-        run: >
-          zig build test
-          -Dfuzz-cases=250000
-          -Dfuzz-alloc-cases=2000
-          -Dfuzz-seed=${{ github.run_number }}
+        shell: bash
+        run: |
+          for i in 0 1 2 3 4; do
+            seed=$(( ${{ github.run_number }} * 5 + i ))
+            echo "== chunk $i, seed $seed"
+            if [ "$RUNNER_OS" = macOS ]; then
+              /usr/bin/time -l zig build test -Dfuzz-cases=50000 -Dfuzz-alloc-cases=400 -Dfuzz-seed="$seed"
+            else
+              zig build test -Dfuzz-cases=50000 -Dfuzz-alloc-cases=400 -Dfuzz-seed="$seed"
+            fi
+          done
 
-      - name: Install PCRE2
+      # Built from the release tarball, not taken from apt: the oracle's
+      # comparisons are written against PCRE2 10.47 and steer around that
+      # version's known quirks, and POSIX class semantics genuinely changed
+      # between the 10.42 Ubuntu ships and 10.47 -- the first run of this
+      # workflow reported a dozen "disagreements" that were the reference
+      # disagreeing with itself across versions.
+      - name: Build PCRE2 10.47
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpcre2-dev
+        run: |
+          curl -fsSLO https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.bz2
+          tar xf pcre2-10.47.tar.bz2
+          cd pcre2-10.47
+          ./configure --prefix="$GITHUB_WORKSPACE/pcre2-prefix" --disable-shared --quiet
+          make -j"$(nproc)" --quiet
+          make install --quiet
 
       - name: Fuzz against PCRE2
         if: runner.os == 'Linux'
         run: >
           zig build oracle
-          -Dpcre2-include=/usr/include
-          -Dpcre2-lib=/usr/lib/x86_64-linux-gnu
+          -Dpcre2-include=pcre2-prefix/include
+          -Dpcre2-lib=pcre2-prefix/lib
           -- 150000 ${{ github.run_number }}

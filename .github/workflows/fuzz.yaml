@@ -50,25 +50,29 @@ jobs:
         with:
           version: 0.16.0
 
-      # A quarter of a million cases as five fresh processes rather than one
-      # long one. The first run's macOS job was killed by the operating
-      # system at eighty-six minutes -- memory, on a seven-gigabyte runner,
-      # somewhere the leak-checking allocator cannot see: the same workload
-      # holds flat at seven megabytes of resident memory on Linux. Until the
-      # Darwin side is understood, fresh processes bound whatever
-      # accumulates, `/usr/bin/time -l` records each chunk's peak footprint
-      # in the log so the next run carries data instead of another silent
-      # kill, and the chunks walk five seeds a week instead of one.
+      # The engines fuzzed against each other, as several fresh processes.
+      # The fuzzer compiles a new Regex per case -- a quarter of a million
+      # JIT mappings over a run -- and on macOS the resident-set cost of a
+      # released MAP_JIT region is not reclaimed promptly, so RSS climbs even
+      # as the actual footprint stays flat: run 2 measured a peak footprint
+      # of twenty megabytes while RSS reached four gigabytes in one
+      # fifty-thousand-case process. It is a fuzzer artifact, not a library
+      # leak -- every mapping is unmapped, a real program compiles a pattern
+      # once, and Linux (which reclaims) holds flat at seven megabytes -- but
+      # a seven-gigabyte runner still kills on RSS. Fresh processes reset it,
+      # and twenty-five thousand cases each keep the peak near two gigabytes;
+      # `/usr/bin/time -l` on macOS keeps the footprint in the log. Eight
+      # chunks walk eight seeds a week.
       - name: Fuzz the engines against each other
         shell: bash
         run: |
-          for i in 0 1 2 3 4; do
-            seed=$(( ${{ github.run_number }} * 5 + i ))
+          for i in 0 1 2 3 4 5 6 7; do
+            seed=$(( ${{ github.run_number }} * 8 + i ))
             echo "== chunk $i, seed $seed"
             if [ "$RUNNER_OS" = macOS ]; then
-              /usr/bin/time -l zig build test -Dfuzz-cases=50000 -Dfuzz-alloc-cases=400 -Dfuzz-seed="$seed"
+              /usr/bin/time -l zig build test -Dfuzz-cases=25000 -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
             else
-              zig build test -Dfuzz-cases=50000 -Dfuzz-alloc-cases=400 -Dfuzz-seed="$seed"
+              zig build test -Dfuzz-cases=25000 -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
             fi
           done
 

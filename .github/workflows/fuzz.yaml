@@ -31,7 +31,7 @@ jobs:
   fuzz:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -63,16 +63,28 @@ jobs:
       # and twenty-five thousand cases each keep the peak near two gigabytes;
       # `/usr/bin/time -l` on macOS keeps the footprint in the log. Eight
       # chunks walk eight seeds a week.
+      # Case counts differ by platform. Linux fuzzes deep and cheap -- the
+      # allocator reclaims, resident memory stays flat at a few megabytes, so
+      # two hundred thousand cases run fast. macOS does not reclaim released
+      # MAP_JIT regions, so a JIT-heavy run climbs to some three gigabytes of
+      # resident memory and slows under the pressure; run 4's eight
+      # twenty-five-thousand chunks did not finish inside two hours. Its
+      # contribution is not volume but the aarch64 JIT on real hardware --
+      # real MAP_JIT, cache coherency, NEON -- which a much smaller count
+      # exercises, and the per-push qemu job already fuzzes aarch64 in bulk.
+      # So macOS runs four eight-thousand-case chunks; `/usr/bin/time -l`
+      # keeps its footprint in the log.
       - name: Fuzz the engines against each other
         shell: bash
         run: |
-          for i in 0 1 2 3 4 5 6 7; do
+          if [ "$RUNNER_OS" = macOS ]; then chunks=4; cases=8000; else chunks=8; cases=25000; fi
+          for (( i=0; i<chunks; i++ )); do
             seed=$(( ${{ github.run_number }} * 8 + i ))
-            echo "== chunk $i, seed $seed"
+            echo "== chunk $i, seed $seed ($cases cases)"
             if [ "$RUNNER_OS" = macOS ]; then
-              /usr/bin/time -l zig build test -Dfuzz-cases=25000 -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
+              /usr/bin/time -l zig build test -Dfuzz-cases="$cases" -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
             else
-              zig build test -Dfuzz-cases=25000 -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
+              zig build test -Dfuzz-cases="$cases" -Dfuzz-alloc-cases=250 -Dfuzz-seed="$seed"
             fi
           done
 

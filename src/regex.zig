@@ -571,7 +571,12 @@ pub const Regex = struct {
     /// codepoint, so `.*?` over "ab" yields five matches -- empty, `a`,
     /// empty, `b`, empty -- not just the three empty ones.
     pub fn iterator(self: *const Regex, gpa: std.mem.Allocator, haystack: []const u8) Iterator {
-        return .{ .re = self, .gpa = gpa, .haystack = haystack };
+        return .{
+            .re = self,
+            .gpa = gpa,
+            .haystack = haystack,
+            .budget = self.stepBudget(haystack.len),
+        };
     }
 
     pub const Iterator = struct {
@@ -583,12 +588,11 @@ pub const Regex = struct {
         /// Set when the last match was empty: the next search must look for a
         /// longer match beginning right there before moving on.
         retry_nonempty_at: ?usize = null,
-        /// Backtracker steps left for the whole iteration, initialized on the
-        /// first `next`. One pool, not one per match found: the calls scan
-        /// disjoint regions, so the per-byte allowance is spent once, and a
-        /// haystack full of cheap matches cannot claim a fresh `max_steps`
-        /// headroom for each of them.
-        budget: ?usize = null,
+        /// Backtracker steps left for the whole iteration. One pool, not one
+        /// per match found: the calls scan disjoint regions, so the per-byte
+        /// allowance is spent once, and a haystack full of cheap matches
+        /// cannot claim a fresh `max_steps` headroom for each of them.
+        budget: usize,
         /// Warm DFA cache shared across `next()` calls; created lazily.
         machine: ?dfa.Machine = null,
 
@@ -611,14 +615,13 @@ pub const Regex = struct {
             // at 0 and then all of `ab`, where advancing straight away would
             // report empty at 0, 1 and 2 and never the text between them.
             // PCRE and Python both do it this way.
-            if (self.budget == null) self.budget = self.re.stepBudget(self.haystack.len);
             const m = (try self.re.findAtInner(
                 self.gpa,
                 self.haystack,
                 self.pos,
                 if (self.retry_nonempty_at == null) mach else null,
                 self.retry_nonempty_at,
-                &self.budget.?,
+                &self.budget,
             )) orelse {
                 // No longer match here after all, so carry on from the next
                 // codepoint, which is where the empty one left off.

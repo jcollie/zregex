@@ -151,6 +151,31 @@ const Gen = struct {
                 return;
             },
             .class => |cl| {
+                const ranges = self.prog.ranges[cl.start..][0..cl.len];
+                if (compiler.asciiPairOf(ranges, cl.negated, cl.ci)) |pair| {
+                    // See `compiler.AsciiPair`: compares beat the bit table
+                    // for the classes caseless letters compile to.
+                    const l_ok = try a.label();
+                    a.ldrbReg(.x9, r_input, r_pos);
+                    a.cmpImm(.x9, pair.cps[0]);
+                    a.bcond(.eq, l_ok);
+                    if (pair.n == 2) {
+                        a.cmpImm(.x9, pair.cps[1]);
+                        a.bcond(.eq, l_ok);
+                    }
+                    if (pair.has_high) {
+                        a.cmpImm(.x9, 0x80);
+                        a.bcond(.lo, on_fail);
+                        try self.emitHelperTest(pc, on_fail, advance);
+                        a.b(l_done);
+                    } else {
+                        a.b(on_fail);
+                    }
+                    a.place(l_ok);
+                    if (advance) a.addImm(r_pos, r_pos, 1);
+                    a.place(l_done);
+                    return;
+                }
                 const l_high = try a.label();
                 a.ldrbReg(.x9, r_input, r_pos);
                 a.cmpImm(.x9, 0x80);

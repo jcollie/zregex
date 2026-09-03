@@ -109,6 +109,37 @@ pub const Program = struct {
 
 pub const CompileError = error{ProgramTooLarge};
 
+/// A class of at most two single ASCII codepoints, plus possibly members at
+/// or above 0x80: the shape every caseless letter's case-equivalence class
+/// takes once the parser rewrites it -- `(?i)s` is `{S, s, ſ}`. The JIT
+/// backends test it as two register compares with the high members behind
+/// the existing helper path, instead of the general 128-bit table, which is
+/// what keeps a caseless ASCII scan near its pre-Unicode speed.
+pub const AsciiPair = struct {
+    cps: [2]u8,
+    n: u8,
+    has_high: bool,
+};
+
+/// See `AsciiPair`; null when the class is not that shape.
+pub fn asciiPairOf(ranges: []const common.ClassRange, negated: bool, ci: bool) ?AsciiPair {
+    if (negated or ci) return null;
+    var out: AsciiPair = .{ .cps = undefined, .n = 0, .has_high = false };
+    for (ranges) |r| {
+        if (r.hi < 0x80) {
+            // A real ASCII range is what the bit table is for.
+            if (r.lo != r.hi or out.n == 2) return null;
+            out.cps[out.n] = @intCast(r.lo);
+            out.n += 1;
+        } else if (r.lo >= 0x80) {
+            out.has_high = true;
+        } else {
+            return null; // straddles the boundary
+        }
+    }
+    return if (out.n == 0) null else out;
+}
+
 pub const Counts = struct {
     insts: u32,
     slots: u16,

@@ -1239,6 +1239,82 @@ test "findAt past the end of the haystack finds nothing" {
     try std.testing.expectEqual(@as(usize, 2), mm.span().start);
 }
 
+test "pike capture chains are compacted, and compaction changes nothing" {
+    // A run of `(a?)` groups against a long haystack once grew five
+    // kilobytes of dead capture chain per input byte -- three hundred
+    // megabytes for sixty kilobytes of `a` -- because chain nodes lived in
+    // one arena for the whole scan and nearly all of them belonged to
+    // threads that died a step later. The Pike VM now compacts: chains still
+    // reachable from live threads are copied to a fresh arena and the rest
+    // freed. This input is long enough to force the compactor to run about
+    // a hundred and fifty times; the captures must come out exactly as the
+    // backtracker computes them without any of that machinery.
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(gpa);
+    for (0..90) |_| try pat.appendSlice(gpa, "(a?)");
+    try pat.appendSlice(gpa, "b");
+    var hay: std.ArrayList(u8) = .empty;
+    defer hay.deinit(gpa);
+    for (0..60_000) |_| try hay.append(gpa, 'a');
+    try hay.append(gpa, 'b');
+
+    var re = try Regex.compile(gpa, pat.items);
+    defer re.deinit();
+    re.jit_mode = .off;
+    re.dfa_mode = .off;
+
+    // The equality check runs at a size the backtracker can afford; five
+    // hundred positions of ninety optional groups still put ~90,000 nodes
+    // through the arena, past the compaction threshold.
+    var probe_bt = re;
+    probe_bt.fallback_engine = .backtrack;
+    var short_hay: std.ArrayList(u8) = .empty;
+    defer short_hay.deinit(gpa);
+    for (0..500) |_| try short_hay.append(gpa, 'a');
+    try short_hay.append(gpa, 'b');
+    const short = short_hay.items;
+    const mp = (try re.find(gpa, short)) orelse return error.TestUnexpectedResult;
+    var pike_m = mp;
+    defer pike_m.deinit(gpa);
+    const mb = (try probe_bt.find(gpa, short)) orelse return error.TestUnexpectedResult;
+    var bt_m = mb;
+    defer bt_m.deinit(gpa);
+    try std.testing.expectEqualSlices(?zregex.Span, bt_m.groups, pike_m.groups);
+
+    // The full sixty kilobytes -- some hundred and fifty compactions -- on
+    // the Pike VM alone: must complete, must find the match at the end.
+    const ml = (try re.find(gpa, hay.items)) orelse return error.TestUnexpectedResult;
+    var long_m = ml;
+    defer long_m.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 60_001), long_m.span().end);
+}
+
+test "the backtracker's scratch is bounded like its time" {
+    // Slot writes nearly every step of a long budget-legal scan once built
+    // fifty megabytes of undo log; the frame stack and undo log are now held
+    // to a cap in PCRE2-heap-limit territory, and exceeding it is the same
+    // error as exceeding the step budget -- it is the same thing, a bound on
+    // what one search may spend. Memoization has carried its own entry cap
+    // all along, so it is turned off here to expose the logs themselves.
+    var hay: std.ArrayList(u8) = .empty;
+    defer hay.deinit(gpa);
+    for (0..400_000) |_| try hay.append(gpa, 'a');
+    var re = try Regex.compile(gpa, "(?:(a)(a)(a)(a))+\\1z");
+    defer re.deinit();
+    re.jit_mode = .off;
+    re.memo = false;
+    try std.testing.expectError(error.StepLimitExceeded, re.find(gpa, hay.items));
+
+    // With memoization on -- the default -- the same scan completes: the
+    // memo prunes the re-visits, its table has carried its own entry cap all
+    // along, and the logs stay far under the new one.
+    var re2 = try Regex.compile(gpa, "(?:(a)(a)(a)(a))+\\1z");
+    defer re2.deinit();
+    re2.jit_mode = .off;
+    const m = try re2.find(gpa, hay.items);
+    try std.testing.expect(m == null);
+}
+
 test "cases where PCRE2 is the one that is wrong" {
     // Found by tools/oracle.zig. All were checked against Python, which
     // agrees with zregex; the reference is pinned in build.zig.zon, and the

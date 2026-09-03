@@ -61,7 +61,11 @@ const ThreadList = struct {
 const Ctx = struct {
     prog: compiler.Program,
     input: []const u8,
+    /// Where `prepend` allocates: the chain arena, swapped out whole by the
+    /// compaction in `run` -- never the arena the structural buffers live in.
     arena: std.mem.Allocator,
+    /// Chain nodes created since the arena was last compacted; the trigger.
+    nodes_allocated: usize = 0,
     /// Generation marks per visited key; a key is in a list iff its mark
     /// equals that list's gen. Indexed by `(pc << key_shift) | mask`.
     seen: []u32,
@@ -99,6 +103,7 @@ const Ctx = struct {
     fn prepend(self: *Ctx, chain: ?*const SlotNode, slot: u16, pos: usize) !*const SlotNode {
         const node = try self.arena.create(SlotNode);
         node.* = .{ .slot = slot, .pos = pos, .prev = chain };
+        self.nodes_allocated += 1;
         return node;
     }
 
@@ -247,6 +252,43 @@ fn assignGuardBits(
     return levels;
 }
 
+/// Copy one chain into `dst`, sharing what was already copied: `map` carries
+/// old node -> new node, so common suffixes stay common and the copy is no
+/// larger than what is live. Iterative, because a chain can be as long as
+/// every save the scan has executed on one path.
+fn copyChain(
+    gpa: std.mem.Allocator,
+    map: *std.AutoHashMapUnmanaged(*const SlotNode, *const SlotNode),
+    scratch: *std.ArrayList(*const SlotNode),
+    dst: std.mem.Allocator,
+    head: ?*const SlotNode,
+) !?*const SlotNode {
+    scratch.clearRetainingCapacity();
+    // Walk down to the first node already copied (or the end), remembering
+    // the stretch that still needs copying.
+    var node = head;
+    var tail: ?*const SlotNode = null;
+    while (node) |n| {
+        if (map.get(n)) |copied| {
+            tail = copied;
+            break;
+        }
+        try scratch.append(gpa, n);
+        node = n.prev;
+    }
+    // Rebuild that stretch back-to-front on top of the shared tail.
+    var i = scratch.items.len;
+    while (i > 0) {
+        i -= 1;
+        const old_node = scratch.items[i];
+        const copy = try dst.create(SlotNode);
+        copy.* = .{ .slot = old_node.slot, .pos = old_node.pos, .prev = tail };
+        try map.put(gpa, old_node, copy);
+        tail = copy;
+    }
+    return tail;
+}
+
 /// Unanchored search from byte offset `start`. On success fills `slots_out`
 /// (length `prog.slot_count`) and returns true. Leftmost-greedy semantics.
 pub fn run(
@@ -261,6 +303,18 @@ pub fn run(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    // Capture chains get an arena of their own, because it gets thrown away:
+    // most nodes belong to threads that die within a step or two, an arena
+    // frees nothing until it is destroyed, and one scan writes chains at
+    // every position -- a run of `(a?)` groups against sixty kilobytes of
+    // `a` grew three hundred megabytes of dead chain before this existed.
+    // When enough nodes have been created, the chains still reachable from
+    // the live threads are copied into a fresh arena -- sharing preserved,
+    // so the copy is no bigger than what is genuinely alive -- and the old
+    // arena, garbage and all, is freed. The structural buffers above stay in
+    // `arena_state`, which is why the two must not be one.
+    var chains_state = std.heap.ArenaAllocator.init(gpa);
+    defer chains_state.deinit();
 
     // One mask bit per empty-loop guard, so that threads which disagree
     // about whether the current iteration started here stay distinct; see
@@ -285,7 +339,7 @@ pub fn run(
     var ctx = Ctx{
         .prog = prog,
         .input = input,
-        .arena = arena,
+        .arena = chains_state.allocator(),
         .seen = try arena.alloc(u32, keys),
         // One stack entry per split actually processed, plus the seed. A
         // split can be processed once per guard mask, not just once per
@@ -305,6 +359,14 @@ pub fn run(
     var pos = start;
     var matched = false;
 
+    // Compaction bookkeeping; see the note in the loop.
+    const min_compact: usize = 1 << 16;
+    var next_compact: usize = min_compact;
+    var copy_map: std.AutoHashMapUnmanaged(*const SlotNode, *const SlotNode) = .empty;
+    defer copy_map.deinit(gpa);
+    var copy_scratch: std.ArrayList(*const SlotNode) = .empty;
+    defer copy_scratch.deinit(gpa);
+
     while (true) {
         // With no live threads and no match yet, only candidate first bytes
         // matter: skip straight to the next one.
@@ -321,6 +383,30 @@ pub fn run(
                 gen += 1;
             }
         }
+        // Compact the chain arena once enough nodes have piled up: copy what
+        // the live threads still reach into a fresh arena and free the rest.
+        // This is the one point in the loop where `clist` holds every live
+        // reference -- `nlist` is empty, and a match's slots were copied out
+        // the moment it was seen. The threshold doubles with the surviving
+        // set, so the work is amortized against the allocation that forced
+        // it, and a scan whose chains are all live compacts ever more rarely
+        // rather than thrashing.
+        if (ctx.nodes_allocated >= next_compact) {
+            var fresh = std.heap.ArenaAllocator.init(gpa);
+            errdefer fresh.deinit();
+            copy_map.clearRetainingCapacity();
+            var live: usize = 0;
+            for (clist.items[0..clist.len]) |*th| {
+                th.slots = try copyChain(gpa, &copy_map, &copy_scratch, fresh.allocator(), th.slots);
+            }
+            live = copy_map.count();
+            chains_state.deinit();
+            chains_state = fresh;
+            ctx.arena = chains_state.allocator();
+            ctx.nodes_allocated = live;
+            next_compact = @max(min_compact, live * 2);
+        }
+
         const d: ?common.DecodeResult = if (pos < input.len) common.decode(input, pos) else null;
 
         // Seed a new lowest-priority thread at this position until we have a

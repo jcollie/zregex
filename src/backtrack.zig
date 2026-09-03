@@ -87,6 +87,9 @@ const Bt = struct {
     steps: usize = 0,
     max_steps: usize,
     memo: std.AutoHashMapUnmanaged(MemoKey, void) = .empty,
+    /// Combined ceiling on frame-stack plus undo-log entries; see the check
+    /// in `matchFrom`.
+    scratch_cap: usize = std.math.maxInt(usize),
     /// Position at which a zero-length match must be refused, if any; see
     /// `Regex.Iterator`, which uses it to look for the longer match PCRE
     /// tries for after reporting an empty one.
@@ -351,6 +354,15 @@ const Bt = struct {
         step: while (true) {
             self.steps += 1;
             if (self.steps > self.max_steps) return error.StepLimitExceeded;
+            // The frame stack and undo log both grow with the work done, up
+            // to an entry per step -- which, against the whole budget, is a
+            // kilobyte of scratch per input byte. `(?:(a)(a)(a)(a))+` over
+            // four hundred kilobytes of `a` built fifty megabytes of undo
+            // log inside a budget-legal scan. The cap scales like the budget
+            // does and comes back as the same error, because it is the same
+            // thing: a bound on what one search may spend.
+            if (self.stack.items.len + self.undo.items.len > self.scratch_cap)
+                return error.StepLimitExceeded;
 
             // Arms that succeed `continue :step`; falling out of the switch
             // means this path failed and we backtrack.
@@ -573,6 +585,11 @@ pub fn run(
         .slots = slots_out,
         .max_steps = budget.*,
         .reject_empty_at = reject_empty_at,
+        // A million entries of headroom plus a sliver per input byte --
+        // roughly the thirty-megabyte territory of PCRE2's own default heap
+        // limit, which is the precedent for bounding a backtracker's scratch
+        // separately from its time.
+        .scratch_cap = (1 << 20) +| @as(usize, input.len) / 8,
     };
     defer budget.* -|= bt.steps;
     defer bt.stack.deinit(gpa);

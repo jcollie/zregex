@@ -130,6 +130,12 @@ pub const Machine = struct {
         const arena = arena_state.allocator();
         // Allocate all scratch before building the struct literal: the
         // literal copies arena_state, so it must already know these buffers.
+        // Each cached state's key is up to four bytes per instruction, so a
+        // program near the instruction ceiling would put the default cap of
+        // five hundred states at over a hundred megabytes of keys. Scale the
+        // cap down so the key store stays within a few megabytes; giving up
+        // earlier just hands the subject to the Pike VM sooner.
+        const scaled_max = @min(max_states, @max(8, (4 << 20) / (4 * n + 1)));
         const seen = try arena.alloc(u32, n);
         // One stack entry per split actually processed, plus the seed.
         const stack = try arena.alloc(u32, n + 1);
@@ -142,7 +148,7 @@ pub const Machine = struct {
             .prog = prog,
             .alphabet = alphabet,
             .n_classes = alphabet.numClasses(),
-            .max_states = max_states,
+            .max_states = scaled_max,
             .seen = seen,
             .stack = stack,
             .list_buf = list_buf,

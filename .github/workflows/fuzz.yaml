@@ -83,5 +83,12 @@ jobs:
       # POSIX class behavior differs.) That also makes it portable enough to
       # run on the macOS leg, where the aarch64 JIT faces the reference on
       # real hardware.
+      # Linux only. The oracle compares against PCRE2 on semantics, which do
+      # not depend on the architecture, so the aarch64 run adds no coverage
+      # the x86_64 one lacks -- and on the macOS runner, building PCRE2 from
+      # source plus the sweep pushed the job past its timeout after the
+      # cross-engine step (that leg's real contribution: the aarch64 JIT on
+      # real MAP_JIT hardware) had already passed.
       - name: Fuzz against PCRE2
+        if: runner.os == 'Linux'
         run: zig build oracle -- 150000 ${{ github.run_number }}

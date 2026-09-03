@@ -15,6 +15,9 @@ def main(results, corpus):
     preferred = ["zregex/pike", "zregex/backtrack", "pcre2", "pcre2-jit",
                  "python", "perl", "posix"]
     for line in open(results):
+        # The Zig harness leads with a `# target=...` line for the CI tables.
+        if line.startswith("#") or not line.strip():
+            continue
         impl, name, ms, count = line.rstrip("\n").split("\t")
         if impl not in impls:
             impls.append(impl)

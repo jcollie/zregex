@@ -12,23 +12,34 @@ prints a merged table. Each harness emits `impl \t bench \t best_ms \t count`;
 match counts are cross-checked in the "matches" column (a single value means
 all implementations agree).
 
-Snapshot (2026-08-31, Linux, corpus 4.2 MB, times in ms, best of 5, with the
+Snapshot (2026-09-02, Linux, corpus 4.2 MB, times in ms, best of 5, with the
 first-byte prefilter, lazy capture handling, the lazy DFA, the fused
 backtracker, and the x86-64 JIT with SSE2/AVX2 run scanning):
 
 | benchmark    | zregex          | pcre2   | pcre2-jit | python | perl   | posix   |
 |--------------|----------------:|--------:|----------:|-------:|-------:|--------:|
-| literal      | 1.8 (jit)       | 4.5     | 0.17      | 1.9    | 1.7    | 6.4     |
-| ci_literal   | 2.9 (jit)       | 1940.6  | 0.19      | 16.5   | 2.6    | 8.3     |
-| date         | 2.2 (jit)       | 2.7     | 0.63      | 40.7   | 4.9    | 251.1   |
-| email        | **5.2** (jit)   | 82.2    | 6.11      | 128.6  | 39.2   | 240.3   |
-| alt          | 12.4 (jit)      | 29.3    | 4.77      | 24.0   | 17.2   | 283.2   |
-| ing_suffix   | 11.0 (jit)      | 201.6   | 6.92      | 65.2   | 54.2   | 1013.2  |
-| spanning     | **0.08** (jit)  | 0.12    | 0.14      | 1.0    | 1.4    | 10.2    |
-| groups       | 6.3 (jit)       | 127.8   | 5.67      | 157.7  | 41.5   | 288.4   |
-| lookahead    | **5.1** (jit)   | 294.7   | 8.66      | 175.0  | 40.5   | —       |
-| backref      | **7.4** (jit)   | 130.9   | 16.98     | 118.7  | 177.5  | —       |
-| pathological | **0.00** (pike) | ERROR   | 26.47     | 281.7  | 0.01   | 0.01    |
+| literal      | 1.8 (jit)       | 4.6     | 0.19      | 1.8    | 1.7    | 6.5     |
+| ci_literal   | 3.0 (jit)       | 1986.4  | 0.19      | 16.5   | 2.7    | 8.4     |
+| date         | 2.3 (jit)       | 2.8     | 0.61      | 41.8   | 5.2    | 248.4   |
+| email        | **5.2** (jit)   | 86.2    | 6.38      | 88.9   | 40.0   | 245.4   |
+| alt          | 12.5 (jit)      | 30.1    | 4.92      | 24.4   | 17.5   | 289.1   |
+| ing_suffix   | 11.4 (jit)      | 207.6   | 6.96      | 66.2   | 56.4   | 1017.9  |
+| spanning     | **0.08** (jit)  | 0.12    | 0.14      | 1.1    | 1.4    | 10.4    |
+| groups       | 6.5 (jit)       | 131.1   | 5.72      | 152.9  | 42.7   | 297.2   |
+| lookahead    | **5.2** (jit)   | 302.6   | 8.98      | 176.6  | 41.9   | —       |
+| backref      | **7.4** (jit)   | 134.2   | 17.95     | 127.0  | 182.3  | —       |
+| pathological | **0.01** (pike) | ERROR   | 26.18     | 299.2  | 0.01   | 0.01    |
+
+Between this snapshot and the previous one (2026-08-31), caseless matching
+became Unicode rather than ASCII — `(?i)s` now also matches the long s, as
+PCRE does — which briefly cost `ci_literal` about six percent until the JIT
+learned to compile the two-compares-plus-rare-helper shape such classes
+take; the row now sits within noise of the old ASCII fold, at full Unicode
+semantics. Match iteration also gained PCRE's empty-match retry and a step
+budget covering the whole iteration, whose bookkeeping is the small movement
+on `ing_suffix`, the row with fifty thousand matches. Everything else is
+unchanged within run-to-run noise; an interleaved A/B against the previous
+snapshot's commit put the total across all rows at under one percent.
 
 The parenthesised engine is the one `Regex.engine` selected. zregex is
 fastest of the interpreted engines on nine of eleven rows (Perl edges it out

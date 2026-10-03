@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 .{
     .name = .zregex,
-    .version = "0.1.0",
+    .version = "0.2.0-dev",
     // Globally unique package identifier together with `name`; never changes.
     .fingerprint = 0x9f5d80d30fd26c90, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",

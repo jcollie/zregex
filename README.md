@@ -457,3 +457,24 @@ case: `--case '<pattern>' '<haystack>'` shows every engine beside PCRE2, and
 involved — which is the only way to judge a haystack holding invalid UTF-8,
 since PCRE2 runs in UTF mode and rejects one outright. Both exit non-zero on a
 disagreement, so a shrinker can drive them.
+
+## Where this lives
+
+The canonical repository is on Forgejo:
+
+```console
+$ git clone https://git.jcollie.dev/jeff/zregex.git
+```
+
+It is also on the Radicle network, where the repository's identifier is
+
+```
+rad:zrJSKT7jYVm7YHSkm3an1RRKUMWo
+```
+
+and `rad clone rad:zrJSKT7jYVm7YHSkm3an1RRKUMWo` fetches it from any node that
+seeds it, needing no account and no forge. Further copies are mirrored to
+<https://github.com/jcollie/zregex> and <https://tangled.org/jcollie.dev/zregex>.
+All four carry the same history on `main`; the Forgejo one is where the tests
+and the documentation build run, and GitHub is where the cross-platform CI and
+the weekly fuzz run.

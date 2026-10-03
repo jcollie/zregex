@@ -106,7 +106,10 @@ disagreements there are expected, anywhere else is a bug.
 
 ## Git
 
-Push only to `origin` (git.jcollie.dev), which mirrors to GitHub
+Push to `origin` (git.jcollie.dev), which mirrors to GitHub
 (github.com/jcollie/zregex) on its own — never push to GitHub separately.
+The `tangled` (tangled.org/jcollie.dev/zregex) and `rad`
+(rad:zrJSKT7jYVm7YHSkm3an1RRKUMWo) remotes are not mirrored by the forge, so
+push the same branches and tags to them as well.
 Commit messages here are prose explaining why a change was made and how it was
 verified, not bullet lists.

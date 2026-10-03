@@ -106,7 +106,7 @@ disagreements there are expected, anywhere else is a bug.
 
 ## Git
 
-Push only to `origin` (git.ocjtech.us), which mirrors to GitHub
+Push only to `origin` (git.jcollie.dev), which mirrors to GitHub
 (github.com/jcollie/zregex) on its own — never push to GitHub separately.
 Commit messages here are prose explaining why a change was made and how it was
 verified, not bullet lists.

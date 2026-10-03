@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 # Runs the test suite on every push, and publishes the API documentation
-# to https://jeff.ocj.page/zregex/ when the push was to main.
+# to https://jeff.jcollie.page/zregex/ when the push was to main.
 #
 # The documentation is only published from main, so that a branch build
 # cannot replace the site with a work in progress. Everything goes
@@ -62,7 +62,7 @@ jobs:
 
       - name: Publish docs
         run: >
-          nix develop .#default -c git-pages-cli https://jeff.ocj.page/zregex/
-          --server ocj.page
+          nix develop .#default -c git-pages-cli https://jeff.jcollie.page/zregex/
+          --server jcollie.page
           --token ${{ forge.token }}
           --upload-dir zig-out/docs

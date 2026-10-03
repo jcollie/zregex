@@ -8,6 +8,9 @@ SPDX-License-Identifier: MIT
 A regular expression library for Zig 0.17. For Zig 0.16, use the
 `zig-0.16` branch or the `v0.1.0` tag; see [Building](#building).
 
+The [API documentation](https://jeff.jcollie.page/zregex/) is generated from
+the doc comments in the source and published from `main`.
+
 Four engines behind one API:
 
 - **JIT** — on x86-64 and aarch64, patterns are compiled to native machine

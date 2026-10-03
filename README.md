@@ -478,3 +478,31 @@ seeds it, needing no account and no forge. Further copies are mirrored to
 All four carry the same history on `main`; the Forgejo one is where the tests
 and the documentation build run, and GitHub is where the cross-platform CI and
 the weekly fuzz run.
+
+## References cited
+
+What zregex is written against. PCRE2's documentation is the specification,
+and the PCRE2 oracle holds the library to it; Thompson and Cox describe the
+designs the Pike VM, the lazy DFA and the backtracker follow; the rest are what
+the case folding, the POSIX classes and the JIT's code generation and memory
+mapping are built from. The same list is kept as a Zotero collection named
+`zregex`, and the Intel manual carries its PDF as an attachment.
+
+- Apple Inc. *Allow execution of JIT-compiled code entitlement*. Apple Developer Documentation. <https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.allow-jit>.
+- Apple Inc. *Porting just-in-time compilers to Apple silicon*. Apple Developer Documentation. <https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon>.
+- Arm Limited. *Arm Architecture Reference Manual for A-profile architecture*. ARM DDI 0487 M.c. Arm Limited, 2026. <https://developer.arm.com/documentation/ddi0487/mc/>.
+- Cox, Russ. *Regular Expression Matching Can Be Simple And Fast (but is slow in Java, Perl, PHP, Python, Ruby, ...)*. swtch.com, January 2007. <https://swtch.com/~rsc/regexp/regexp1.html>.
+- Cox, Russ. *Regular Expression Matching: the Virtual Machine Approach*. swtch.com, December 2009. <https://swtch.com/~rsc/regexp/regexp2.html>.
+- Cox, Russ. *Regular Expression Matching in the Wild*. swtch.com, March 2010. <https://swtch.com/~rsc/regexp/regexp3.html>.
+- Hazel, Philip. *pcre2api: Perl-compatible regular expressions (revised API)*. PCRE2 10.48 documentation, 8 December 2025. <https://www.pcre.org/current/doc/html/pcre2api.html>.
+- Hazel, Philip. *pcre2pattern: Perl-compatible regular expressions (revised API)*. PCRE2 10.48 documentation, 25 October 2025. <https://www.pcre.org/current/doc/html/pcre2pattern.html>.
+- Intel Corporation. *Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 2 (2A, 2B, 2C, & 2D): Instruction Set Reference, A-Z*. Order Number 325383-093US. Intel Corporation, September 2026. <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
+- Microsoft. *VirtualAlloc function (memoryapi.h)*. Microsoft Learn, 5 February 2024. <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc>.
+- Microsoft. *VirtualProtect function (memoryapi.h)*. Microsoft Learn, 5 February 2024. <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualprotect>.
+- The Open Group. *The Open Group Base Specifications Issue 8, Chapter 9: Regular Expressions*. IEEE Std 1003.1-2024. The Open Group, 2024. <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap09.html>.
+- Thompson, Ken. "Programming Techniques: Regular expression search algorithm." *Communications of the ACM* 11, no. 6 (June 1968): 419–422. <https://doi.org/10.1145/363347.363387>.
+- Whistler, Ken. *Unicode Character Database*. Unicode Standard Annex #44, Revision 36, Unicode 17.0.0. Unicode Consortium, 27 August 2025. <https://www.unicode.org/reports/tr44/tr44-36.html>.
+
+`CaseFolding.txt`, which the case-insensitive tables are generated from, is one
+file of the Unicode Character Database; the copy used is the one vendored by
+the [`uucode`](https://github.com/jacobsandlund/uucode) package.

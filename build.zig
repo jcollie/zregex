@@ -107,12 +107,14 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        // The self-hosted backend, which Debug otherwise uses, emits no
+        // coverage instrumentation, so under it `zig build test --fuzz` runs
+        // blind ("pcs_len was zero") and kcov reports nothing at all.
+        .use_llvm = true,
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -162,27 +164,37 @@ pub fn build(b: *std.Build) void {
             }),
         });
         oracle.root_module.link_libc = true;
-        if (pcre2_include) |inc| {
-            oracle.root_module.addIncludePath(.{ .cwd_relative = inc });
+        const pcre2_h: std.Build.LazyPath = if (pcre2_include) |inc| header: {
             if (pcre2_lib) |lib| oracle.root_module.addLibraryPath(.{ .cwd_relative = lib });
             oracle.root_module.linkSystemLibrary("pcre2-8", .{});
+            break :header .{ .cwd_relative = b.pathJoin(&.{ inc, "pcre2.h" }) };
         } else if (b.lazyDependency("pcre2", .{
             .target = target,
             .optimize = std.builtin.OptimizeMode.ReleaseFast,
             .linkage = std.builtin.LinkMode.static,
-        })) |pcre2| {
+        })) |pcre2| header: {
             // Upstream defaults: 8-bit code units, Unicode on, JIT off (so
             // its sljit dependency stays unfetched). Static, because the
             // oracle is a test tool that should carry its reference with it.
             oracle.root_module.linkLibrary(pcre2.artifact("pcre2-8"));
+            break :header pcre2.namedLazyPath("pcre2.h");
         } else {
             // Fetch pending; the build runner fetches and configures again.
             break :oracle;
-        }
+        };
+
+        // The header's bindings, which the oracle imports as `c`.
+        const pcre2_c = b.addTranslateC(.{
+            .root_source_file = pcre2_h,
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        pcre2_c.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
+        oracle.root_module.addImport("c", pcre2_c.createModule());
 
         const run_oracle = b.addRunArtifact(oracle);
         run_oracle.stdio = .inherit;
-        if (b.args) |args| run_oracle.addArgs(args);
+        run_oracle.addPassthruArgs();
         const oracle_step = b.step("oracle", "Differential-test against PCRE2");
         oracle_step.dependOn(&run_oracle.step);
     }
@@ -222,7 +234,7 @@ pub fn build(b: *std.Build) void {
 
     const run_docs_server = b.addRunArtifact(docs_server);
     run_docs_server.step.dependOn(&install_docs.step);
-    run_docs_server.addArg(b.getInstallPath(.prefix, "docs"));
+    run_docs_server.addDirectoryArg(docs_library.getEmittedDocs());
     run_docs_server.addArg(b.fmt("{d}", .{docs_port}));
     // The server runs until interrupted, so its output has to reach the
     // terminal rather than being captured by the build runner.
@@ -254,7 +266,7 @@ pub fn build(b: *std.Build) void {
     // `zig build bench-run -- --builtin` needs no corpus file.
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.stdio = .inherit;
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     const bench_run_step = b.step("bench-run", "Build and run the benchmark harness");
     bench_run_step.dependOn(&run_bench.step);
 }

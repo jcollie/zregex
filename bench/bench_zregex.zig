@@ -78,7 +78,7 @@ const Case = struct {
     haystack: ?[]const u8 = null,
 };
 
-const patho_haystack = "a" ** 22 ++ "!";
+const patho_haystack = @as([22]u8, @splat('a')) ++ "!";
 
 const cases = [_]Case{
     .{ .name = "literal", .pattern = "synchronization" },

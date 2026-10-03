@@ -21,12 +21,12 @@
 //! build test` runs thousands of seeded cases every time, and `zig build test
 //! --fuzz` hands the same generator to the coverage-guided fuzzer.
 //!
-//! The seeded path is not a stand-in that happens to be convenient — as of
-//! Zig 0.16.0 it is the only one that works. The compiler's own test runner
-//! fails to build in fuzz mode (`expected type '*const debug.StackTrace',
-//! found '*builtin.StackTrace'` in compiler/test_runner.zig), which a
-//! two-line fuzz test reproduces with no zregex involved. When that is fixed
-//! upstream the `--fuzz` test starts working with no changes here.
+//! The coverage-guided fuzzer needs the test binary compiled by LLVM, which
+//! is why `build.zig` sets `use_llvm` on it: the self-hosted backend Debug
+//! otherwise uses emits no coverage instrumentation, and `--fuzz` then ends
+//! with "pcs_len was zero" rather than a report. That message, or a panic in
+//! the build runner, is the tooling; a finding says "input saved to" above
+//! the report.
 const std = @import("std");
 const zregex = @import("root.zig");
 const Regex = zregex.Regex;
@@ -439,6 +439,48 @@ test "arbitrary bytes never crash the parser or the engines" {
     }
 }
 
+/// Passes everything through to `child` except growing in place, which it
+/// always refuses. `checkAllAllocationFailures` needs every run of a case to
+/// make the same allocations, and whether the testing allocator can grow a
+/// block in place depends on what earlier runs left beside it: a container
+/// whose `remap` succeeds once and fails the next time allocates once more,
+/// and the check reports it as nondeterministic. A refused resize is always
+/// allowed by the `Allocator` contract, so this only takes away a choice.
+const NoGrowAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *NoGrowAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Compile `pattern` and run the whole public surface over `hay`, letting
 /// every allocation error out. Written for `checkAllAllocationFailures`, which
 /// calls it once per allocation the successful run makes, failing that one.
@@ -500,6 +542,8 @@ test "no allocation failure leaks or is swallowed" {
     var prng = std.Random.DefaultPrng.init(0x0a11_0c_fa11);
     const src = Source{ .random = prng.random() };
     const gpa = std.testing.allocator;
+    var no_grow: NoGrowAllocator = .{ .child = gpa };
+    const backing = no_grow.allocator();
 
     for (0..fuzz_options.alloc_cases) |_| {
         var b = Builder{ .src = src, .gpa = gpa };
@@ -519,7 +563,7 @@ test "no allocation failure leaks or is swallowed" {
             // as one: a run that reports a clean result after an allocation
             // was refused has lost an error somewhere.
             try std.testing.checkAllAllocationFailures(
-                gpa,
+                backing,
                 allocFailureCase,
                 .{ b.buf.items, hay.items, engine, false },
             );
@@ -531,7 +575,7 @@ test "no allocation failure leaks or is swallowed" {
             // outside it looks like a swallowed error. Leaks are still
             // faults, and this is the only run that reaches the memo at all.
             std.testing.checkAllAllocationFailures(
-                gpa,
+                backing,
                 allocFailureCase,
                 .{ b.buf.items, hay.items, engine, true },
             ) catch |err| switch (err) {

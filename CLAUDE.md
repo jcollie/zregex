@@ -3,14 +3,15 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 zregex is a regular expression library for Zig, with PCRE semantics as its
-specification. It targets Zig 0.16.0 exactly.
+specification. It targets Zig 0.17.0 exactly; the `zig-0.16` branch carries
+the last version that builds with Zig 0.16.0.
 
 ## Environment
 
 The toolchain lives in the Nix dev shell, not on PATH. Prefix build commands
 with `nix develop --command`, e.g. `nix develop --command zig build test`. The
-shell provides `zig_0_16`, `qemu` (for the aarch64 tests), `reuse`, and
-`pinact`.
+shell provides Zig 0.17.0 (from zig-overlay), `qemu` (for the aarch64 tests),
+`reuse`, and `pinact`.
 
 ## Commands
 
@@ -19,6 +20,8 @@ shell provides `zig_0_16`, `qemu` (for the aarch64 tests), `reuse`, and
 - `zig build test -Dfuzz-cases=N -Dfuzz-seed=M` — a longer differential soak;
   walk the seed to reach patterns one stream never produces. `-Dfuzz-alloc-cases=N`
   scales the allocation-failure test, which reruns cases once per allocation.
+- `zig build test --fuzz[=N]` — the same generator under Zig's coverage-guided
+  fuzzer; it works because the module tests set `use_llvm`.
 - `zig build test -fqemu -Dtarget=aarch64-linux` — runs the suite (and any
   `-Dfuzz-cases`) on the aarch64 JIT under emulation. The x86-64 host never
   executes the a64/NEON backend otherwise; do this after any change to

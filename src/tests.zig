@@ -234,7 +234,7 @@ test "no catastrophic backtracking without backrefs" {
     var re = try Regex.compile(gpa, "(a+)+$");
     defer re.deinit();
     try std.testing.expectEqual(zregex.Engine.pike, re.fallback_engine);
-    const haystack = "a" ** 60 ++ "b";
+    const haystack = @as([60]u8, @splat('a')) ++ "b";
     try std.testing.expect(!try re.isMatch(gpa, haystack));
 }
 
@@ -253,7 +253,7 @@ test "step limit" {
     defer re.deinit();
     try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
     re.max_steps = 1000;
-    const haystack = "a" ** 40 ++ "b";
+    const haystack = @as([40]u8, @splat('a')) ++ "b";
     try std.testing.expectError(error.StepLimitExceeded, re.isMatch(gpa, haystack));
 }
 
@@ -503,7 +503,7 @@ test "memoization tames exponential backtracking" {
     var re = try Regex.compile(gpa, "(a+)+\\1$");
     defer re.deinit();
     try std.testing.expectEqual(zregex.Engine.backtrack, re.fallback_engine);
-    const haystack = "a" ** 30 ++ "b";
+    const haystack = @as([30]u8, @splat('a')) ++ "b";
     try std.testing.expect(!try re.isMatch(gpa, haystack));
     // Without the memo the same search must blow the step budget.
     re.memo = false;
@@ -513,7 +513,7 @@ test "memoization tames exponential backtracking" {
     // Alternation-driven blowup, forced onto the backtracker by a lookahead.
     var re2 = try Regex.compile(gpa, "(?=a)(a|a)*c$");
     defer re2.deinit();
-    const haystack2 = "a" ** 26 ++ "b";
+    const haystack2 = @as([26]u8, @splat('a')) ++ "b";
     try std.testing.expect(!try re2.isMatch(gpa, haystack2));
     re2.memo = false;
     re2.max_steps = 100_000;
@@ -682,7 +682,7 @@ test "jit bails instead of blowing up, and the answer still comes back" {
     var re = try Regex.compile(gpa, "(a+)+\\1$");
     defer re.deinit();
     try std.testing.expectEqual(zregex.Engine.jit, re.engine);
-    try std.testing.expect(!try re.isMatch(gpa, "a" ** 30 ++ "b"));
+    try std.testing.expect(!try re.isMatch(gpa, @as([30]u8, @splat('a')) ++ "b"));
 }
 
 test "greedy give-back happens exactly where a shorter run could help" {

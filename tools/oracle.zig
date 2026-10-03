@@ -57,10 +57,8 @@ const std = @import("std");
 const zregex = @import("zregex");
 const gen = @import("pattern_gen");
 
-const c = @cImport({
-    @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");
-    @cInclude("pcre2.h");
-});
+/// PCRE2's header with 8-bit code units, translated by the build.
+const c = @import("c");
 
 /// Both are `~(PCRE2_SIZE)0` in the header, which translate-c cannot render.
 const pcre2_zero_terminated: usize = std.math.maxInt(usize);
@@ -749,7 +747,7 @@ fn runCorpus(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, verbose: 
 
         for (cases.items) |cse| {
             patterns += 1;
-            const pattern = gpa.dupeZ(u8, cse.pattern) catch continue;
+            const pattern = gpa.dupeSentinel(u8, cse.pattern, 0) catch continue;
             defer gpa.free(pattern);
             // A pattern holding a NUL cannot reach PCRE2 through a C string.
             if (std.mem.indexOfScalar(u8, cse.pattern, 0) != null) continue;
@@ -978,7 +976,7 @@ fn runCorpusMutate(
         // The pattern reaches PCRE2 as a C string; a NUL would truncate it
         // there and the two libraries would be compared on different input.
         if (std.mem.indexOfScalar(u8, pat.items, 0) != null) continue;
-        const pattern = try gpa.dupeZ(u8, pat.items);
+        const pattern = try gpa.dupeSentinel(u8, pat.items, 0);
         defer gpa.free(pattern);
 
         // A subject from the base case when it has one, or any other's --
@@ -1161,7 +1159,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("usage: --engines <pattern> <haystack> [ims] [-q]\n", .{});
             std.process.exit(2);
         }
-        const pat = try arena.dupeZ(u8, args[2]);
+        const pat = try arena.dupeSentinel(u8, args[2], 0);
         std.process.exit(try engineCase(gpa, pat, args[3], verbose, cli_flags));
     }
 
@@ -1170,7 +1168,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("usage: --case <pattern> <haystack> [ims] [-q]\n", .{});
             std.process.exit(2);
         }
-        std.process.exit(try oneCase(gpa, try arena.dupeZ(u8, args[2]), args[3], verbose, cli_flags));
+        std.process.exit(try oneCase(gpa, try arena.dupeSentinel(u8, args[2], 0), args[3], verbose, cli_flags));
     }
 
     const cases: usize = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 20000;
@@ -1227,7 +1225,7 @@ pub fn main(init: std.process.Init) !void {
         defer b.buf.deinit(gpa);
         try b.sequence(0);
         if (b.buf.items.len == 0) continue;
-        const pattern = try gpa.dupeZ(u8, b.buf.items);
+        const pattern = try gpa.dupeSentinel(u8, b.buf.items, 0);
         defer gpa.free(pattern);
 
         var hay: std.ArrayList(u8) = .empty;

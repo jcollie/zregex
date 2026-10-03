@@ -189,8 +189,8 @@ pub const Gen = struct {
         var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
         var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
-            lo_regs[i] = @enumFromInt(first_const_xmm + 2 * i);
-            hi_regs[i] = @enumFromInt(first_const_xmm + 1 + 2 * i);
+            lo_regs[i] = @fromBackingInt(@intCast(first_const_xmm + 2 * i));
+            hi_regs[i] = @fromBackingInt(@intCast(first_const_xmm + 1 + 2 * i));
             const lo: [32]u8 = @splat(@intCast(r.lo));
             const hi: [32]u8 = @splat(@intCast(r.hi));
             a.vmovdquYmmLabel(lo_regs[i], try self.emitBlob(&lo));
@@ -230,8 +230,8 @@ pub const Gen = struct {
         var lo_regs: [max_simd_ranges]x64.Xmm = undefined;
         var hi_regs: [max_simd_ranges]x64.Xmm = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
-            lo_regs[i] = @enumFromInt(first_const_xmm + 2 * i);
-            hi_regs[i] = @enumFromInt(first_const_xmm + 1 + 2 * i);
+            lo_regs[i] = @fromBackingInt(@intCast(first_const_xmm + 2 * i));
+            hi_regs[i] = @fromBackingInt(@intCast(first_const_xmm + 1 + 2 * i));
             const lo: [16]u8 = @splat(@intCast(r.lo));
             const hi: [16]u8 = @splat(@intCast(r.hi));
             a.movdquXmmLabel(lo_regs[i], try self.emitBlob(&lo));
@@ -819,7 +819,7 @@ pub fn compile(
     {
         var i: i32 = 0;
         while (i < xmm_saves) : (i += 1) {
-            const reg: x64.Xmm = @enumFromInt(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i)))));
+            const reg: x64.Xmm = @fromBackingInt(@intCast(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i))))));
             a.movdquMemXmm(.{ .base = .rsp, .disp = stack_reserve + 16 * i }, reg);
         }
     }
@@ -1023,7 +1023,7 @@ pub fn compile(
     {
         var i: i32 = 0;
         while (i < xmm_saves) : (i += 1) {
-            const reg: x64.Xmm = @enumFromInt(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i)))));
+            const reg: x64.Xmm = @fromBackingInt(@intCast(@as(u4, @intCast(first_saved_xmm + @as(usize, @intCast(i))))));
             a.movdquXmmMem(reg, .{ .base = .rsp, .disp = stack_reserve + 16 * i });
         }
     }

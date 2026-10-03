@@ -49,7 +49,7 @@ pub const Reg = enum(u5) {
     zr = 31,
 
     fn n(self: Reg) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -75,7 +75,7 @@ pub const Vec = enum(u5) {
     v15 = 15,
 
     fn n(self: Vec) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -342,7 +342,7 @@ pub const Asm = struct {
 
     pub fn bcond(self: *Asm, c: Cond, l: Label) void {
         self.fixup(l, .branch19);
-        self.word(0x54000000 | @as(u32, @intFromEnum(c)));
+        self.word(0x54000000 | @as(u32, @backingInt(c)));
     }
 
     pub fn cbz(self: *Asm, rt: Reg, l: Label) void {

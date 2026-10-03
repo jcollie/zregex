@@ -413,8 +413,8 @@ const Gen = struct {
         var lo_regs: [runtime.max_simd_ranges]a64.Vec = undefined;
         var hi_regs: [runtime.max_simd_ranges]a64.Vec = undefined;
         for (set.ranges[0..set.len], 0..) |r, i| {
-            lo_regs[i] = @enumFromInt(2 + 2 * i);
-            hi_regs[i] = @enumFromInt(3 + 2 * i);
+            lo_regs[i] = @fromBackingInt(@intCast(2 + 2 * i));
+            hi_regs[i] = @fromBackingInt(@intCast(3 + 2 * i));
             const lo: [16]u8 = @splat(@intCast(r.lo));
             const hi: [16]u8 = @splat(@intCast(r.hi));
             a.adr(.x9, try self.emitBlob(&lo, true));

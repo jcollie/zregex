@@ -30,10 +30,10 @@ pub const Reg = enum(u4) {
     r15 = 15,
 
     fn low(self: Reg) u3 {
-        return @truncate(@intFromEnum(self));
+        return @truncate(@backingInt(self));
     }
     fn ext(self: Reg) u1 {
-        return @truncate(@intFromEnum(self) >> 3);
+        return @truncate(@backingInt(self) >> 3);
     }
 };
 
@@ -83,10 +83,10 @@ pub const Xmm = enum(u4) {
     xmm15 = 15,
 
     fn low(self: Xmm) u3 {
-        return @truncate(@intFromEnum(self));
+        return @truncate(@backingInt(self));
     }
     fn ext(self: Xmm) u1 {
-        return @truncate(@intFromEnum(self) >> 3);
+        return @truncate(@backingInt(self) >> 3);
     }
 };
 
@@ -382,7 +382,7 @@ pub const Asm = struct {
     /// `cmp dst_low_byte, imm8`.
     pub fn cmpReg8Imm(self: *Asm, dst: Reg, imm: u8) void {
         // REX needed for sil/dil/spl/bpl and r8b-r15b.
-        if (dst.ext() == 1 or @intFromEnum(dst) >= 4) self.rex(0, 0, 0, dst.ext());
+        if (dst.ext() == 1 or @backingInt(dst) >= 4) self.rex(0, 0, 0, dst.ext());
         self.b(0x80);
         self.modrm(3, 7, dst.low());
         self.b(imm);
@@ -416,7 +416,7 @@ pub const Asm = struct {
 
     pub fn jcc(self: *Asm, c: Cond, l: Label) void {
         self.b(0x0F);
-        self.b(0x80 + @as(u8, @intFromEnum(c)));
+        self.b(0x80 + @as(u8, @backingInt(c)));
         self.fixup(l);
     }
 
@@ -575,7 +575,7 @@ pub const Asm = struct {
     }
 
     fn vexRegRegReg(self: *Asm, opcode: u8, dst: Xmm, src1: Xmm, src2: Xmm) void {
-        self.vex3(dst.ext(), 0, src2.ext(), 1, 0, @intFromEnum(src1), 1, 0b01); // 66 0F
+        self.vex3(dst.ext(), 0, src2.ext(), 1, 0, @backingInt(src1), 1, 0b01); // 66 0F
         self.b(opcode);
         self.modrm(3, dst.low(), src2.low());
     }

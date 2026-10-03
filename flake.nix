@@ -8,11 +8,18 @@
     nixpkgs = {
       url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
     };
+    # The toolchain is the official 0.17.0 release binary, packaged by the
+    # overlay, rather than nixpkgs' Zig.
+    zig = {
+      url = "git+https://git.jcollie.dev/jeff/zig-overlay.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
       nixpkgs,
+      zig,
       ...
     }:
     let
@@ -25,6 +32,7 @@
         import nixpkgs {
           inherit system;
         };
+      zigFor = system: zig.packages.${system}."0.17.0";
       forAllSystems = lib.genAttrs linuxSystems;
     in
     {
@@ -46,7 +54,7 @@
               pkgs.kcov
               pkgs.radicle-node
               pkgs.reuse
-              pkgs.zig_0_16
+              (zigFor system)
             ];
             # The oracle builds its own PCRE2 (pinned in build.zig.zon);
             # these exports exist for -Dpcre2-include/-Dpcre2-lib override

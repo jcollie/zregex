@@ -5,7 +5,8 @@ SPDX-License-Identifier: MIT
 
 # zregex
 
-A regular expression library for Zig 0.16.
+A regular expression library for Zig 0.17. For Zig 0.16, use the
+`zig-0.16` branch or the `v0.1.0` tag; see [Building](#building).
 
 Four engines behind one API:
 
@@ -351,6 +352,15 @@ zig build test   # run the test suite
 zig build run -- '(\w+)@([\w.]+)' 'mail jeff@example.org'   # demo CLI
 ```
 
+This builds with Zig 0.17.0; the development shell takes the official release
+binary from [zig-overlay](https://git.jcollie.dev/jeff/zig-overlay). For Zig
+0.16.0, use the `zig-0.16` branch, which holds the last of zregex to build
+with it, or the `v0.1.0` tag it starts from:
+
+```console
+$ git clone -b zig-0.16 https://git.jcollie.dev/jeff/zregex.git
+```
+
 ## Differential testing
 
 The engines are independent implementations of one specification, so they can
@@ -375,6 +385,14 @@ stream never produces get reached:
 zig build test -Dfuzz-cases=50000 -Dfuzz-seed=7
 ```
 
+The same generator also runs under Zig's coverage-guided fuzzer, which steers
+toward inputs that reach code the earlier ones did not:
+
+```sh
+zig build test --fuzz          # until interrupted, with a web interface
+zig build test --fuzz=1M       # a bounded run, then a report
+```
+
 A separate test reruns generated cases once per allocation they make, failing a
 different one each time, so that the paths taken when memory runs out partway
 are executed too — what was allocated by then still has to be released. It is
@@ -388,7 +406,10 @@ The cross-engine comparison cannot find a mistake every engine makes together.
 For that, `tools/oracle.zig` runs the same generated patterns through PCRE2 and
 compares. The reference is built from source by PCRE2's own `build.zig` —
 pinned in `build.zig.zon`, currently 10.48 — so this works the same on any
-machine, with nothing installed:
+machine, with nothing installed. It comes from a
+[mirror](https://git.jcollie.dev/jeff/pcre2) whose `zig-0.17` branch is the
+10.48 release plus a one-line change that lets its `build.zig` build with Zig
+0.17:
 
 ```sh
 zig build oracle -- [cases] [seed]

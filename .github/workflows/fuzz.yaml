@@ -48,7 +48,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # The engines fuzzed against each other, as several fresh processes.
       # The fuzzer compiles a new Regex per case -- a quarter of a million

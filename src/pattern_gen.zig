@@ -50,7 +50,7 @@ pub const max_gen_groups = 8;
 
 /// Group numbers are one-based, so this holds `max_group_limit` of them.
 /// `group_limit` must stay under its bit count.
-const GroupSet = std.bit_set.IntegerBitSet(64);
+const GroupSet = std.bit_set.Integer(64);
 pub const max_group_limit: u8 = GroupSet.bit_length - 1;
 
 /// Where the generator's decisions come from. The fuzzer supplies bytes it
@@ -96,10 +96,10 @@ pub const Builder = struct {
     /// Capture groups opened so far, so a backreference can name a real one.
     groups: u8 = 0,
     /// Which of those were given a name, so `\k<name>` only uses real ones.
-    named: GroupSet = .initEmpty(),
+    named: GroupSet = .empty,
     /// Groups whose closing paren has not been emitted yet: a backreference
     /// generated here would point at the group enclosing it.
-    open: GroupSet = .initEmpty(),
+    open: GroupSet = .empty,
     allow_backrefs: bool = true,
     /// Raised on a minority of cases to reach patterns the defaults never
     /// build: deep nesting, long programs, and many capture groups, each of

@@ -5,7 +5,7 @@
     .version = "0.2.0-dev",
     // Globally unique package identifier together with `name`; never changes.
     .fingerprint = 0x9f5d80d30fd26c90, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Win32 bindings, used by the JIT to map executable memory. Lazy so
         // that builds for other targets never fetch it.
@@ -24,9 +24,16 @@
         // failed on nothing but apt shipping an older PCRE2 whose POSIX
         // class behavior differs. Lazy, so builds that never wire the oracle
         // never fetch it.
+        //
+        // Taken from a mirror rather than the release tarball: 10.48's
+        // build.zig names `Build.build_root`, which Zig 0.17 removed, and Zig
+        // compiles every fetched dependency's build.zig, so upstream's breaks
+        // every build of this project and not only the oracle. The mirror's
+        // zig-0.17 branch is the pcre2-10.48 tag plus that one line; move
+        // back to upstream once a release builds with 0.17.
         .pcre2 = .{
-            .url = "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz",
-            .hash = "pcre2-10.48.0-IZ6r69wnegD6fc08FgRTKVcmyp4Ux2aVefaVvsRndgEl",
+            .url = "git+https://git.jcollie.dev/jeff/pcre2.git#e58b5afbe91dbddfb47478db1f68d742c5c41155",
+            .hash = "pcre2-10.48.0-IZ6r6wnVXgDvFPxmhnanI3-WSqYWp5jjtMmktcI9E2mz",
             .lazy = true,
         },
     },

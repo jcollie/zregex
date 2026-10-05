@@ -8,18 +8,11 @@
     nixpkgs = {
       url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
     };
-    # The toolchain is the official 0.17.0 release binary, packaged by the
-    # overlay, rather than nixpkgs' Zig.
-    zig = {
-      url = "git+https://git.jcollie.dev/jeff/zig-overlay.git";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
     {
       nixpkgs,
-      zig,
       ...
     }:
     let
@@ -31,8 +24,11 @@
         system:
         import nixpkgs {
           inherit system;
+          # nixpkgs marks radicle-node insecure because traffic for private
+          # repositories is neither encrypted nor authenticated. This
+          # repository is public, so that does not apply to it.
+          config.allowInsecurePredicate = pkg: lib.getName pkg == "radicle-node";
         };
-      zigFor = system: zig.packages.${system}."0.17.0";
       forAllSystems = lib.genAttrs linuxSystems;
     in
     {
@@ -54,7 +50,7 @@
               pkgs.kcov
               pkgs.radicle-node
               pkgs.reuse
-              (zigFor system)
+              pkgs.zig_0_17
             ];
             # The oracle builds its own PCRE2 (pinned in build.zig.zon);
             # these exports exist for -Dpcre2-include/-Dpcre2-lib override

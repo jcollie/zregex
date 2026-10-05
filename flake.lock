@@ -2,11 +2,11 @@
   "nodes": {
     "nixpkgs": {
       "locked": {
-        "lastModified": 1787964612,
-        "narHash": "sha256-qeiZaY+0tpZXliRA9odCNx+sOfIOhnkcUq9t+ctPrRA=",
-        "rev": "e8be7818e19ada32105a8af937a6a473b38167ca",
+        "lastModified": 1791011291,
+        "narHash": "sha256-4ettaZ6zgjT1Zgjq6zrmIg87gBvLMvPJGA8u0BBTn6Y=",
+        "rev": "73e728ddb6b7a12d18808f510813a13ee1fe4cce",
         "type": "tarball",
-        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1063758.e8be7818e19a/nixexprs.tar.zst"
+        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1084597.73e728ddb6b7/nixexprs.tar.zst"
       },
       "original": {
         "type": "tarball",
@@ -15,51 +15,7 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs",
-        "zig": "zig"
-      }
-    },
-    "zig": {
-      "inputs": {
-        "nixpkgs": [
-          "nixpkgs"
-        ],
-        "zon2nix": "zon2nix"
-      },
-      "locked": {
-        "lastModified": 1790983248,
-        "narHash": "sha256-fjtjxWEofW5cbzXm3SqvjC2QZIbtp3lij2k8e1Jmj0w=",
-        "ref": "refs/heads/main",
-        "rev": "1a73bc5e8ae4d0223fefbd00afc58fe0b7f7e718",
-        "revCount": 1734,
-        "type": "git",
-        "url": "https://git.jcollie.dev/jeff/zig-overlay.git"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://git.jcollie.dev/jeff/zig-overlay.git"
-      }
-    },
-    "zon2nix": {
-      "inputs": {
-        "nixpkgs": [
-          "zig",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1790583033,
-        "narHash": "sha256-Eo3hR521Yc2Gsqw7m/aqd5sn3/qi0XoSpJBIPPIYKkg=",
-        "owner": "jcollie",
-        "repo": "zon2nix",
-        "rev": "8e91c0d44aa49d0ac415f7e3046662e9aa754335",
-        "type": "github"
-      },
-      "original": {
-        "owner": "jcollie",
-        "ref": "v0.9.0",
-        "repo": "zon2nix",
-        "type": "github"
+        "nixpkgs": "nixpkgs"
       }
     }
   },

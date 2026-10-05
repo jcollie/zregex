@@ -10,7 +10,7 @@ the last version that builds with Zig 0.16.0.
 
 The toolchain lives in the Nix dev shell, not on PATH. Prefix build commands
 with `nix develop --command`, e.g. `nix develop --command zig build test`. The
-shell provides Zig 0.17.0 (from zig-overlay), `qemu` (for the aarch64 tests),
+shell provides Zig 0.17.0 (nixpkgs `zig_0_17`), `qemu` (for the aarch64 tests),
 `reuse`, and `pinact`.
 
 ## Commands

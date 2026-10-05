@@ -355,8 +355,8 @@ zig build test   # run the test suite
 zig build run -- '(\w+)@([\w.]+)' 'mail jeff@example.org'   # demo CLI
 ```
 
-This builds with Zig 0.17.0; the development shell takes the official release
-binary from [zig-overlay](https://git.jcollie.dev/jeff/zig-overlay). For Zig
+This builds with Zig 0.17.0; the development shell takes it from nixpkgs
+(`zig_0_17`). For Zig
 0.16.0, use the `zig-0.16` branch, which holds the last of zregex to build
 with it, or the `v0.1.0` tag it starts from:
 
